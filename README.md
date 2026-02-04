@@ -59,6 +59,7 @@ python train.py \
   --preset B \
   --snr-mode predict \
   --group-k 8 \
+  --group-pool attn \
   --stem-channels 64 \
   --stem-layers 2 \
   --batch-size 512 \
@@ -66,6 +67,10 @@ python train.py \
   --lr 1e-4 \
   --lambda-diff 0.2 \
   --lambda-snr 0.1 \
+  --snr-balanced \
+  --label-smoothing 0.1 \
+  --aug-phase \
+  --aug-shift \
   --t-schedule uniform \
   --t-max 200 \
   --p-clean 0.3 \
@@ -92,6 +97,7 @@ python train.py \
 ### Model architecture
 - `--preset {S,B}`: Model size (S=small, B=base). S: p=8, d=192, depth=10; B: p=4, d=256, depth=12
 - `--group-k N`: Multi-window pooling (N random windows from same (mod,SNR) bucket). Default: 1
+- `--group-pool {mean,attn}`: Pool across the `group-k` windows (mean or learned attention). Default: mean
 - `--stem-channels C`: CNN stem channels (0 to disable). Default: 0
 - `--stem-layers L`: CNN stem depth. Default: 0
 
@@ -100,6 +106,17 @@ python train.py \
 - `--epochs N`: Training epochs
 - `--lr F`: Learning rate (default: preset-dependent)
 - `--amp`: Enable mixed precision (BF16 on Ampere/Hopper, FP16 otherwise)
+- `--label-smoothing F`: Cross-entropy label smoothing (e.g. 0.05–0.1). Default: 0.0
+- `--snr-balanced`: Use SNR-balanced sampling for training batches (reduces domination by high-SNR “easy” samples)
+- `--snr-balance-power F`: Weight exponent for SNR-balanced sampling. Default: 1.0
+
+### Train-time signal augmentations (label-preserving)
+Applied to the **training** split only (after normalization):
+
+- `--aug-phase`: Random global phase rotation per window
+- `--aug-shift`: Random circular time shift per window
+- `--aug-gain F`: Gain jitter magnitude (e.g. 0.2 ⇒ ×[0.8,1.2]); mostly redundant if `--normalize rms`
+- `--aug-cfo F`: Max CFO in cycles/sample (keep small, e.g. 0.005–0.02)
 
 ### Diffusion regularization
 - `--lambda-diff F`: Diffusion loss weight (default: 0.2)

@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.utils.data import WeightedRandomSampler
 
 try:
     from torch.amp import GradScaler as AmpGradScaler
@@ -120,6 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stem-channels", type=int, default=64)
     parser.add_argument("--stem-layers", type=int, default=2)
     parser.add_argument("--group-k", type=int, default=1, help="Number of random windows per (mod,SNR) bucket per sample.")
+    parser.add_argument("--group-pool", type=str, choices=["mean", "attn"], default="mean", help="How to pool over group-k windows.")
 
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=50)
@@ -132,6 +134,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-per", type=int, default=600)
     parser.add_argument("--val-per", type=int, default=200)
     parser.add_argument("--normalize", type=str, choices=["rms", "none"], default="rms")
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--snr-balanced", action="store_true", help="Use SNR-balanced sampling for the training loader.")
+    parser.add_argument("--snr-balance-power", type=float, default=1.0, help="Sampling weight exponent: w ~ (1/count)^power.")
+
+    # Train-only, label-preserving signal augmentations (applied after normalization).
+    parser.add_argument("--aug-phase", action="store_true", help="Random global phase rotation per window.")
+    parser.add_argument("--aug-shift", action="store_true", help="Random circular time shift per window.")
+    parser.add_argument("--aug-gain", type=float, default=0.0, help="Random gain jitter magnitude (e.g., 0.2 => x*[0.8,1.2]).")
+    parser.add_argument("--aug-cfo", type=float, default=0.0, help="Max normalized CFO in cycles/sample (e.g., 0.01).")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.9996)
     parser.add_argument("--ema-start", type=int, default=500)
@@ -233,11 +244,32 @@ def build_loaders(args: argparse.Namespace, device: torch.device):
 
     X_t, y_t, snr_t = build_tensors(X, y, snr)
     if args.group_k > 1:
-        train_ds = RML2016aGroupedDataset(X_t, y_t, snr_t, train_idx, group_k=args.group_k, normalize=args.normalize)
+        train_ds = RML2016aGroupedDataset(
+            X_t,
+            y_t,
+            snr_t,
+            train_idx,
+            group_k=args.group_k,
+            normalize=args.normalize,
+            aug_phase=args.aug_phase,
+            aug_shift=args.aug_shift,
+            aug_gain=args.aug_gain,
+            aug_cfo=args.aug_cfo,
+        )
         val_ds = RML2016aGroupedDataset(X_t, y_t, snr_t, val_idx, group_k=args.group_k, normalize=args.normalize)
         test_ds = RML2016aGroupedDataset(X_t, y_t, snr_t, test_idx, group_k=args.group_k, normalize=args.normalize)
     else:
-        train_ds = RML2016aDataset(X_t, y_t, snr_t, train_idx, normalize=args.normalize)
+        train_ds = RML2016aDataset(
+            X_t,
+            y_t,
+            snr_t,
+            train_idx,
+            normalize=args.normalize,
+            aug_phase=args.aug_phase,
+            aug_shift=args.aug_shift,
+            aug_gain=args.aug_gain,
+            aug_cfo=args.aug_cfo,
+        )
         val_ds = RML2016aDataset(X_t, y_t, snr_t, val_idx, normalize=args.normalize)
         test_ds = RML2016aDataset(X_t, y_t, snr_t, test_idx, normalize=args.normalize)
 
@@ -247,10 +279,21 @@ def build_loaders(args: argparse.Namespace, device: torch.device):
     generator = torch.Generator()
     generator.manual_seed(args.seed)
 
+    sampler = None
+    if args.snr_balanced:
+        # Balance sampling across SNR bins using inverse-frequency weights.
+        snr_np = snr_t[torch.from_numpy(train_ds.indices)].cpu().numpy().astype(np.int32)
+        unique, counts = np.unique(snr_np, return_counts=True)
+        count_map = {int(u): int(c) for u, c in zip(unique, counts)}
+        power = float(args.snr_balance_power)
+        weights = np.asarray([(1.0 / max(1, count_map[int(s)])) ** power for s in snr_np], dtype=np.float64)
+        sampler = WeightedRandomSampler(weights=weights, num_samples=len(weights), replacement=True)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         drop_last=True,
         worker_init_fn=_seed_worker,
         generator=generator,
@@ -460,6 +503,7 @@ def train(args: argparse.Namespace) -> None:
         snr_scale=args.snr_scale,
         stem_channels=args.stem_channels,
         stem_layers=args.stem_layers,
+        group_pool=args.group_pool,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -565,10 +609,10 @@ def train(args: argparse.Namespace) -> None:
                         snr_clamped = torch.clamp(snr.float(), min=snr_floor, max=snr_cap_max)
                         frac = (snr_clamped - snr_floor) / denom
                         weights = 1.0 + float(args.low_snr_boost) * (1.0 - frac)
-                        ce = F.cross_entropy(logits, y, reduction="none")
+                        ce = F.cross_entropy(logits, y, reduction="none", label_smoothing=float(args.label_smoothing))
                         loss_cls = torch.mean(ce * weights)
                     else:
-                        loss_cls = F.cross_entropy(logits, y)
+                        loss_cls = F.cross_entropy(logits, y, label_smoothing=float(args.label_smoothing))
                     loss_diff = F.mse_loss(x0_pred, z0)
                     loss_snr = F.smooth_l1_loss(snr_pred, snr) if args.lambda_snr > 0 else 0.0
                     loss = loss_cls + lambda_diff * loss_diff + args.lambda_snr * loss_snr
@@ -587,10 +631,10 @@ def train(args: argparse.Namespace) -> None:
                     snr_clamped = torch.clamp(snr.float(), min=snr_floor, max=snr_cap_max)
                     frac = (snr_clamped - snr_floor) / denom
                     weights = 1.0 + float(args.low_snr_boost) * (1.0 - frac)
-                    ce = F.cross_entropy(logits, y, reduction="none")
+                    ce = F.cross_entropy(logits, y, reduction="none", label_smoothing=float(args.label_smoothing))
                     loss_cls = torch.mean(ce * weights)
                 else:
-                    loss_cls = F.cross_entropy(logits, y)
+                    loss_cls = F.cross_entropy(logits, y, label_smoothing=float(args.label_smoothing))
                 loss_diff = F.mse_loss(x0_pred, z0)
                 loss_snr = F.smooth_l1_loss(snr_pred, snr) if args.lambda_snr > 0 else 0.0
                 loss = loss_cls + lambda_diff * loss_diff + args.lambda_snr * loss_snr

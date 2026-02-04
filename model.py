@@ -67,6 +67,7 @@ class DiffusionAMC(nn.Module):
         snr_scale: float = 20.0,
         stem_channels: int = 0,
         stem_layers: int = 2,
+        group_pool: str = "mean",
     ) -> None:
         super().__init__()
         if seq_len % patch_size != 0:
@@ -76,6 +77,9 @@ class DiffusionAMC(nn.Module):
         self.num_patches = seq_len // patch_size
         self.dim = dim
         self.snr_scale = snr_scale
+        if group_pool not in {"mean", "attn"}:
+            raise ValueError(f"group_pool must be mean|attn, got {group_pool}")
+        self.group_pool = group_pool
 
         if stem_channels and stem_channels > 0:
             layers = []
@@ -126,6 +130,13 @@ class DiffusionAMC(nn.Module):
             nn.SiLU(),
             nn.Linear(dim, 1),
         )
+        # Learned pooling across group-k windows (attention over per-window representations).
+        self.group_attn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, max(32, dim // 2)),
+            nn.GELU(),
+            nn.Linear(max(32, dim // 2), 1),
+        )
 
     def forward_tokens(
         self,
@@ -173,8 +184,16 @@ class DiffusionAMC(nn.Module):
             if pooled.shape[0] % group_size != 0:
                 raise ValueError("Batch size must be divisible by group_size.")
             b = pooled.shape[0] // group_size
-            pooled = pooled.view(b, group_size, -1).mean(dim=1)
-            snr_pred_out = snr_pred.view(b, group_size).mean(dim=1)
+            pooled_g = pooled.view(b, group_size, -1)  # (B,G,D)
+            snr_g = snr_pred.view(b, group_size)  # (B,G)
+            if self.group_pool == "mean":
+                pooled = pooled_g.mean(dim=1)
+                snr_pred_out = snr_g.mean(dim=1)
+            else:
+                scores = self.group_attn(pooled_g).squeeze(-1)  # (B,G)
+                w = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B,G,1)
+                pooled = torch.sum(w * pooled_g, dim=1)
+                snr_pred_out = torch.sum(w.squeeze(-1) * snr_g, dim=1)
         else:
             snr_pred_out = snr_pred
         logits = self.cls_head(pooled)
