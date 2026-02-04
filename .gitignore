@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# PyTorch
+*.pt
+*.pth
+*.ckpt
+
+# Data
+*.pkl
+*.h5
+*.hdf5
+*.dat
+
+# Training outputs
+runs/
+logs/
+wandb/
+tensorboard/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment
+venv/
+env/
+ENV/
+.venv
+
+# Results
+*.jsonl
+*.csv
+*.png
+*.pdf
+figure/
