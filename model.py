@@ -145,6 +145,7 @@ class DiffusionAMC(nn.Module):
         snr: Optional[torch.Tensor] = None,
         snr_mode: str = "predict",
         group_size: Optional[int] = None,
+        group_mask: Optional[torch.Tensor] = None,
     ):
         """
         tokens_in: (B, N, D) patch embeddings (without positional embedding).
@@ -186,14 +187,25 @@ class DiffusionAMC(nn.Module):
             b = pooled.shape[0] // group_size
             pooled_g = pooled.view(b, group_size, -1)  # (B,G,D)
             snr_g = snr_pred.view(b, group_size)  # (B,G)
+            if group_mask is None:
+                mask = torch.ones((b, group_size), device=pooled_g.device, dtype=torch.float32)
+            else:
+                if group_mask.ndim != 2 or group_mask.shape[0] != b or group_mask.shape[1] != group_size:
+                    raise ValueError("group_mask must have shape (B, group_size)")
+                mask = group_mask.to(device=pooled_g.device, dtype=torch.float32)
+
             if self.group_pool == "mean":
-                pooled = pooled_g.mean(dim=1)
-                snr_pred_out = snr_g.mean(dim=1)
+                denom = torch.clamp(mask.sum(dim=1, keepdim=True), min=1.0)  # (B,1)
+                pooled = torch.sum(pooled_g * mask.unsqueeze(-1), dim=1) / denom
+                snr_pred_out = torch.sum(snr_g * mask, dim=1) / denom.squeeze(-1)
             else:
                 scores = self.group_attn(pooled_g).squeeze(-1)  # (B,G)
-                w = torch.softmax(scores, dim=1).unsqueeze(-1)  # (B,G,1)
-                pooled = torch.sum(w * pooled_g, dim=1)
-                snr_pred_out = torch.sum(w.squeeze(-1) * snr_g, dim=1)
+                scores = scores.masked_fill(mask <= 0, float("-inf"))
+                w = torch.softmax(scores, dim=1)  # (B,G)
+                # If all masked (shouldn't happen), softmax -> NaNs; guard.
+                w = torch.where(torch.isfinite(w), w, torch.zeros_like(w))
+                pooled = torch.sum(w.unsqueeze(-1) * pooled_g, dim=1)
+                snr_pred_out = torch.sum(w * snr_g, dim=1)
         else:
             snr_pred_out = snr_pred
         logits = self.cls_head(pooled)
@@ -214,6 +226,7 @@ class DiffusionAMC(nn.Module):
         t: torch.Tensor,
         snr: Optional[torch.Tensor] = None,
         snr_mode: str = "predict",
+        group_mask: Optional[torch.Tensor] = None,
     ):
         # Accept (B,2,L) or (B,K,2,L)
         group_size = None
@@ -231,4 +244,11 @@ class DiffusionAMC(nn.Module):
                 if snr.shape[0] * group_size == x.shape[0]:
                     snr = snr.repeat_interleave(group_size)
         tokens0 = self.encode(x)
-        return self.forward_tokens(tokens0, t, snr=snr, snr_mode=snr_mode, group_size=group_size)
+        return self.forward_tokens(
+            tokens0,
+            t,
+            snr=snr,
+            snr_mode=snr_mode,
+            group_size=group_size,
+            group_mask=group_mask,
+        )

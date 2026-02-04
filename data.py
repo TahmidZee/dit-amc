@@ -282,6 +282,141 @@ class RML2016aGroupedDataset(Dataset):
         return xg, self.y[anchor], self.snr[anchor]
 
 
+class RML2016aVariableGroupedDataset(Dataset):
+    """
+    Returns up to K_max windows per sample from the same (class, SNR) bucket, plus a mask.
+
+    This enables variable-K training (sample K from k_choices each __getitem__) and
+    dynamic-K evaluation (progressively unmask more windows).
+
+    Output:
+      xg: (K_max, 2, 128)
+      y: ()
+      snr: ()
+      mask: (K_max,) float32 in {0,1}
+    """
+
+    def __init__(
+        self,
+        X: torch.Tensor,
+        y: torch.Tensor,
+        snr: torch.Tensor,
+        indices: List[int],
+        k_max: int,
+        k_choices: Optional[List[int]] = None,
+        normalize: str = "rms",
+        eps: float = 1e-8,
+        window_dropout: float = 0.0,
+        aug_phase: bool = False,
+        aug_shift: bool = False,
+        aug_gain: float = 0.0,
+        aug_cfo: float = 0.0,
+    ) -> None:
+        if k_max < 1:
+            raise ValueError("k_max must be >= 1")
+        self.X = X
+        self.y = y
+        self.snr = snr
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.k_max = int(k_max)
+        self.k_choices = [int(k) for k in k_choices] if k_choices else None
+        if self.k_choices is not None:
+            if any(k < 1 or k > self.k_max for k in self.k_choices):
+                raise ValueError("k_choices must be within [1, k_max]")
+        self.normalize = normalize
+        self.eps = float(eps)
+        self.window_dropout = float(window_dropout)
+
+        self.aug_phase = bool(aug_phase)
+        self.aug_shift = bool(aug_shift)
+        self.aug_gain = float(aug_gain)
+        self.aug_cfo = float(aug_cfo)
+
+        y_np = self.y[self.indices].cpu().numpy()
+        snr_np = self.snr[self.indices].cpu().numpy().astype(np.int32)
+        self.bucket_map = {}
+        for local_i, (yy, ss) in enumerate(zip(y_np, snr_np)):
+            key = (int(yy), int(ss))
+            self.bucket_map.setdefault(key, []).append(int(self.indices[local_i]))
+
+    def __len__(self) -> int:
+        return self.indices.shape[0]
+
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        if self.normalize == "none":
+            return x
+        if self.normalize == "rms":
+            rms = torch.sqrt(torch.mean(x * x) + self.eps)
+            return x / rms
+        raise ValueError(f"Unknown normalize mode: {self.normalize}")
+
+    def _augment(self, x: torch.Tensor) -> torch.Tensor:
+        if self.aug_shift:
+            shift = int(torch.randint(0, x.shape[-1], (1,)).item())
+            x = torch.roll(x, shifts=shift, dims=-1)
+        if self.aug_phase:
+            theta = float(torch.rand(1).item()) * (2.0 * math.pi)
+            c = math.cos(theta)
+            s = math.sin(theta)
+            i = x[0]
+            q = x[1]
+            x = torch.stack([c * i - s * q, s * i + c * q], dim=0)
+        if self.aug_cfo and self.aug_cfo > 0:
+            f = (torch.rand(1).item() * 2.0 - 1.0) * float(self.aug_cfo)
+            n = torch.arange(x.shape[-1], device=x.device, dtype=torch.float32)
+            ang = 2.0 * math.pi * f * n
+            c = torch.cos(ang)
+            s = torch.sin(ang)
+            i = x[0]
+            q = x[1]
+            x = torch.stack([c * i - s * q, s * i + c * q], dim=0)
+        if self.aug_gain and self.aug_gain > 0:
+            g = 1.0 + (torch.rand(1).item() * 2.0 - 1.0) * float(self.aug_gain)
+            x = x * float(g)
+        return x
+
+    def __getitem__(self, idx: int):
+        anchor = int(self.indices[int(idx)])
+        yy = int(self.y[anchor].item())
+        ss = int(self.snr[anchor].item())
+        bucket = self.bucket_map[(yy, ss)]
+
+        if self.k_choices is None:
+            k = self.k_max
+        else:
+            k = int(np.random.choice(self.k_choices))
+
+        # Optional window dropout: randomly reduce effective k further.
+        if self.window_dropout and self.window_dropout > 0:
+            keep = int(max(1, round(k * (1.0 - float(self.window_dropout)))))
+            k = min(k, keep)
+
+        # Sample k windows, then pad to k_max by repeating sampled windows.
+        if len(bucket) >= k:
+            chosen = np.random.choice(bucket, size=k, replace=False)
+        else:
+            chosen = np.random.choice(bucket, size=k, replace=True)
+
+        xs = []
+        for i in chosen:
+            x = self._norm(self.X[int(i)])
+            if self.aug_phase or self.aug_shift or (self.aug_gain and self.aug_gain > 0) or (self.aug_cfo and self.aug_cfo > 0):
+                x = self._augment(x)
+            xs.append(x)
+
+        if k < self.k_max:
+            pad_idx = np.random.choice(np.arange(k), size=(self.k_max - k), replace=True)
+            for pi in pad_idx:
+                xs.append(xs[int(pi)])
+            mask = torch.zeros(self.k_max, dtype=torch.float32)
+            mask[:k] = 1.0
+        else:
+            mask = torch.ones(self.k_max, dtype=torch.float32)
+
+        xg = torch.stack(xs, dim=0)  # (K_max,2,128)
+        return xg, self.y[anchor], self.snr[anchor], mask
+
+
 def build_tensors(X: np.ndarray, y: np.ndarray, snr: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     X_t = torch.from_numpy(np.ascontiguousarray(X))
     y_t = torch.from_numpy(y).long()

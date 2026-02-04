@@ -33,6 +33,7 @@ from data import (
     parse_snrs,
     RML2016aDataset,
     RML2016aGroupedDataset,
+    RML2016aVariableGroupedDataset,
 )
 from diffusion import DiffusionSchedule
 from model import DiffusionAMC
@@ -122,6 +123,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stem-layers", type=int, default=2)
     parser.add_argument("--group-k", type=int, default=1, help="Number of random windows per (mod,SNR) bucket per sample.")
     parser.add_argument("--group-pool", type=str, choices=["mean", "attn"], default="mean", help="How to pool over group-k windows.")
+    parser.add_argument("--k-max", type=int, default=None, help="Max windows for variable-K mode (defaults to --group-k).")
+    parser.add_argument("--k-choices", type=str, default=None, help="Comma-separated K choices for variable-K training (e.g. 4,8,16).")
+    parser.add_argument("--window-dropout", type=float, default=0.0, help="Extra random window dropout fraction applied on top of sampled K.")
 
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=50)
@@ -199,6 +203,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--dynamic-k-eval", action="store_true", help="Evaluate with dynamic-K (confidence-adaptive windows) at end of training.")
+    parser.add_argument("--dynamic-k-start", type=int, default=4)
+    parser.add_argument("--dynamic-k-step", type=int, default=4)
+    parser.add_argument("--dynamic-k-max", type=int, default=None, help="Defaults to --k-max (or --group-k).")
+    parser.add_argument("--dynamic-conf-thresh", type=float, default=0.85)
     parser.add_argument(
         "--amp",
         action="store_true",
@@ -243,7 +252,47 @@ def build_loaders(args: argparse.Namespace, device: torch.device):
     test_idx = filter_indices_by_snrs(test_idx, snr, test_snrs)
 
     X_t, y_t, snr_t = build_tensors(X, y, snr)
-    if args.group_k > 1:
+    k_max = int(args.k_max) if args.k_max is not None else int(args.group_k)
+    k_choices = None
+    if args.k_choices is not None and args.k_choices.strip() != "":
+        k_choices = [int(v.strip()) for v in args.k_choices.split(",") if v.strip() != ""]
+
+    use_variable_k = k_choices is not None and len(k_choices) > 0 and k_max > 1
+    if use_variable_k:
+        train_ds = RML2016aVariableGroupedDataset(
+            X_t,
+            y_t,
+            snr_t,
+            train_idx,
+            k_max=k_max,
+            k_choices=k_choices,
+            normalize=args.normalize,
+            window_dropout=args.window_dropout,
+            aug_phase=args.aug_phase,
+            aug_shift=args.aug_shift,
+            aug_gain=args.aug_gain,
+            aug_cfo=args.aug_cfo,
+        )
+        # For val/test in variable-K mode, we use full k_max windows (mask=all ones).
+        val_ds = RML2016aVariableGroupedDataset(
+            X_t,
+            y_t,
+            snr_t,
+            val_idx,
+            k_max=k_max,
+            k_choices=None,
+            normalize=args.normalize,
+        )
+        test_ds = RML2016aVariableGroupedDataset(
+            X_t,
+            y_t,
+            snr_t,
+            test_idx,
+            k_max=k_max,
+            k_choices=None,
+            normalize=args.normalize,
+        )
+    elif args.group_k > 1:
         train_ds = RML2016aGroupedDataset(
             X_t,
             y_t,
@@ -398,7 +447,12 @@ def evaluate(
     snr_total: Dict[int, int] = {}
 
     with torch.no_grad():
-        for x, y, snr in loader:
+        for batch in loader:
+            if len(batch) == 4:
+                x, y, snr, mask = batch
+            else:
+                x, y, snr = batch
+                mask = None
             x = x.to(device)
             y = y.to(device)
             snr = snr.to(device)
@@ -406,9 +460,9 @@ def evaluate(
             snr_in = snr if snr_mode == "known" else None
             if amp and device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=_cuda_amp_dtype(), enabled=True):
-                    logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode)
+                    logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
             else:
-                logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode)
+                logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
 
             preds = logits.argmax(dim=1)
             correct = (preds == y).sum().item()
@@ -428,6 +482,103 @@ def evaluate(
     return acc, total, acc_by_snr
 
 
+def evaluate_dynamic_k(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    t_eval: int,
+    snr_mode: str,
+    amp: bool,
+    k_start: int,
+    k_step: int,
+    k_max: int,
+    conf_thresh: float,
+) -> Tuple[float, float, Dict[int, float], float]:
+    """
+    Dynamic evidence evaluation:
+    progressively unmask more windows until confidence >= threshold (or k_max reached).
+
+    Requires loader to yield (x, y, snr, mask) with x shape (B, Kmax, 2, 128).
+    Returns (acc, total, acc_by_snr, avg_k_used).
+    """
+    model.eval()
+    total_correct = 0
+    total = 0
+    total_k_used = 0
+    snr_correct: Dict[int, int] = {}
+    snr_total: Dict[int, int] = {}
+
+    k_start = max(1, int(k_start))
+    k_step = max(1, int(k_step))
+    k_max = max(1, int(k_max))
+    conf_thresh = float(conf_thresh)
+
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) != 4:
+                raise ValueError("Dynamic-K evaluation requires batches of (x, y, snr, mask).")
+            x, y, snr, _mask_full = batch
+            x = x.to(device)
+            y = y.to(device)
+            snr = snr.to(device)
+
+            if x.ndim != 4:
+                raise ValueError("Expected x with shape (B, Kmax, 2, 128) for dynamic-K.")
+            bsz = x.shape[0]
+            kmax_here = x.shape[1]
+            kmax_use = min(k_max, kmax_here)
+
+            t = torch.full((bsz,), t_eval, device=device, dtype=torch.long)
+            snr_in = snr if snr_mode == "known" else None
+
+            decided = torch.zeros(bsz, device=device, dtype=torch.bool)
+            preds = torch.zeros(bsz, device=device, dtype=torch.long)
+            k_used = torch.full((bsz,), kmax_use, device=device, dtype=torch.long)
+
+            k = k_start
+            while True:
+                k = min(k, kmax_use)
+                mask = torch.zeros((bsz, kmax_here), device=device, dtype=torch.float32)
+                mask[:, :k] = 1.0
+
+                if amp and device.type == "cuda":
+                    with torch.autocast(device_type="cuda", dtype=_cuda_amp_dtype(), enabled=True):
+                        logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
+                else:
+                    logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
+
+                prob = torch.softmax(logits, dim=1)
+                conf, pred = torch.max(prob, dim=1)
+
+                newly_decided = (~decided) & (conf >= conf_thresh)
+                preds[newly_decided] = pred[newly_decided]
+                k_used[newly_decided] = k
+                decided = decided | newly_decided
+
+                if decided.all() or k >= kmax_use:
+                    preds[~decided] = pred[~decided]
+                    k_used[~decided] = k
+                    break
+                k += k_step
+
+            total_correct += (preds == y).sum().item()
+            total += y.shape[0]
+            total_k_used += int(k_used.sum().item())
+
+            snr_cpu = snr.detach().cpu().numpy().astype(np.int32)
+            preds_cpu = preds.detach().cpu().numpy()
+            y_cpu = y.detach().cpu().numpy()
+            for snr_val, pred_val, y_val in zip(snr_cpu, preds_cpu, y_cpu):
+                snr_key = int(snr_val)
+                snr_correct[snr_key] = snr_correct.get(snr_key, 0) + int(pred_val == y_val)
+                snr_total[snr_key] = snr_total.get(snr_key, 0) + 1
+
+    acc = float(total_correct) / max(1, total)
+    acc_by_snr = {snr: snr_correct[snr] / snr_total[snr] for snr in snr_total.keys()}
+    avg_k = float(total_k_used) / max(1, total)
+    return acc, total, acc_by_snr, avg_k
+
+
 def evaluate_subset(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -443,9 +594,14 @@ def evaluate_subset(
     total_correct = 0
     total = 0
     with torch.no_grad():
-        for batch_idx, (x, y, snr) in enumerate(loader):
+        for batch_idx, batch in enumerate(loader):
             if batch_idx >= max_batches:
                 break
+            if len(batch) == 4:
+                x, y, snr, mask = batch
+            else:
+                x, y, snr = batch
+                mask = None
             x = x.to(device)
             y = y.to(device)
             snr = snr.to(device)
@@ -453,9 +609,9 @@ def evaluate_subset(
             snr_in = snr if snr_mode == "known" else None
             if amp and device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=_cuda_amp_dtype(), enabled=True):
-                    logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode)
+                    logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
             else:
-                logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode)
+                logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
             preds = logits.argmax(dim=1)
             total_correct += (preds == y).sum().item()
             total += y.shape[0]
@@ -547,10 +703,16 @@ def train(args: argparse.Namespace) -> None:
             unit="batch",
             dynamic_ncols=True,
         )
-        for x, y, snr in progress:
+        for batch in progress:
+            if len(batch) == 4:
+                x, y, snr, mask = batch
+            else:
+                x, y, snr = batch
+                mask = None
             x = x.to(device)
             y = y.to(device)
             snr = snr.to(device)
+            mask = mask.to(device) if mask is not None else None
 
             # --- Token-space diffusion: z_t = sqrt(a)*z0 + sqrt(1-a)*eps ---
             # z0 are patch embeddings BEFORE positional embedding; model adds pos internally.
@@ -601,6 +763,7 @@ def train(args: argparse.Namespace) -> None:
                         snr=snr_in,
                         snr_mode=args.snr_mode,
                         group_size=group_size,
+                        group_mask=mask,
                     )
                     if args.low_snr_boost and args.low_snr_boost > 0 and args.snr_floor_db is not None:
                         snr_floor = float(args.snr_floor_db)
@@ -623,6 +786,7 @@ def train(args: argparse.Namespace) -> None:
                     snr=snr_in,
                     snr_mode=args.snr_mode,
                     group_size=group_size,
+                    group_mask=mask,
                 )
                 if args.low_snr_boost and args.low_snr_boost > 0 and args.snr_floor_db is not None:
                     snr_floor = float(args.snr_floor_db)
@@ -767,11 +931,32 @@ def train(args: argparse.Namespace) -> None:
     test_acc, _, test_acc_by_snr = evaluate(
         model, test_loader, device, args.t_eval, args.snr_mode, amp=args.amp
     )
+    dyn = None
+    if args.dynamic_k_eval:
+        dyn_k_max = int(args.dynamic_k_max) if args.dynamic_k_max is not None else int(args.k_max if args.k_max is not None else args.group_k)
+        dyn_acc, _dyn_total, dyn_by_snr, avg_k = evaluate_dynamic_k(
+            model,
+            test_loader,
+            device,
+            args.t_eval,
+            args.snr_mode,
+            amp=args.amp,
+            k_start=args.dynamic_k_start,
+            k_step=args.dynamic_k_step,
+            k_max=dyn_k_max,
+            conf_thresh=args.dynamic_conf_thresh,
+        )
+        dyn = {"dynamic_test_acc": dyn_acc, "dynamic_avg_k": avg_k, "dynamic_test_acc_by_snr": dyn_by_snr}
     with open(os.path.join(args.out_dir, "test_acc_by_snr.json"), "w", encoding="utf-8") as f:
         json.dump(test_acc_by_snr, f, indent=2)
     write_jsonl(
         metrics_path,
-        {"epoch": best_epoch if best_epoch is not None else args.epochs, "test_acc": test_acc, "best_val_acc": best_val},
+        {
+            "epoch": best_epoch if best_epoch is not None else args.epochs,
+            "test_acc": test_acc,
+            "best_val_acc": best_val,
+            **(dyn if dyn is not None else {}),
+        },
     )
 
 

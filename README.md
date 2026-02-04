@@ -92,12 +92,45 @@ python train.py \
   --ckpt ./runs/dit_amc_group8_stem/best.pt
 ```
 
+### Variable-K training (Kmax=16) + dynamic-K evaluation (Step D)
+
+Train so the model learns to operate with varying amounts of evidence, then evaluate with
+confidence-adaptive K at the end:
+
+```bash
+python train.py \
+  --data-path /path/to/RML2016.10a_dict.pkl \
+  --out-dir ./runs/dit_amc_varK16_dynK \
+  --preset B \
+  --snr-mode predict \
+  --k-max 16 \
+  --k-choices 4,8,16 \
+  --group-pool attn \
+  --window-dropout 0.25 \
+  --stem-channels 64 \
+  --stem-layers 2 \
+  --snr-balanced \
+  --label-smoothing 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --dynamic-k-eval \
+  --dynamic-k-start 4 \
+  --dynamic-k-step 4 \
+  --dynamic-k-max 16 \
+  --dynamic-conf-thresh 0.85 \
+  --normalize rms \
+  --amp
+```
+
 ## Key Arguments
 
 ### Model architecture
 - `--preset {S,B}`: Model size (S=small, B=base). S: p=8, d=192, depth=10; B: p=4, d=256, depth=12
 - `--group-k N`: Multi-window pooling (N random windows from same (mod,SNR) bucket). Default: 1
 - `--group-pool {mean,attn}`: Pool across the `group-k` windows (mean or learned attention). Default: mean
+- `--k-max N`: Enable variable-K mode (max windows, padded+masked). Defaults to `--group-k`
+- `--k-choices LIST`: Comma-separated K choices for variable-K training (e.g. `4,8,16`)
+- `--window-dropout F`: Additional fraction of windows dropped during variable-K training (forces robustness)
 - `--stem-channels C`: CNN stem channels (0 to disable). Default: 0
 - `--stem-layers L`: CNN stem depth. Default: 0
 
@@ -117,6 +150,15 @@ Applied to the **training** split only (after normalization):
 - `--aug-shift`: Random circular time shift per window
 - `--aug-gain F`: Gain jitter magnitude (e.g. 0.2 ⇒ ×[0.8,1.2]); mostly redundant if `--normalize rms`
 - `--aug-cfo F`: Max CFO in cycles/sample (keep small, e.g. 0.005–0.02)
+
+### Dynamic-K evaluation (confidence adaptive)
+Trades compute for accuracy at evaluation time (logs `dynamic_test_acc` and `dynamic_avg_k` to `metrics.jsonl`):
+
+- `--dynamic-k-eval`
+- `--dynamic-k-start N`
+- `--dynamic-k-step N`
+- `--dynamic-k-max N`
+- `--dynamic-conf-thresh F` (max-softmax threshold)
 
 ### Diffusion regularization
 - `--lambda-diff F`: Diffusion loss weight (default: 0.2)
