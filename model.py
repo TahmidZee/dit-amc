@@ -18,6 +18,30 @@ def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 1000
     return embedding
 
 
+class ResBlock1d(nn.Module):
+    """Residual block for 1D signals with optional channel projection."""
+
+    def __init__(self, channels: int, kernel_size: int = 3, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.norm1 = nn.BatchNorm1d(channels)
+        self.norm2 = nn.BatchNorm1d(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm1(x)
+        x = self.act(x)
+        x = self.conv1(x)
+        x = self.norm2(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.conv2(x)
+        return x + residual
+
+
 class DiTBlock(nn.Module):
     def __init__(self, dim: int, heads: int, mlp_ratio: float, dropout: float) -> None:
         super().__init__()
@@ -82,12 +106,14 @@ class DiffusionAMC(nn.Module):
         self.group_pool = group_pool
 
         if stem_channels and stem_channels > 0:
-            layers = []
-            ch_in = in_channels
+            # Deeper residual stem: project to stem_channels, then stack ResBlocks.
+            layers = [
+                nn.Conv1d(in_channels, stem_channels, kernel_size=7, padding=3),
+                nn.BatchNorm1d(stem_channels),
+                nn.GELU(),
+            ]
             for _ in range(int(stem_layers)):
-                layers.append(nn.Conv1d(ch_in, stem_channels, kernel_size=3, padding=1))
-                layers.append(nn.GELU())
-                ch_in = stem_channels
+                layers.append(ResBlock1d(stem_channels, kernel_size=3, dropout=dropout * 0.5))
             self.stem = nn.Sequential(*layers)
             patch_in = stem_channels
         else:
