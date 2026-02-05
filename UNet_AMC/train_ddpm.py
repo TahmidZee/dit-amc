@@ -65,6 +65,13 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument(
+        "--train-with-ddpm",
+        action="store_true",
+        help="If set, train a classifier on DDPM-denoised inputs (very slow). "
+             "If not set, we only train the baseline classifier and evaluate "
+             "DDPM as an inference-time preprocessor."
+    )
     
     # SNR thresholds for pairing
     parser.add_argument("--high-snr-threshold", type=int, default=14)
@@ -386,8 +393,9 @@ def main():
     print("Phase 2: Training classifier")
     print("=" * 60)
     
-    # Train two classifiers: with and without DDPM
-    for use_ddpm in [False, True]:
+    # Always train the baseline classifier (no denoising)
+    trained_classifiers = {}
+    for use_ddpm in [False] + ([True] if args.train_with_ddpm else []):
         name = "with_ddpm" if use_ddpm else "without_ddpm"
         print(f"\n--- Training classifier {name} ---")
         
@@ -440,6 +448,7 @@ def main():
         
         # Load best classifier and evaluate
         classifier.load_state_dict(torch.load(out_dir / f"classifier_{name}_best.pt", weights_only=True))
+        trained_classifiers[name] = classifier
         
         print(f"\n  Final test evaluation ({name}):")
         overall, acc_by_snr = evaluate_by_snr(
@@ -453,6 +462,20 @@ def main():
         # Save results
         with open(out_dir / f"test_acc_by_snr_{name}.json", "w") as f:
             json.dump(acc_by_snr, f, indent=2)
+
+    # Always evaluate DDPM as an inference-time preprocessor on the baseline classifier
+    if "without_ddpm" in trained_classifiers:
+        print("\n" + "-" * 60)
+        print("Inference-time DDPM preprocessing (no retraining)")
+        print("-" * 60)
+
+        base_clf = trained_classifiers["without_ddpm"]
+        overall_ddpm, acc_by_snr_ddpm = evaluate_by_snr(
+            base_clf, full_test_loader, device, ddpm=ddpm, denoise_steps=args.denoise_steps
+        )
+        print(f"  Baseline classifier + DDPM denoise ({args.denoise_steps} steps): {overall_ddpm:.4f}")
+        with open(out_dir / f"test_acc_by_snr_baseline_plus_ddpm_{args.denoise_steps}steps.json", "w") as f:
+            json.dump(acc_by_snr_ddpm, f, indent=2)
     
     # =========================================================================
     # Final comparison: Test with different denoising steps
@@ -460,17 +483,24 @@ def main():
     print("\n" + "=" * 60)
     print("Testing DDPM denoising with different step counts")
     print("=" * 60)
-    
-    classifier.load_state_dict(torch.load(out_dir / "classifier_with_ddpm_best.pt", weights_only=True))
-    
-    for steps in [10, 25, 50, 100, 200]:
-        overall, _ = evaluate_by_snr(classifier, full_test_loader, device, ddpm=ddpm, denoise_steps=steps)
-        print(f"  {steps} steps: {overall:.4f}")
+    if "without_ddpm" in trained_classifiers:
+        base_clf = trained_classifiers["without_ddpm"]
+        for steps in [10, 25, 50, 100, 200]:
+            overall, _ = evaluate_by_snr(
+                base_clf, full_test_loader, device, ddpm=ddpm, denoise_steps=steps
+            )
+            print(f"  {steps} steps: {overall:.4f}")
+    else:
+        print("  (Skipping step sweep: baseline classifier not available.)")
     
     # Save config
     config = vars(args)
     config["ddpm_params"] = count_parameters(ddpm)
-    config["classifier_params"] = count_parameters(classifier)
+    config["classifier_params"] = (
+        count_parameters(trained_classifiers["without_ddpm"])
+        if "without_ddpm" in trained_classifiers
+        else None
+    )
     with open(out_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
     
