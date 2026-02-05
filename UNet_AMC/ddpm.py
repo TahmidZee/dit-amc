@@ -144,15 +144,16 @@ class DownBlock(nn.Module):
         self.pool = nn.MaxPool1d(2)
     
     def forward(self, x, t_emb):
+        skip = x  # Save BEFORE conv (has in_ch channels)
         x = self.conv(x, t_emb)
-        return self.pool(x), x  # Return pooled and skip
+        return self.pool(x), skip
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, time_dim):
+    def __init__(self, in_ch, skip_ch, out_ch, time_dim):
         super().__init__()
         self.up = nn.ConvTranspose1d(in_ch, out_ch, 2, stride=2)
-        self.conv = ConvBlock(out_ch * 2, out_ch, time_dim)  # *2 for skip
+        self.conv = ConvBlock(out_ch + skip_ch, out_ch, time_dim)
     
     def forward(self, x, skip, t_emb):
         x = self.up(x)
@@ -182,21 +183,39 @@ class UNetDDPM(nn.Module):
         )
         
         # Encoder
+        # inc: in_channels -> base_channels
         self.inc = ConvBlock(in_channels, base_channels, time_dim)
+        
+        # Track channel sizes for skip connections
+        # After inc: base_channels
+        # Each down: in_ch -> out_ch (doubles)
         self.downs = nn.ModuleList()
+        self.encoder_channels = [base_channels]  # Channels at each level (for skips)
+        
         ch = base_channels
         for i in range(depth):
             self.downs.append(DownBlock(ch, ch * 2, time_dim))
+            self.encoder_channels.append(ch)  # Skip has 'ch' channels (before conv)
             ch *= 2
         
         # Bottleneck
         self.mid = ConvBlock(ch, ch, time_dim)
         
         # Decoder
+        # Need to match skip channels correctly
+        # Skips are stored in order: [base, base, base*2, base*4, ...]
+        # Reversed: [..., base*4, base*2, base, base]
         self.ups = nn.ModuleList()
+        skip_channels = list(reversed(self.encoder_channels[1:]))  # Exclude first (used at end)
+        
         for i in range(depth):
-            self.ups.append(UpBlock(ch, ch // 2, time_dim))
-            ch //= 2
+            skip_ch = skip_channels[i]
+            out_ch = ch // 2
+            self.ups.append(UpBlock(ch, skip_ch, out_ch, time_dim))
+            ch = out_ch
+        
+        # Final: concatenate with inc output (base_channels)
+        self.final_conv = ConvBlock(ch + base_channels, base_channels, time_dim)
         
         # Output
         self.outc = nn.Conv1d(base_channels, in_channels, 1)
@@ -213,6 +232,8 @@ class UNetDDPM(nn.Module):
         
         # Encoder
         x = self.inc(x, t_emb)
+        inc_skip = x  # Save for final concat
+        
         skips = []
         for down in self.downs:
             x, skip = down(x, t_emb)
@@ -224,6 +245,13 @@ class UNetDDPM(nn.Module):
         # Decoder
         for up, skip in zip(self.ups, reversed(skips)):
             x = up(x, skip, t_emb)
+        
+        # Final concat with inc output
+        if x.size(-1) != inc_skip.size(-1):
+            diff = inc_skip.size(-1) - x.size(-1)
+            x = F.pad(x, (diff // 2, diff - diff // 2))
+        x = torch.cat([x, inc_skip], dim=1)
+        x = self.final_conv(x, t_emb)
         
         return self.outc(x)
 
