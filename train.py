@@ -121,6 +121,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--stem-channels", type=int, default=64)
     parser.add_argument("--stem-layers", type=int, default=2)
+    # Improved classifier architecture options
+    parser.add_argument("--use-cls-token", action="store_true", help="Use learnable [CLS] token instead of mean pooling.")
+    parser.add_argument("--cls-head-hidden", type=int, default=0, help="Hidden dim for MLP classifier (0 = single linear).")
+    parser.add_argument("--cls-head-layers", type=int, default=1, help="Number of layers in classifier head.")
+    parser.add_argument("--use-lstm", action="store_true", help="Add LSTM after Transformer for temporal modeling.")
+    parser.add_argument("--lstm-hidden", type=int, default=128, help="LSTM hidden size (bidirectional, so 2x this).")
     parser.add_argument("--group-k", type=int, default=1, help="Number of random windows per (mod,SNR) bucket per sample.")
     parser.add_argument("--group-pool", type=str, choices=["mean", "attn"], default="mean", help="How to pool over group-k windows.")
     parser.add_argument("--k-max", type=int, default=None, help="Max windows for variable-K mode (defaults to --group-k).")
@@ -660,6 +666,11 @@ def train(args: argparse.Namespace) -> None:
         stem_channels=args.stem_channels,
         stem_layers=args.stem_layers,
         group_pool=args.group_pool,
+        use_cls_token=args.use_cls_token,
+        cls_head_hidden=args.cls_head_hidden,
+        cls_head_layers=args.cls_head_layers,
+        use_lstm=args.use_lstm,
+        lstm_hidden=args.lstm_hidden,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -977,6 +988,11 @@ def run_eval(args: argparse.Namespace) -> None:
         stem_channels=args.stem_channels,
         stem_layers=args.stem_layers,
         group_pool=args.group_pool,
+        use_cls_token=args.use_cls_token,
+        cls_head_hidden=args.cls_head_hidden,
+        cls_head_layers=args.cls_head_layers,
+        use_lstm=args.use_lstm,
+        lstm_hidden=args.lstm_hidden,
     ).to(device)
 
     if args.ckpt is None:
