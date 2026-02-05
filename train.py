@@ -45,6 +45,86 @@ PRESETS = {
 }
 
 
+# =============================================================================
+# Mixup augmentation helper
+# =============================================================================
+def mixup_data(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    snr: torch.Tensor,
+    alpha: float = 0.4,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor]:
+    """
+    Apply mixup augmentation.
+    Returns: (mixed_x, y_a, y_b, lam, mixed_snr)
+    """
+    if alpha > 0:
+        lam = float(np.random.beta(alpha, alpha))
+    else:
+        lam = 1.0
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    mixed_snr = lam * snr + (1 - lam) * snr[index]
+
+    return mixed_x, y_a, y_b, lam, mixed_snr
+
+
+def mixup_criterion(
+    criterion_fn,
+    logits: torch.Tensor,
+    y_a: torch.Tensor,
+    y_b: torch.Tensor,
+    lam: float,
+) -> torch.Tensor:
+    """Compute mixup loss as weighted combination of losses for both labels."""
+    return lam * criterion_fn(logits, y_a) + (1 - lam) * criterion_fn(logits, y_b)
+
+
+# =============================================================================
+# Curriculum learning helper
+# =============================================================================
+def get_curriculum_snr_min(epoch: int, curriculum_epochs: int, snr_start: float, snr_end: float = -20.0) -> float:
+    """
+    Compute the minimum SNR for curriculum learning.
+    Linearly decreases from snr_start to snr_end over curriculum_epochs.
+    """
+    if curriculum_epochs <= 0:
+        return snr_end
+    progress = min(1.0, float(epoch) / float(curriculum_epochs))
+    return snr_start + progress * (snr_end - snr_start)
+
+
+# =============================================================================
+# Consistency loss helper
+# =============================================================================
+def consistency_loss(logits_list: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Compute consistency loss as the mean variance of predictions across K windows.
+    logits_list: list of K tensors, each (B, C)
+    Returns: scalar loss encouraging all K predictions to be the same.
+    """
+    if len(logits_list) <= 1:
+        return torch.tensor(0.0, device=logits_list[0].device)
+    
+    # Stack: (K, B, C)
+    stacked = torch.stack(logits_list, dim=0)
+    # Compute softmax probs
+    probs = F.softmax(stacked, dim=-1)  # (K, B, C)
+    # Mean across K
+    mean_probs = probs.mean(dim=0, keepdim=True)  # (1, B, C)
+    # KL divergence from each to mean
+    kl_divs = F.kl_div(
+        probs.log(),
+        mean_probs.expand_as(probs),
+        reduction="none",
+    ).sum(dim=-1)  # (K, B)
+    return kl_divs.mean()
+
+
 def _cuda_amp_dtype() -> torch.dtype:
     if not torch.cuda.is_available():
         return torch.float32
@@ -141,6 +221,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cldnn-lstm-layers", type=int, default=2, help="Number of LSTM layers.")
     parser.add_argument("--cldnn-bidir", action="store_true", help="Use bidirectional LSTM.")
     parser.add_argument("--cldnn-pool", type=str, default="attn", choices=["attn", "last", "mean"], help="Temporal pooling over LSTM outputs.")
+    parser.add_argument("--cldnn-snr-cond", action="store_true", help="Enable SNR conditioning via FiLM for CLDNN.")
+
+    # Mixup augmentation
+    parser.add_argument("--mixup-alpha", type=float, default=0.0, help="Mixup alpha (0 = disabled). Recommended: 0.2-0.4.")
+    parser.add_argument("--mixup-prob", type=float, default=0.5, help="Probability of applying mixup per batch (when alpha > 0).")
+
+    # Curriculum learning (SNR-based)
+    parser.add_argument("--curriculum-epochs", type=int, default=0, help="Number of epochs for curriculum (0 = disabled). SNR min increases from curriculum-snr-start to -20.")
+    parser.add_argument("--curriculum-snr-start", type=float, default=0.0, help="Starting SNR min for curriculum (e.g., 0 means start with SNR >= 0 only).")
+
+    # Consistency loss for multi-window training
+    parser.add_argument("--consistency-lambda", type=float, default=0.0, help="Weight for consistency loss across K windows (0 = disabled).")
+    parser.add_argument("--consistency-k", type=int, default=4, help="Number of windows for consistency loss (used when consistency-lambda > 0).")
 
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=50)
@@ -689,6 +782,7 @@ def train(args: argparse.Namespace) -> None:
             bidirectional=bool(args.cldnn_bidir),
             dropout=float(args.dropout),
             pool=str(args.cldnn_pool),
+            snr_cond=bool(args.cldnn_snr_cond),
         ).to(device)
         schedule = None
 
@@ -720,6 +814,15 @@ def train(args: argparse.Namespace) -> None:
         phase1 = epoch < args.phase1_epochs
         lambda_diff = args.phase1_lambda_diff if phase1 else args.lambda_diff
         p_clean = args.phase1_p_clean if phase1 else args.p_clean
+
+        # Curriculum learning: compute minimum SNR for this epoch
+        curriculum_snr_min = get_curriculum_snr_min(
+            epoch,
+            args.curriculum_epochs,
+            args.curriculum_snr_start,
+            snr_end=-20.0,
+        )
+
         model.train()
         epoch_loss = 0.0
         epoch_correct = 0
@@ -791,6 +894,28 @@ def train(args: argparse.Namespace) -> None:
                 z0 = None
                 zt = None
 
+            # --- Curriculum learning: mask out samples below curriculum_snr_min ---
+            # curriculum_mask is 1.0 for samples to include, 0.0 for samples to skip
+            if args.curriculum_epochs > 0:
+                curriculum_mask = (snr >= curriculum_snr_min).float()
+            else:
+                curriculum_mask = torch.ones_like(snr)
+
+            # --- Mixup augmentation (only for CLDNN, with probability mixup_prob) ---
+            use_mixup = False
+            y_a, y_b, lam = y, y, 1.0
+            if args.arch != "dit" and args.mixup_alpha > 0 and random.random() < args.mixup_prob:
+                use_mixup = True
+                # Flatten x if grouped (K>1) for mixup - mix at sample level
+                if x.ndim == 4:
+                    # For grouped windows, mixup the whole group together
+                    x, y_a, y_b, lam, snr = mixup_data(x, y, snr, alpha=args.mixup_alpha)
+                else:
+                    x, y_a, y_b, lam, snr = mixup_data(x, y, snr, alpha=args.mixup_alpha)
+                # Update curriculum mask for mixed SNR
+                if args.curriculum_epochs > 0:
+                    curriculum_mask = (snr >= curriculum_snr_min).float()
+
             optimizer.zero_grad(set_to_none=True)
             snr_in = snr if args.snr_mode == "known" else None
             if amp_enabled:
@@ -810,6 +935,17 @@ def train(args: argparse.Namespace) -> None:
                             x, t, snr=snr_in, snr_mode=args.snr_mode, group_mask=mask
                         )
                         loss_diff = 0.0
+
+                    # Compute classification loss (with optional mixup and curriculum)
+                    if use_mixup:
+                        # Mixup: blend losses for both labels
+                        ce_a = F.cross_entropy(logits, y_a, reduction="none", label_smoothing=float(args.label_smoothing))
+                        ce_b = F.cross_entropy(logits, y_b, reduction="none", label_smoothing=float(args.label_smoothing))
+                        ce = lam * ce_a + (1 - lam) * ce_b
+                    else:
+                        ce = F.cross_entropy(logits, y, reduction="none", label_smoothing=float(args.label_smoothing))
+
+                    # Apply low-SNR boost weighting
                     if args.low_snr_boost and args.low_snr_boost > 0 and args.snr_floor_db is not None:
                         snr_floor = float(args.snr_floor_db)
                         snr_cap_max = float(args.snr_cap_max_db)
@@ -817,10 +953,13 @@ def train(args: argparse.Namespace) -> None:
                         snr_clamped = torch.clamp(snr.float(), min=snr_floor, max=snr_cap_max)
                         frac = (snr_clamped - snr_floor) / denom
                         weights = 1.0 + float(args.low_snr_boost) * (1.0 - frac)
-                        ce = F.cross_entropy(logits, y, reduction="none", label_smoothing=float(args.label_smoothing))
-                        loss_cls = torch.mean(ce * weights)
-                    else:
-                        loss_cls = F.cross_entropy(logits, y, label_smoothing=float(args.label_smoothing))
+                        ce = ce * weights
+
+                    # Apply curriculum mask (zero out samples below SNR threshold)
+                    ce = ce * curriculum_mask
+                    denom_curriculum = torch.clamp(curriculum_mask.sum(), min=1.0)
+                    loss_cls = ce.sum() / denom_curriculum
+
                     loss_snr = F.smooth_l1_loss(snr_pred, snr) if args.lambda_snr > 0 else 0.0
                     loss = loss_cls + lambda_diff * loss_diff + args.lambda_snr * loss_snr
             else:
@@ -839,6 +978,17 @@ def train(args: argparse.Namespace) -> None:
                         x, t, snr=snr_in, snr_mode=args.snr_mode, group_mask=mask
                     )
                     loss_diff = 0.0
+
+                # Compute classification loss (with optional mixup and curriculum)
+                if use_mixup:
+                    # Mixup: blend losses for both labels
+                    ce_a = F.cross_entropy(logits, y_a, reduction="none", label_smoothing=float(args.label_smoothing))
+                    ce_b = F.cross_entropy(logits, y_b, reduction="none", label_smoothing=float(args.label_smoothing))
+                    ce = lam * ce_a + (1 - lam) * ce_b
+                else:
+                    ce = F.cross_entropy(logits, y, reduction="none", label_smoothing=float(args.label_smoothing))
+
+                # Apply low-SNR boost weighting
                 if args.low_snr_boost and args.low_snr_boost > 0 and args.snr_floor_db is not None:
                     snr_floor = float(args.snr_floor_db)
                     snr_cap_max = float(args.snr_cap_max_db)
@@ -846,10 +996,13 @@ def train(args: argparse.Namespace) -> None:
                     snr_clamped = torch.clamp(snr.float(), min=snr_floor, max=snr_cap_max)
                     frac = (snr_clamped - snr_floor) / denom
                     weights = 1.0 + float(args.low_snr_boost) * (1.0 - frac)
-                    ce = F.cross_entropy(logits, y, reduction="none", label_smoothing=float(args.label_smoothing))
-                    loss_cls = torch.mean(ce * weights)
-                else:
-                    loss_cls = F.cross_entropy(logits, y, label_smoothing=float(args.label_smoothing))
+                    ce = ce * weights
+
+                # Apply curriculum mask (zero out samples below SNR threshold)
+                ce = ce * curriculum_mask
+                denom_curriculum = torch.clamp(curriculum_mask.sum(), min=1.0)
+                loss_cls = ce.sum() / denom_curriculum
+
                 loss_snr = F.smooth_l1_loss(snr_pred, snr) if args.lambda_snr > 0 else 0.0
                 loss = loss_cls + lambda_diff * loss_diff + args.lambda_snr * loss_snr
 
@@ -1039,6 +1192,7 @@ def run_eval(args: argparse.Namespace) -> None:
             bidirectional=bool(args.cldnn_bidir),
             dropout=float(args.dropout),
             pool=str(args.cldnn_pool),
+            snr_cond=bool(args.cldnn_snr_cond),
         ).to(device)
 
     if args.ckpt is None:

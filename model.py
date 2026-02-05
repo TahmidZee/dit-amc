@@ -335,6 +335,7 @@ class CLDNNAMC(nn.Module):
       - Strong inductive bias for short IQ sequences (L=128)
       - Small parameter count (<< DiT-AMC) to reduce overfitting
       - Optional attention pooling over LSTM outputs (better than "last hidden" at low SNR)
+      - Optional SNR conditioning via FiLM (Feature-wise Linear Modulation)
 
     Forward signature matches DiffusionAMC so we can reuse evaluate()/dynamic-K code.
     """
@@ -350,6 +351,8 @@ class CLDNNAMC(nn.Module):
         bidirectional: bool = False,
         dropout: float = 0.5,
         pool: str = "attn",  # attn|last|mean
+        snr_cond: bool = False,  # Enable SNR conditioning via FiLM
+        snr_embed_dim: int = 64,  # SNR embedding dimension
     ) -> None:
         super().__init__()
         if seq_len != 128:
@@ -359,6 +362,7 @@ class CLDNNAMC(nn.Module):
             raise ValueError(f"pool must be one of attn|last|mean, got {pool}")
         self.seq_len = int(seq_len)
         self.pool = pool
+        self.snr_cond = bool(snr_cond)
 
         # Branch 1: IQ joint Conv2D over (2 x 128)
         self.conv_iq = nn.Conv2d(
@@ -401,8 +405,25 @@ class CLDNNAMC(nn.Module):
             dropout=float(dropout) if int(lstm_layers) > 1 else 0.0,
         )
         lstm_out_dim = lstm_hidden * (2 if bidirectional else 1)
+        self.lstm_out_dim = lstm_out_dim
 
         self.attn_pool = TemporalAttentionPool(lstm_out_dim, hidden=max(64, lstm_out_dim // 2))
+
+        # SNR conditioning: embed SNR scalar into a vector, then produce FiLM params (scale, shift)
+        if self.snr_cond:
+            self.snr_embed = nn.Sequential(
+                nn.Linear(1, snr_embed_dim),
+                nn.GELU(),
+                nn.Linear(snr_embed_dim, snr_embed_dim),
+                nn.GELU(),
+            )
+            # FiLM: gamma (scale) and beta (shift) for the pooled feature
+            self.film_gamma = nn.Linear(snr_embed_dim, lstm_out_dim)
+            self.film_beta = nn.Linear(snr_embed_dim, lstm_out_dim)
+        else:
+            self.snr_embed = None
+            self.film_gamma = None
+            self.film_beta = None
 
         # Classifier head (mirrors MCLDNN-style DNN)
         self.fc1 = nn.Linear(lstm_out_dim, 128)
@@ -413,9 +434,14 @@ class CLDNNAMC(nn.Module):
         # Optional SNR head for auxiliary supervision (kept for compatibility with train.py)
         self.snr_head = nn.Linear(lstm_out_dim, 1)
 
-    def _forward_windows(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_windows(
+        self,
+        x_flat: torch.Tensor,
+        snr_flat: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x_flat: (B*, 2, 128)
+        snr_flat: (B*,) optional SNR values for conditioning
         returns:
           feat: (B*, D)
           snr_pred: (B*,)
@@ -450,6 +476,16 @@ class CLDNNAMC(nn.Module):
         else:  # last
             feat = lstm_out[:, -1, :]
 
+        # Apply FiLM conditioning if enabled and SNR is provided
+        if self.snr_cond and snr_flat is not None:
+            snr_in = snr_flat.view(-1, 1).float()  # (B,1)
+            # Normalize SNR to roughly [-1, 1] range (RML2016.10a: -20 to 18 dB)
+            snr_norm = (snr_in - (-1.0)) / 19.0  # centered around 0
+            snr_emb = self.snr_embed(snr_norm)  # (B, snr_embed_dim)
+            gamma = self.film_gamma(snr_emb)  # (B, D)
+            beta = self.film_beta(snr_emb)  # (B, D)
+            feat = gamma * feat + beta  # FiLM modulation
+
         snr_pred = self.snr_head(feat).squeeze(-1)
         return feat, snr_pred
 
@@ -457,7 +493,7 @@ class CLDNNAMC(nn.Module):
         self,
         x: torch.Tensor,
         t: torch.Tensor,  # unused, for API compatibility
-        snr: Optional[torch.Tensor] = None,  # unused unless snr_mode == "known" (we don't condition yet)
+        snr: Optional[torch.Tensor] = None,  # used for SNR conditioning if snr_mode == "known"
         snr_mode: str = "predict",
         group_mask: Optional[torch.Tensor] = None,
     ):
@@ -469,7 +505,16 @@ class CLDNNAMC(nn.Module):
         else:
             x_flat = x
 
-        feat_flat, snr_pred_flat = self._forward_windows(x_flat)  # (B*,D), (B*,)
+        # Prepare SNR for conditioning (if enabled and snr_mode is "known")
+        snr_flat = None
+        if self.snr_cond and snr_mode == "known" and snr is not None:
+            if group_size is not None:
+                # Repeat SNR for each window in the group
+                snr_flat = snr.repeat_interleave(group_size)
+            else:
+                snr_flat = snr
+
+        feat_flat, snr_pred_flat = self._forward_windows(x_flat, snr_flat=snr_flat)  # (B*,D), (B*,)
 
         if group_size is not None and group_size > 1:
             b = feat_flat.shape[0] // group_size
