@@ -106,8 +106,10 @@ class RML2016aDenoisingDataset(Dataset):
     """
     Dataset with synthetic noisy/clean pairs for denoising training.
     
-    Uses high-SNR samples as "clean" targets and adds noise to create
-    training pairs at various SNR levels.
+    Uses ALL samples for classification, but only applies denoising loss
+    to high-SNR samples where we have valid clean targets.
+    
+    Returns a flag indicating whether denoising loss should be computed.
     """
     
     def __init__(
@@ -140,17 +142,16 @@ class RML2016aDenoisingDataset(Dataset):
         self.idx_to_mod = {i: m for m, i in self.mod_to_idx.items()}
         self.num_classes = len(mods)
         
-        # Separate indices into clean (high SNR) and all
-        self.clean_indices = [
-            (k, i) for k, i in indices if get_snr_from_key(k) >= clean_snr_threshold
-        ]
-        self.all_indices = indices
+        # Use ALL indices for training
+        self.indices = indices
         
-        print(f"Denoising dataset: {len(self.clean_indices)} clean samples "
-              f"(SNR >= {clean_snr_threshold}), {len(self.all_indices)} total")
+        # Count how many are high-SNR (for logging)
+        n_clean = sum(1 for k, i in indices if get_snr_from_key(k) >= clean_snr_threshold)
+        print(f"Hybrid dataset: {len(indices)} total samples, "
+              f"{n_clean} clean (SNR >= {clean_snr_threshold}) for denoising")
     
     def __len__(self):
-        return len(self.all_indices)
+        return len(self.indices)
     
     def _augment(self, x):
         """Apply augmentations"""
@@ -171,13 +172,13 @@ class RML2016aDenoisingDataset(Dataset):
     def __getitem__(self, idx):
         """
         Returns:
-            noisy_x: noisy IQ signal
-            clean_x: clean IQ signal (target for denoising)
+            x: IQ signal (possibly with synthetic noise added for high-SNR samples)
+            clean_x: clean IQ signal (target for denoising, zeros if not applicable)
             label: modulation class
             original_snr: original SNR of the sample
-            target_snr: SNR after adding synthetic noise
+            has_denoise_target: 1.0 if denoising loss should be computed, 0.0 otherwise
         """
-        key, sample_idx = self.all_indices[idx]
+        key, sample_idx = self.indices[idx]
         mod, original_snr = key
         
         # Get the sample
@@ -191,28 +192,25 @@ class RML2016aDenoisingDataset(Dataset):
         
         label = self.mod_to_idx[mod]
         
-        # For denoising: if this is a high-SNR sample, we can use it as clean
-        # and create a noisy version. Otherwise, we use it as-is for both.
+        # For high-SNR samples: create synthetic noisy version for denoising training
         if original_snr >= self.clean_snr_threshold:
-            # This is a "clean" sample - create noisy version
             clean_x = x.copy()
             target_snr = np.random.uniform(*self.target_snr_range)
             noisy_x = add_awgn(clean_x, target_snr)
-            noisy_x = normalize_iq(noisy_x, self.normalize)  # Re-normalize after noise
+            noisy_x = normalize_iq(noisy_x, self.normalize)
+            has_denoise_target = 1.0
         else:
-            # This is already a noisy sample - use as-is
-            # We don't have the true clean version, so we use the sample itself
-            # as both input and target (identity mapping for these)
+            # Low-SNR sample: use as-is, no denoising target
             noisy_x = x.copy()
-            clean_x = x.copy()  # Best we can do
-            target_snr = original_snr
+            clean_x = np.zeros_like(x)  # Placeholder, won't be used
+            has_denoise_target = 0.0
         
         return (
             torch.tensor(noisy_x, dtype=torch.float32),
             torch.tensor(clean_x, dtype=torch.float32),
             label,
             original_snr,
-            target_snr
+            has_denoise_target  # Changed from target_snr to flag
         )
 
 

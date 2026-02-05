@@ -23,7 +23,7 @@ from data import (
     load_rml2016a,
     build_split_indices,
     RML2016aDataset,
-    RML2016aDenoisingDatasetV2,
+    RML2016aDenoisingDataset,
     RML2016aGroupedDenoisingDataset,
 )
 
@@ -120,15 +120,15 @@ def build_loaders(args, data, train_idx, val_idx, test_idx):
             seed=args.seed + 1
         )
     else:
-        # Single window dataset
-        train_ds = RML2016aDenoisingDatasetV2(
+        # Single window dataset - uses ALL samples
+        train_ds = RML2016aDenoisingDataset(
             data, train_idx,
             normalize=args.normalize,
             clean_snr_threshold=args.clean_snr_threshold,
             target_snr_range=target_snr_range,
             augment=True
         )
-        val_ds = RML2016aDenoisingDatasetV2(
+        val_ds = RML2016aDenoisingDataset(
             data, val_idx,
             normalize=args.normalize,
             clean_snr_threshold=args.clean_snr_threshold,
@@ -164,16 +164,23 @@ def train_epoch(model, loader, optimizer, scaler, args, device, epoch):
     total_denoise_loss = 0
     correct = 0
     total = 0
+    n_denoise_samples = 0
     
     for batch_idx, batch in enumerate(loader):
         if args.group_k > 1:
-            noisy, clean, labels, orig_snr, target_snr = batch
+            noisy, clean, labels, orig_snr, has_denoise_target = batch
             noisy = noisy.to(device)  # (B, K, 2, 128)
             clean = clean.to(device)
+            has_denoise_target = has_denoise_target.to(device).float()
         else:
-            noisy, clean, labels, orig_snr, target_snr = batch
+            noisy, clean, labels, orig_snr, has_denoise_target = batch
             noisy = noisy.to(device)  # (B, 2, 128)
             clean = clean.to(device)
+            # has_denoise_target is already float from dataset
+            if isinstance(has_denoise_target, torch.Tensor):
+                has_denoise_target = has_denoise_target.to(device)
+            else:
+                has_denoise_target = torch.tensor(has_denoise_target, device=device)
         
         labels = labels.to(device)
         
@@ -181,16 +188,25 @@ def train_epoch(model, loader, optimizer, scaler, args, device, epoch):
         
         with autocast('cuda', enabled=args.amp):
             if args.group_k > 1:
-                # Multi-window model
                 logits, denoised = model(noisy, return_denoised=True)
             else:
                 logits, denoised = model(noisy, return_denoised=True)
             
-            # Classification loss
+            # Classification loss (all samples)
             cls_loss = F.cross_entropy(logits, labels)
             
-            # Denoising loss (MSE)
-            denoise_loss = F.mse_loss(denoised, clean)
+            # Denoising loss - ONLY for samples with valid clean targets
+            # Compute per-sample MSE
+            if args.train_mode != "cls_only":
+                mse_per_sample = ((denoised - clean) ** 2).mean(dim=(1, 2))  # (B,)
+                # Mask: only include samples where has_denoise_target == 1
+                mask = has_denoise_target.float()
+                if mask.sum() > 0:
+                    denoise_loss = (mse_per_sample * mask).sum() / mask.sum()
+                else:
+                    denoise_loss = torch.tensor(0.0, device=device)
+            else:
+                denoise_loss = torch.tensor(0.0, device=device)
             
             # Combined loss
             if args.train_mode == "joint":
@@ -207,6 +223,7 @@ def train_epoch(model, loader, optimizer, scaler, args, device, epoch):
         total_loss += loss.item()
         total_cls_loss += cls_loss.item()
         total_denoise_loss += denoise_loss.item()
+        n_denoise_samples += has_denoise_target.sum().item()
         
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
@@ -217,7 +234,8 @@ def train_epoch(model, loader, optimizer, scaler, args, device, epoch):
         "loss": total_loss / n_batches,
         "cls_loss": total_cls_loss / n_batches,
         "denoise_loss": total_denoise_loss / n_batches,
-        "acc": correct / total
+        "acc": correct / total,
+        "n_denoise_samples": n_denoise_samples
     }
 
 
@@ -238,8 +256,8 @@ def evaluate(model, loader, args, device, is_denoising_dataset=True):
     
     for batch in loader:
         if is_denoising_dataset:
-            # Denoising dataset returns: noisy, clean, label, orig_snr, target_snr
-            noisy, clean, labels, orig_snr, target_snr = batch
+            # Denoising dataset returns: noisy, clean, label, orig_snr, has_denoise_target
+            noisy, clean, labels, orig_snr, has_denoise_target = batch
             noisy = noisy.to(device)
             labels = labels.to(device)
             
