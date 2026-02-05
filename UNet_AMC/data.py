@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-# Suppress numpy VisibleDeprecationWarning from pickle loading
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
+# Suppress deprecation warnings from pickle loading
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
 def load_rml2016a(path):
