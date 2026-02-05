@@ -92,6 +92,19 @@ python train.py \
   --ckpt ./runs/dit_amc_group8_stem/best.pt
 ```
 
+### Plot accuracy vs SNR
+
+After a run, plot the sweep from `test_acc_by_snr.json`:
+
+```bash
+python plot_acc_vs_snr.py \
+  --json ./runs/dit_amc_group8_stem/test_acc_by_snr.json \
+  --out ./runs/dit_amc_group8_stem/acc_vs_snr.png \
+  --title "DiT-AMC: Accuracy vs SNR"
+```
+
+You can compare multiple runs by passing multiple `--json` paths.
+
 ### Variable-K training (Kmax=16) + dynamic-K evaluation (Step D)
 
 Train so the model learns to operate with varying amounts of evidence, then evaluate with

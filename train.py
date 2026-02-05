@@ -974,6 +974,9 @@ def run_eval(args: argparse.Namespace) -> None:
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         snr_scale=args.snr_scale,
+        stem_channels=args.stem_channels,
+        stem_layers=args.stem_layers,
+        group_pool=args.group_pool,
     ).to(device)
 
     if args.ckpt is None:
