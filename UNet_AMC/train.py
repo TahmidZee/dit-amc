@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 from model import UNetAMC, UNetAMCWithMultiWindow, count_parameters
 from data import (
@@ -179,7 +179,7 @@ def train_epoch(model, loader, optimizer, scaler, args, device, epoch):
         
         optimizer.zero_grad()
         
-        with autocast(enabled=args.amp):
+        with autocast('cuda', enabled=args.amp):
             if args.group_k > 1:
                 # Multi-window model
                 logits, denoised = model(noisy, return_denoised=True)
@@ -222,8 +222,14 @@ def train_epoch(model, loader, optimizer, scaler, args, device, epoch):
 
 
 @torch.no_grad()
-def evaluate(model, loader, args, device, is_grouped=False):
-    """Evaluate on validation/test set"""
+def evaluate(model, loader, args, device, is_denoising_dataset=True):
+    """
+    Evaluate on validation/test set.
+    
+    Args:
+        is_denoising_dataset: True if loader uses denoising dataset (5 values),
+                              False if using basic dataset (3 values)
+    """
     model.eval()
     
     correct = 0
@@ -231,20 +237,20 @@ def evaluate(model, loader, args, device, is_grouped=False):
     total_loss = 0
     
     for batch in loader:
-        if is_grouped:
+        if is_denoising_dataset:
+            # Denoising dataset returns: noisy, clean, label, orig_snr, target_snr
             noisy, clean, labels, orig_snr, target_snr = batch
             noisy = noisy.to(device)
-            clean = clean.to(device)
             labels = labels.to(device)
             
-            logits, denoised = model(noisy, return_denoised=True)
+            logits = model(noisy, return_denoised=False)
             loss = F.cross_entropy(logits, labels)
         else:
+            # Basic dataset returns: x, label, snr
             x, labels, snr = batch
             x = x.to(device)
             labels = labels.to(device)
             
-            # For test set, we classify directly (no denoising target available)
             logits = model(x, return_denoised=False)
             loss = F.cross_entropy(logits, labels)
         
@@ -378,7 +384,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6
     )
-    scaler = GradScaler(enabled=args.amp)
+    scaler = GradScaler('cuda', enabled=args.amp)
     
     # Save config
     config = vars(args)
@@ -398,7 +404,7 @@ def main():
         train_metrics = train_epoch(model, train_loader, optimizer, scaler, args, device, epoch)
         
         # Validate
-        val_metrics = evaluate(model, val_loader, args, device, is_grouped=(args.group_k > 1))
+        val_metrics = evaluate(model, val_loader, args, device, is_denoising_dataset=True)
         
         scheduler.step()
         
