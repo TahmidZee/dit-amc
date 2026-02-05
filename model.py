@@ -92,12 +92,6 @@ class DiffusionAMC(nn.Module):
         stem_channels: int = 0,
         stem_layers: int = 2,
         group_pool: str = "mean",
-        # --- New architecture options for improved K=1 ---
-        use_cls_token: bool = False,  # Use learnable [CLS] token instead of mean pooling
-        cls_head_hidden: int = 0,     # Hidden dim for MLP classifier (0 = single linear)
-        cls_head_layers: int = 1,     # Number of layers in classifier head
-        use_lstm: bool = False,       # Add LSTM after Transformer for temporal modeling
-        lstm_hidden: int = 128,       # LSTM hidden size (bidirectional, so 2x this)
     ) -> None:
         super().__init__()
         if seq_len % patch_size != 0:
@@ -110,8 +104,6 @@ class DiffusionAMC(nn.Module):
         if group_pool not in {"mean", "attn"}:
             raise ValueError(f"group_pool must be mean|attn, got {group_pool}")
         self.group_pool = group_pool
-        self.use_cls_token = use_cls_token
-        self.use_lstm = use_lstm
 
         if stem_channels and stem_channels > 0:
             # Deeper residual stem: project to stem_channels, then stack ResBlocks.
@@ -134,15 +126,7 @@ class DiffusionAMC(nn.Module):
             kernel_size=patch_size,
             stride=patch_size,
         )
-        
-        # Positional embedding: +1 for CLS token if used
-        num_pos = self.num_patches + (1 if use_cls_token else 0)
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_pos, dim))
-        
-        # Learnable [CLS] token for classification
-        if use_cls_token:
-            self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
-            nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, dim))
 
         self.t_mlp = nn.Sequential(
             nn.Linear(dim, dim),
@@ -159,41 +143,7 @@ class DiffusionAMC(nn.Module):
             [DiTBlock(dim, heads, mlp_ratio, dropout) for _ in range(depth)]
         )
         self.norm = nn.LayerNorm(dim)
-        
-        # Optional LSTM for temporal sequence modeling (like MCLDNN)
-        if use_lstm:
-            self.lstm = nn.LSTM(
-                input_size=dim,
-                hidden_size=lstm_hidden,
-                num_layers=2,
-                batch_first=True,
-                bidirectional=True,
-                dropout=dropout,
-            )
-            self.lstm_norm = nn.LayerNorm(lstm_hidden * 2)
-            cls_input_dim = lstm_hidden * 2  # bidirectional
-        else:
-            self.lstm = None
-            cls_input_dim = dim
-        
-        # Deeper MLP classification head (vs single linear layer)
-        if cls_head_hidden > 0 and cls_head_layers > 1:
-            cls_layers = []
-            in_dim = cls_input_dim
-            for i in range(cls_head_layers - 1):
-                out_dim = cls_head_hidden if i < cls_head_layers - 2 else cls_head_hidden
-                cls_layers.extend([
-                    nn.Linear(in_dim, out_dim),
-                    nn.LayerNorm(out_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                ])
-                in_dim = out_dim
-            cls_layers.append(nn.Linear(in_dim, num_classes))
-            self.cls_head = nn.Sequential(*cls_layers)
-        else:
-            # Single linear (original behavior)
-            self.cls_head = nn.Linear(cls_input_dim, num_classes)
+        self.cls_head = nn.Linear(dim, num_classes)
 
         # Diffusion-style denoising head: predict clean patch embeddings z0 from noisy zt.
         self.x0_head = nn.Sequential(
@@ -232,19 +182,9 @@ class DiffusionAMC(nn.Module):
         """
         if snr_mode not in {"predict", "known", "none"}:
             raise ValueError(f"snr_mode must be one of predict|known|none, got {snr_mode}")
-        
-        B = tokens_in.shape[0]
-        
-        # Prepend [CLS] token if using learned pooling
-        if self.use_cls_token:
-            cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, D)
-            tokens = torch.cat([cls_tokens, tokens_in], dim=1)  # (B, 1+N, D)
-        else:
-            tokens = tokens_in
-        
-        tokens = tokens + self.pos_embed
+        tokens = tokens_in + self.pos_embed
 
-        pooled0 = tokens[:, 1:, :].mean(dim=1) if self.use_cls_token else tokens.mean(dim=1)
+        pooled0 = tokens.mean(dim=1)
         snr_pred = self.snr_head(pooled0).squeeze(-1)  # (B*,)
 
         if snr_mode == "known" and snr is not None:
@@ -264,31 +204,9 @@ class DiffusionAMC(nn.Module):
             tokens = block(tokens, cond)
 
         tokens = self.norm(tokens)
-        
-        # Extract patch tokens (excluding CLS if present) for x0 prediction
-        if self.use_cls_token:
-            patch_tokens = tokens[:, 1:, :]  # (B, N, D) - exclude CLS
-            cls_out = tokens[:, 0, :]        # (B, D) - CLS token output
-        else:
-            patch_tokens = tokens
-            cls_out = None
-        
-        x0_pred = self.x0_head(patch_tokens)
+        x0_pred = self.x0_head(tokens)
 
-        # Compute pooled representation for classification
-        if self.use_cls_token:
-            # Use CLS token as the pooled representation
-            pooled = cls_out  # (B*, D)
-        else:
-            pooled = x0_pred.mean(dim=1)  # (B*, D)
-        
-        # Optional LSTM for temporal modeling (process patch sequence)
-        if self.lstm is not None:
-            # Apply LSTM to patch tokens for richer temporal features
-            lstm_out, _ = self.lstm(patch_tokens)  # (B, N, 2*lstm_hidden)
-            lstm_pooled = lstm_out.mean(dim=1)     # (B, 2*lstm_hidden)
-            lstm_pooled = self.lstm_norm(lstm_pooled)
-            pooled = lstm_pooled  # Override with LSTM features
+        pooled = x0_pred.mean(dim=1)  # (B*, D)
         if group_size is not None and group_size > 1:
             if pooled.shape[0] % group_size != 0:
                 raise ValueError("Batch size must be divisible by group_size.")
