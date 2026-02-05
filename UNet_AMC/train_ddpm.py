@@ -161,7 +161,14 @@ def train_classifier_epoch(classifier, loader, optimizer, scaler, args, device, 
         # Optionally denoise before classification
         if ddpm is not None:
             with torch.no_grad():
-                x = ddpm.denoise(x, num_steps=args.denoise_steps)
+                # Treat observation as x_t at an SNR-derived timestep, then reverse to x_0
+                x = ddpm.denoise_observation(
+                    x,
+                    snr_db=snr,
+                    num_steps=args.denoise_steps,
+                    deterministic=True,
+                    strength=1.0,
+                )
         
         optimizer.zero_grad()
         
@@ -197,7 +204,13 @@ def evaluate_classifier(classifier, loader, device, ddpm=None, denoise_steps=50)
         labels = labels.to(device)
         
         if ddpm is not None:
-            x = ddpm.denoise(x, num_steps=denoise_steps)
+            x = ddpm.denoise_observation(
+                x,
+                snr_db=snr,
+                num_steps=denoise_steps,
+                deterministic=True,
+                strength=1.0,
+            )
         
         logits = classifier(x)
         preds = logits.argmax(dim=1)
@@ -223,7 +236,13 @@ def evaluate_by_snr(classifier, loader, device, ddpm=None, denoise_steps=50):
         labels = labels.to(device)
         
         if ddpm is not None:
-            x = ddpm.denoise(x, num_steps=denoise_steps)
+            x = ddpm.denoise_observation(
+                x,
+                snr_db=snrs,
+                num_steps=denoise_steps,
+                deterministic=True,
+                strength=1.0,
+            )
         
         logits = classifier(x)
         preds = logits.argmax(dim=1)

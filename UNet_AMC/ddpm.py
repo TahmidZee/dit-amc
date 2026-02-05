@@ -312,7 +312,7 @@ class DDPM(nn.Module):
         return loss
     
     @torch.no_grad()
-    def p_sample(self, x_t, t):
+    def p_sample(self, x_t, t, deterministic: bool = False):
         """
         Sample x_{t-1} from p(x_{t-1} | x_t) using the model.
         """
@@ -333,40 +333,52 @@ class DDPM(nn.Module):
             x_0_pred, x_t, t
         )
         
-        # Add noise (except for t=0)
-        noise = torch.randn_like(x_t)
+        # Add noise (except for t=0). For denoising (restoration), a deterministic
+        # variant (noise=0) is often more stable and preserves content better.
+        if deterministic:
+            noise = torch.zeros_like(x_t)
+        else:
+            noise = torch.randn_like(x_t)
         nonzero_mask = (t != 0).float().view(-1, 1, 1)
         
         return posterior_mean + nonzero_mask * torch.sqrt(posterior_variance) * noise
     
     @torch.no_grad()
-    def sample(self, x_noisy, num_steps=None, start_t=None):
+    def sample(self, x_t_init, num_steps=None, start_t=None, deterministic: bool = False):
         """
-        Denoise a noisy signal using the reverse diffusion process.
+        Reverse diffusion starting from a provided x_t (not necessarily pure noise).
         
         Args:
-            x_noisy: (B, 2, 128) noisy signal to denoise
-            num_steps: number of denoising steps (default: all timesteps)
-            start_t: starting timestep (default: timesteps-1)
+            x_t_init: (B, 2, 128) signal assumed to correspond to timestep start_t
+            num_steps: number of reverse steps to run (default: start_t+1)
+            start_t: starting timestep (required for correct denoising of observations;
+                     default: timesteps-1, which is appropriate ONLY when starting from
+                     pure Gaussian noise)
+            deterministic: if True, use posterior mean (no sampling noise)
         
         Returns:
             denoised signal: (B, 2, 128)
         """
-        if num_steps is None:
-            num_steps = self.timesteps
         if start_t is None:
             start_t = self.timesteps - 1
+        start_t = int(start_t)
+        if start_t < 0:
+            return x_t_init
+        if num_steps is None:
+            num_steps = start_t + 1
         
-        batch_size = x_noisy.shape[0]
-        x = x_noisy
+        batch_size = x_t_init.shape[0]
+        x = x_t_init
         
         # Iterate from start_t to 0
-        step_size = max(1, self.timesteps // num_steps)
+        step_size = max(1, (start_t + 1) // max(1, int(num_steps)))
         timesteps = list(range(start_t, -1, -step_size))
+        if len(timesteps) == 0 or timesteps[-1] != 0:
+            timesteps.append(0)
         
         for t in timesteps:
             t_batch = torch.full((batch_size,), t, device=x.device, dtype=torch.long)
-            x = self.p_sample(x, t_batch)
+            x = self.p_sample(x, t_batch, deterministic=deterministic)
         
         return x
     
@@ -382,7 +394,76 @@ class DDPM(nn.Module):
         Returns:
             denoised signal
         """
+        # NOTE: This treats x_noisy as x_{T} (very noisy). This is NOT the right
+        # way to denoise a real observation. Use `denoise_observation(...)` instead.
         return self.sample(x_noisy, num_steps=num_steps)
+
+    @torch.no_grad()
+    def snr_db_to_t(self, snr_db: torch.Tensor) -> torch.Tensor:
+        """
+        Map an SNR (dB) to an approximate diffusion timestep t by matching
+        SNR_linear ≈ alpha_bar / (1 - alpha_bar).
+
+        Assumes signals are normalized and that the dominant corruption is
+        approximately additive Gaussian noise.
+        """
+        snr_db = snr_db.to(self.schedule.alphas_cumprod.device).float()
+        snr_lin = torch.pow(10.0, snr_db / 10.0)
+        alpha_bar_target = snr_lin / (1.0 + snr_lin)  # in (0,1)
+
+        # Find nearest alpha_bar in the precomputed schedule
+        alphas_cumprod = self.schedule.alphas_cumprod  # (T,)
+        diffs = (alphas_cumprod[None, :] - alpha_bar_target[:, None]).abs()
+        t = diffs.argmin(dim=1)
+        return t
+
+    @torch.no_grad()
+    def denoise_observation(
+        self,
+        x_obs: torch.Tensor,
+        snr_db: torch.Tensor,
+        num_steps: int = 50,
+        deterministic: bool = True,
+        strength: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Denoise a real observation x_obs by treating it as x_t for a timestep
+        chosen from SNR, then running reverse diffusion from that t to 0.
+
+        This is closer to how diffusion denoisers are typically used for
+        restoration. It avoids the (wrong) assumption that x_obs is x_T.
+
+        Args:
+            x_obs: (B, 2, L)
+            snr_db: (B,) SNR in dB (can be int tensor)
+            num_steps: reverse steps budget (accelerated sampling)
+            deterministic: True => posterior mean (stable, content-preserving)
+            strength: multiply the inferred t by this factor (<=1.0 reduces denoising)
+        """
+        if x_obs.ndim != 3:
+            raise ValueError(f"x_obs must be (B, C, L), got {tuple(x_obs.shape)}")
+
+        t_start = self.snr_db_to_t(snr_db)
+        if strength != 1.0:
+            t_start = torch.clamp((t_start.float() * float(strength)).round().long(), 0, self.timesteps - 1)
+
+        # Group by unique t to avoid per-sample loops (SNR levels are discrete)
+        x_out = x_obs.clone()
+        for t in torch.unique(t_start):
+            t_int = int(t.item())
+            mask = (t_start == t)
+            if mask.sum() == 0:
+                continue
+            # Limit steps for this group
+            group_steps = min(int(num_steps), t_int + 1)
+            x_out[mask] = self.sample(
+                x_obs[mask],
+                num_steps=group_steps,
+                start_t=t_int,
+                deterministic=deterministic,
+            )
+
+        return x_out
 
 
 def count_parameters(model):
