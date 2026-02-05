@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from model import DiffusionAMC
+from model import CLDNNAMC, DiffusionAMC
 
 
 def _infer_arch_from_state_dict(sd: Dict[str, torch.Tensor]) -> Dict[str, int]:
@@ -72,24 +72,70 @@ def _infer_arch_from_state_dict(sd: Dict[str, torch.Tensor]) -> Dict[str, int]:
     }
 
 
-def _build_model_from_ckpt(ckpt_path: str) -> DiffusionAMC:
+def _infer_arch_cldnn(sd: Dict[str, torch.Tensor]) -> Dict[str, int]:
+    if "conv_iq.weight" not in sd or "conv_merge.weight" not in sd or "lstm.weight_ih_l0" not in sd:
+        raise ValueError("Checkpoint does not look like CLDNNAMC state dict.")
+
+    conv_channels = int(sd["conv_iq.weight"].shape[0])
+    merge_channels = int(sd["conv_merge.weight"].shape[0])
+    # LSTM hidden: weight_ih has shape (4*hidden, input_size)
+    lstm_hidden = int(sd["lstm.weight_ih_l0"].shape[0] // 4)
+
+    lstm_layers = 0
+    for k in sd.keys():
+        if k.startswith("lstm.weight_ih_l") and not k.endswith("_reverse"):
+            # e.g. lstm.weight_ih_l0, lstm.weight_ih_l1, ...
+            idx = int(k.split("lstm.weight_ih_l", 1)[1])
+            lstm_layers = max(lstm_layers, idx + 1)
+
+    bidirectional = any(k.startswith("lstm.weight_ih_l0_reverse") for k in sd.keys())
+
+    return {
+        "seq_len": 128,
+        "conv_channels": conv_channels,
+        "merge_channels": merge_channels,
+        "lstm_hidden": lstm_hidden,
+        "lstm_layers": int(lstm_layers),
+        "bidirectional": int(bidirectional),
+    }
+
+
+def _build_model_from_ckpt(ckpt_path: str) -> torch.nn.Module:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    arch = _infer_arch_from_state_dict(sd)
+    if "pos_embed" in sd and "patch_embed.weight" in sd:
+        arch = _infer_arch_from_state_dict(sd)
+        model: torch.nn.Module = DiffusionAMC(
+            num_classes=11,
+            in_channels=2,
+            seq_len=128,
+            patch_size=arch["patch_size"],
+            dim=arch["dim"],
+            depth=arch["depth"],
+            heads=arch["heads"],
+            mlp_ratio=4.0,
+            dropout=0.0,
+            stem_channels=arch["stem_channels"],
+            stem_layers=max(0, arch["stem_layers"]),
+            group_pool="mean",
+        )
+        model.load_state_dict(sd, strict=False)
+        model.eval()
+        model._arch = arch  # type: ignore[attr-defined]
+        return model
 
-    model = DiffusionAMC(
+    # CLDNN checkpoint
+    arch = _infer_arch_cldnn(sd)
+    model = CLDNNAMC(
         num_classes=11,
-        in_channels=2,
         seq_len=128,
-        patch_size=arch["patch_size"],
-        dim=arch["dim"],
-        depth=arch["depth"],
-        heads=arch["heads"],
-        mlp_ratio=4.0,
+        conv_channels=int(arch["conv_channels"]),
+        merge_channels=int(arch["merge_channels"]),
+        lstm_hidden=int(arch["lstm_hidden"]),
+        lstm_layers=int(arch["lstm_layers"]),
+        bidirectional=bool(arch["bidirectional"]),
         dropout=0.0,
-        stem_channels=arch["stem_channels"],
-        stem_layers=max(0, arch["stem_layers"]),
-        group_pool="mean",
+        pool="attn",
     )
     model.load_state_dict(sd, strict=False)
     model.eval()

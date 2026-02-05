@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -278,3 +278,220 @@ class DiffusionAMC(nn.Module):
             group_size=group_size,
             group_mask=group_mask,
         )
+
+
+class CausalConv1d(nn.Module):
+    """Conv1d with left padding to emulate 'causal' padding (Keras-style)."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int = 1,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.dilation = int(dilation)
+        self.left_pad = (self.kernel_size - 1) * self.dilation
+        self.conv = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=self.kernel_size,
+            dilation=self.dilation,
+            padding=0,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, L)
+        if self.left_pad > 0:
+            x = F.pad(x, (self.left_pad, 0))
+        return self.conv(x)
+
+
+class TemporalAttentionPool(nn.Module):
+    """Simple attention pooling over time for (B, T, D) sequences."""
+
+    def __init__(self, dim: int, hidden: int = 128) -> None:
+        super().__init__()
+        self.proj = nn.Linear(dim, hidden)
+        self.v = nn.Linear(hidden, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, T, D)
+        scores = self.v(torch.tanh(self.proj(x))).squeeze(-1)  # (B, T)
+        w = torch.softmax(scores, dim=1)  # (B, T)
+        pooled = torch.sum(w.unsqueeze(-1) * x, dim=1)  # (B, D)
+        return pooled, w
+
+
+class CLDNNAMC(nn.Module):
+    """
+    K=1-first AMC model inspired by MCLDNN / CLDNN family (CNN + LSTM), implemented in PyTorch.
+
+    Design goals:
+      - Strong inductive bias for short IQ sequences (L=128)
+      - Small parameter count (<< DiT-AMC) to reduce overfitting
+      - Optional attention pooling over LSTM outputs (better than "last hidden" at low SNR)
+
+    Forward signature matches DiffusionAMC so we can reuse evaluate()/dynamic-K code.
+    """
+
+    def __init__(
+        self,
+        num_classes: int = 11,
+        seq_len: int = 128,
+        conv_channels: int = 50,
+        merge_channels: int = 100,
+        lstm_hidden: int = 128,
+        lstm_layers: int = 2,
+        bidirectional: bool = False,
+        dropout: float = 0.5,
+        pool: str = "attn",  # attn|last|mean
+    ) -> None:
+        super().__init__()
+        if seq_len != 128:
+            # This architecture is hard-coded for RML2016.10a window length.
+            raise ValueError("CLDNNAMC currently supports seq_len=128 only.")
+        if pool not in {"attn", "last", "mean"}:
+            raise ValueError(f"pool must be one of attn|last|mean, got {pool}")
+        self.seq_len = int(seq_len)
+        self.pool = pool
+
+        # Branch 1: IQ joint Conv2D over (2 x 128)
+        self.conv_iq = nn.Conv2d(
+            in_channels=1,
+            out_channels=conv_channels,
+            kernel_size=(2, 8),
+            padding="same",
+        )
+
+        # Branch 2/3: I-only and Q-only causal Conv1D
+        self.conv_i = CausalConv1d(1, conv_channels, kernel_size=8)
+        self.conv_q = CausalConv1d(1, conv_channels, kernel_size=8)
+
+        # Fuse I/Q branches with a Conv2D over time only (kernel 1x8)
+        self.conv_fuse = nn.Conv2d(
+            in_channels=conv_channels,
+            out_channels=conv_channels,
+            kernel_size=(1, 8),
+            padding="same",
+        )
+
+        # Merge IQ + fused(I,Q) then reduce with Conv2D (kernel 2x5, valid)
+        self.conv_merge = nn.Conv2d(
+            in_channels=2 * conv_channels,
+            out_channels=merge_channels,
+            kernel_size=(2, 5),
+            padding=0,
+        )
+
+        self.act = nn.ReLU()
+        self.drop = nn.Dropout(float(dropout))
+
+        # LSTM over time axis (T=124 after conv_merge)
+        self.lstm = nn.LSTM(
+            input_size=merge_channels,
+            hidden_size=lstm_hidden,
+            num_layers=int(lstm_layers),
+            batch_first=True,
+            bidirectional=bool(bidirectional),
+            dropout=float(dropout) if int(lstm_layers) > 1 else 0.0,
+        )
+        lstm_out_dim = lstm_hidden * (2 if bidirectional else 1)
+
+        self.attn_pool = TemporalAttentionPool(lstm_out_dim, hidden=max(64, lstm_out_dim // 2))
+
+        # Classifier head (mirrors MCLDNN-style DNN)
+        self.fc1 = nn.Linear(lstm_out_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc_out = nn.Linear(128, num_classes)
+        self.fc_act = nn.SELU()
+
+        # Optional SNR head for auxiliary supervision (kept for compatibility with train.py)
+        self.snr_head = nn.Linear(lstm_out_dim, 1)
+
+    def _forward_windows(self, x_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x_flat: (B*, 2, 128)
+        returns:
+          feat: (B*, D)
+          snr_pred: (B*,)
+        """
+        b = x_flat.shape[0]
+        # IQ joint branch
+        x_iq = x_flat.unsqueeze(1)  # (B,1,2,128)
+        h_iq = self.drop(self.act(self.conv_iq(x_iq)))  # (B,conv,2,128)
+
+        # I/Q separate branches (causal Conv1D)
+        i = x_flat[:, 0:1, :]  # (B,1,128)
+        q = x_flat[:, 1:2, :]  # (B,1,128)
+        h_i = self.drop(self.act(self.conv_i(i)))  # (B,conv,128)
+        h_q = self.drop(self.act(self.conv_q(q)))  # (B,conv,128)
+        h_i = h_i.unsqueeze(2)  # (B,conv,1,128)
+        h_q = h_q.unsqueeze(2)  # (B,conv,1,128)
+        h_iq_sep = torch.cat([h_i, h_q], dim=2)  # (B,conv,2,128)
+        h_sep = self.drop(self.act(self.conv_fuse(h_iq_sep)))  # (B,conv,2,128)
+
+        # Merge the two streams along channels
+        h = torch.cat([h_iq, h_sep], dim=1)  # (B,2*conv,2,128)
+        h = self.drop(self.act(self.conv_merge(h)))  # (B,merge,1,124)
+
+        # Sequence for LSTM
+        h = h.squeeze(2).transpose(1, 2)  # (B,124,merge)
+
+        lstm_out, _ = self.lstm(h)  # (B,124,D)
+        if self.pool == "attn":
+            feat, _w = self.attn_pool(lstm_out)
+        elif self.pool == "mean":
+            feat = lstm_out.mean(dim=1)
+        else:  # last
+            feat = lstm_out[:, -1, :]
+
+        snr_pred = self.snr_head(feat).squeeze(-1)
+        return feat, snr_pred
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,  # unused, for API compatibility
+        snr: Optional[torch.Tensor] = None,  # unused unless snr_mode == "known" (we don't condition yet)
+        snr_mode: str = "predict",
+        group_mask: Optional[torch.Tensor] = None,
+    ):
+        # Accept (B,2,L) or (B,K,2,L)
+        group_size = None
+        if x.ndim == 4:
+            group_size = x.shape[1]
+            x_flat = x.reshape(-1, x.shape[2], x.shape[3])
+        else:
+            x_flat = x
+
+        feat_flat, snr_pred_flat = self._forward_windows(x_flat)  # (B*,D), (B*,)
+
+        if group_size is not None and group_size > 1:
+            b = feat_flat.shape[0] // group_size
+            feat_g = feat_flat.view(b, group_size, -1)  # (B,G,D)
+            snr_g = snr_pred_flat.view(b, group_size)  # (B,G)
+            if group_mask is None:
+                mask = torch.ones((b, group_size), device=feat_g.device, dtype=torch.float32)
+            else:
+                mask = group_mask.to(device=feat_g.device, dtype=torch.float32)
+            denom = torch.clamp(mask.sum(dim=1, keepdim=True), min=1.0)  # (B,1)
+            feat = torch.sum(feat_g * mask.unsqueeze(-1), dim=1) / denom
+            snr_pred = torch.sum(snr_g * mask, dim=1) / denom.squeeze(-1)
+        else:
+            feat = feat_flat
+            snr_pred = snr_pred_flat
+
+        # Classifier head
+        z = self.fc_act(self.fc1(feat))
+        z = self.drop(z)
+        z = self.fc_act(self.fc2(z))
+        z = self.drop(z)
+        logits = self.fc_out(z)
+
+        # Return (logits, x0_pred_dummy, snr_pred) to match evaluate() expectations.
+        return logits, None, snr_pred

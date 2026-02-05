@@ -36,7 +36,7 @@ from data import (
     RML2016aVariableGroupedDataset,
 )
 from diffusion import DiffusionSchedule
-from model import DiffusionAMC
+from model import CLDNNAMC, DiffusionAMC
 
 
 PRESETS = {
@@ -112,6 +112,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--out-dir", type=str, default="./runs/dit_amc")
     parser.add_argument("--preset", type=str, choices=["S", "B"], default="S")
+    parser.add_argument(
+        "--arch",
+        type=str,
+        choices=["dit", "cldnn"],
+        default="dit",
+        help="Model architecture. dit=DiffusionAMC (token-space diffusion). cldnn=CNN+LSTM (K=1-first, no diffusion).",
+    )
 
     parser.add_argument("--patch-size", type=int, default=None)
     parser.add_argument("--dim", type=int, default=None)
@@ -126,6 +133,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k-max", type=int, default=None, help="Max windows for variable-K mode (defaults to --group-k).")
     parser.add_argument("--k-choices", type=str, default=None, help="Comma-separated K choices for variable-K training (e.g. 4,8,16).")
     parser.add_argument("--window-dropout", type=float, default=0.0, help="Extra random window dropout fraction applied on top of sampled K.")
+
+    # CLDNN architecture options (used when --arch cldnn)
+    parser.add_argument("--cldnn-conv-ch", type=int, default=50, help="Conv channels for CLDNN branches.")
+    parser.add_argument("--cldnn-merge-ch", type=int, default=100, help="Channels after merging branches (Conv2D(2,5)).")
+    parser.add_argument("--cldnn-lstm-hidden", type=int, default=128, help="LSTM hidden size.")
+    parser.add_argument("--cldnn-lstm-layers", type=int, default=2, help="Number of LSTM layers.")
+    parser.add_argument("--cldnn-bidir", action="store_true", help="Use bidirectional LSTM.")
+    parser.add_argument("--cldnn-pool", type=str, default="attn", choices=["attn", "last", "mean"], help="Temporal pooling over LSTM outputs.")
 
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=50)
@@ -648,24 +663,38 @@ def train(args: argparse.Namespace) -> None:
             persistent_workers=num_workers > 0,
             worker_init_fn=_seed_worker,
         )
-    model = DiffusionAMC(
-        num_classes=len(mods),
-        patch_size=args.patch_size,
-        dim=args.dim,
-        depth=args.depth,
-        heads=args.heads,
-        mlp_ratio=args.mlp_ratio,
-        dropout=args.dropout,
-        snr_scale=args.snr_scale,
-        stem_channels=args.stem_channels,
-        stem_layers=args.stem_layers,
-        group_pool=args.group_pool,
-    ).to(device)
+    if args.arch == "dit":
+        model = DiffusionAMC(
+            num_classes=len(mods),
+            patch_size=args.patch_size,
+            dim=args.dim,
+            depth=args.depth,
+            heads=args.heads,
+            mlp_ratio=args.mlp_ratio,
+            dropout=args.dropout,
+            snr_scale=args.snr_scale,
+            stem_channels=args.stem_channels,
+            stem_layers=args.stem_layers,
+            group_pool=args.group_pool,
+        ).to(device)
+        schedule = DiffusionSchedule(timesteps=args.timesteps).to(device)
+    else:
+        # K=1-first CNN+LSTM model (no diffusion)
+        model = CLDNNAMC(
+            num_classes=len(mods),
+            conv_channels=int(args.cldnn_conv_ch),
+            merge_channels=int(args.cldnn_merge_ch),
+            lstm_hidden=int(args.cldnn_lstm_hidden),
+            lstm_layers=int(args.cldnn_lstm_layers),
+            bidirectional=bool(args.cldnn_bidir),
+            dropout=float(args.dropout),
+            pool=str(args.cldnn_pool),
+        ).to(device)
+        schedule = None
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     total_steps = args.epochs * max(1, len(train_loader))
     scheduler = build_scheduler(optimizer, args.warmup_steps, total_steps, args.min_lr)
-    schedule = DiffusionSchedule(timesteps=args.timesteps).to(device)
 
     amp_enabled = bool(args.amp and device.type == "cuda")
     amp_dtype = _cuda_amp_dtype() if amp_enabled else torch.float32
@@ -714,57 +743,73 @@ def train(args: argparse.Namespace) -> None:
             snr = snr.to(device)
             mask = mask.to(device) if mask is not None else None
 
-            # --- Token-space diffusion: z_t = sqrt(a)*z0 + sqrt(1-a)*eps ---
-            # z0 are patch embeddings BEFORE positional embedding; model adds pos internally.
-            group_size = None
-            if x.ndim == 4:
-                group_size = x.shape[1]
-                x_flat = x.reshape(-1, x.shape[2], x.shape[3])
-            else:
-                x_flat = x
-            z0 = model.encode(x_flat)
-            t_max = args.t_max if args.t_max is not None and args.t_max > 0 else schedule.timesteps
-            t_max = min(t_max, schedule.timesteps)
-            if args.t_schedule == "snr":
-                if group_size is not None:
-                    snr_rep = snr.repeat_interleave(group_size)
+            # --- Training path depends on architecture ---
+            # group_size is used only for DiT-AMC token diffusion (flatten windows) and for grouped pooling.
+            group_size = x.shape[1] if x.ndim == 4 else None
+            if args.arch == "dit":
+                # Token-space diffusion: z_t = sqrt(a)*z0 + sqrt(1-a)*eps
+                # z0 are patch embeddings BEFORE positional embedding; model adds pos internally.
+                if x.ndim == 4:
+                    x_flat = x.reshape(-1, x.shape[2], x.shape[3])
                 else:
-                    snr_rep = snr
-                t = schedule.snr_to_t(snr_rep)
-                if t_max < schedule.timesteps:
-                    t = torch.clamp(t, max=t_max - 1)
+                    x_flat = x
+                z0 = model.encode(x_flat)  # type: ignore[attr-defined]
+                if schedule is None:
+                    raise RuntimeError("schedule is None but arch=dit")
+                t_max = args.t_max if args.t_max is not None and args.t_max > 0 else schedule.timesteps
+                t_max = min(t_max, schedule.timesteps)
+                if args.t_schedule == "snr":
+                    if group_size is not None:
+                        snr_rep = snr.repeat_interleave(group_size)
+                    else:
+                        snr_rep = snr
+                    t = schedule.snr_to_t(snr_rep)
+                    if t_max < schedule.timesteps:
+                        t = torch.clamp(t, max=t_max - 1)
+                else:
+                    t = torch.randint(0, t_max, (z0.shape[0],), device=device, dtype=torch.long)
+
+                # Cap augmentation strength for low-SNR samples (training-time label only).
+                if args.snr_floor_db is not None:
+                    snr_floor = float(args.snr_floor_db)
+                    snr_cap_max = float(args.snr_cap_max_db)
+                    denom = max(1e-6, snr_cap_max - snr_floor)
+                    snr_clamped = torch.clamp(snr.float(), min=snr_floor, max=snr_cap_max)
+                    frac = (snr_clamped - snr_floor) / denom  # 0 at floor, 1 at cap_max
+                    t_cap = torch.floor(frac * float(t_max - 1)).long()
+                    t = torch.minimum(t, t_cap)
+
+                if p_clean > 0:
+                    clean_mask = torch.rand(z0.shape[0], device=device) < p_clean
+                    t = torch.where(clean_mask, torch.zeros_like(t), t)
+                eps = torch.randn_like(z0)
+                alpha_bar = schedule.alpha_bars.gather(0, t).view(-1, 1, 1)
+                zt = torch.sqrt(alpha_bar) * z0 + torch.sqrt(1.0 - alpha_bar) * eps
             else:
-                t = torch.randint(0, t_max, (z0.shape[0],), device=device, dtype=torch.long)
-
-            # Cap augmentation strength for low-SNR samples (training-time label only).
-            if args.snr_floor_db is not None:
-                snr_floor = float(args.snr_floor_db)
-                snr_cap_max = float(args.snr_cap_max_db)
-                denom = max(1e-6, snr_cap_max - snr_floor)
-                snr_clamped = torch.clamp(snr.float(), min=snr_floor, max=snr_cap_max)
-                frac = (snr_clamped - snr_floor) / denom  # 0 at floor, 1 at cap_max
-                t_cap = torch.floor(frac * float(t_max - 1)).long()
-                t = torch.minimum(t, t_cap)
-
-            if p_clean > 0:
-                clean_mask = torch.rand(z0.shape[0], device=device) < p_clean
-                t = torch.where(clean_mask, torch.zeros_like(t), t)
-            eps = torch.randn_like(z0)
-            alpha_bar = schedule.alpha_bars.gather(0, t).view(-1, 1, 1)
-            zt = torch.sqrt(alpha_bar) * z0 + torch.sqrt(1.0 - alpha_bar) * eps
+                # CLDNN: standard supervised classification (no diffusion/noising)
+                t = torch.zeros((x.shape[0],), device=device, dtype=torch.long)
+                z0 = None
+                zt = None
 
             optimizer.zero_grad(set_to_none=True)
             snr_in = snr if args.snr_mode == "known" else None
             if amp_enabled:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
-                    logits, x0_pred, snr_pred = model.forward_tokens(
-                        zt,
-                        t,
-                        snr=snr_in,
-                        snr_mode=args.snr_mode,
-                        group_size=group_size,
-                        group_mask=mask,
-                    )
+                    if args.arch == "dit":
+                        logits, x0_pred, snr_pred = model.forward_tokens(  # type: ignore[attr-defined]
+                            zt,
+                            t,
+                            snr=snr_in,
+                            snr_mode=args.snr_mode,
+                            group_size=group_size,
+                            group_mask=mask,
+                        )
+                        loss_diff = F.mse_loss(x0_pred, z0)
+                    else:
+                        logits, _x0_pred, snr_pred = model(
+                            x, t, snr=snr_in, snr_mode=args.snr_mode, group_mask=mask
+                        )
+                        loss_diff = 0.0
                     if args.low_snr_boost and args.low_snr_boost > 0 and args.snr_floor_db is not None:
                         snr_floor = float(args.snr_floor_db)
                         snr_cap_max = float(args.snr_cap_max_db)
@@ -776,18 +821,24 @@ def train(args: argparse.Namespace) -> None:
                         loss_cls = torch.mean(ce * weights)
                     else:
                         loss_cls = F.cross_entropy(logits, y, label_smoothing=float(args.label_smoothing))
-                    loss_diff = F.mse_loss(x0_pred, z0)
                     loss_snr = F.smooth_l1_loss(snr_pred, snr) if args.lambda_snr > 0 else 0.0
                     loss = loss_cls + lambda_diff * loss_diff + args.lambda_snr * loss_snr
             else:
-                logits, x0_pred, snr_pred = model.forward_tokens(
-                    zt,
-                    t,
-                    snr=snr_in,
-                    snr_mode=args.snr_mode,
-                    group_size=group_size,
-                    group_mask=mask,
-                )
+                if args.arch == "dit":
+                    logits, x0_pred, snr_pred = model.forward_tokens(  # type: ignore[attr-defined]
+                        zt,
+                        t,
+                        snr=snr_in,
+                        snr_mode=args.snr_mode,
+                        group_size=group_size,
+                        group_mask=mask,
+                    )
+                    loss_diff = F.mse_loss(x0_pred, z0)
+                else:
+                    logits, _x0_pred, snr_pred = model(
+                        x, t, snr=snr_in, snr_mode=args.snr_mode, group_mask=mask
+                    )
+                    loss_diff = 0.0
                 if args.low_snr_boost and args.low_snr_boost > 0 and args.snr_floor_db is not None:
                     snr_floor = float(args.snr_floor_db)
                     snr_cap_max = float(args.snr_cap_max_db)
@@ -799,7 +850,6 @@ def train(args: argparse.Namespace) -> None:
                     loss_cls = torch.mean(ce * weights)
                 else:
                     loss_cls = F.cross_entropy(logits, y, label_smoothing=float(args.label_smoothing))
-                loss_diff = F.mse_loss(x0_pred, z0)
                 loss_snr = F.smooth_l1_loss(snr_pred, snr) if args.lambda_snr > 0 else 0.0
                 loss = loss_cls + lambda_diff * loss_diff + args.lambda_snr * loss_snr
 
@@ -965,19 +1015,31 @@ def run_eval(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, test_loader, mods, _ = build_loaders(args, device)
 
-    model = DiffusionAMC(
-        num_classes=len(mods),
-        patch_size=args.patch_size,
-        dim=args.dim,
-        depth=args.depth,
-        heads=args.heads,
-        mlp_ratio=args.mlp_ratio,
-        dropout=args.dropout,
-        snr_scale=args.snr_scale,
-        stem_channels=args.stem_channels,
-        stem_layers=args.stem_layers,
-        group_pool=args.group_pool,
-    ).to(device)
+    if args.arch == "dit":
+        model = DiffusionAMC(
+            num_classes=len(mods),
+            patch_size=args.patch_size,
+            dim=args.dim,
+            depth=args.depth,
+            heads=args.heads,
+            mlp_ratio=args.mlp_ratio,
+            dropout=args.dropout,
+            snr_scale=args.snr_scale,
+            stem_channels=args.stem_channels,
+            stem_layers=args.stem_layers,
+            group_pool=args.group_pool,
+        ).to(device)
+    else:
+        model = CLDNNAMC(
+            num_classes=len(mods),
+            conv_channels=int(args.cldnn_conv_ch),
+            merge_channels=int(args.cldnn_merge_ch),
+            lstm_hidden=int(args.cldnn_lstm_hidden),
+            lstm_layers=int(args.cldnn_lstm_layers),
+            bidirectional=bool(args.cldnn_bidir),
+            dropout=float(args.dropout),
+            pool=str(args.cldnn_pool),
+        ).to(device)
 
     if args.ckpt is None:
         raise ValueError("Provide --ckpt for eval-only mode.")
