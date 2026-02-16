@@ -629,11 +629,30 @@ class EMA:
         self.shadow = {k: v.detach().clone() for k, v in sd.items()}
 
 def parse_args() -> argparse.Namespace:
+    import os
+    # Auto-detect default data path: check current dir first, then fallback to absolute
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    _default_rml2016 = None
+    _default_rml2018 = None
+    # Check for RML2016 in current directory
+    if os.path.exists(os.path.join(_script_dir, "RML2016.10a_dict.pkl")):
+        _default_rml2016 = os.path.join(_script_dir, "RML2016.10a_dict.pkl")
+    elif os.path.exists("/home/tahit/Modulation/RML2016.10a_dict.pkl"):
+        _default_rml2016 = "/home/tahit/Modulation/RML2016.10a_dict.pkl"
+    else:
+        _default_rml2016 = os.path.join(_script_dir, "RML2016.10a_dict.pkl")  # Will error if missing, user must specify
+    # Check for RML2018
+    if os.path.exists("/home/tahit/Modulation/radioml2018/GOLD_XYZ_OSC.0001_1024.hdf5"):
+        _default_rml2018 = "/home/tahit/Modulation/radioml2018/GOLD_XYZ_OSC.0001_1024.hdf5"
+    else:
+        _default_rml2018 = "/home/tahit/Modulation/radioml2018/GOLD_XYZ_OSC.0001_1024.hdf5"  # Will error if missing, user must specify
+    
     parser = argparse.ArgumentParser(description="Diffusion-regularized AMC (RML2016.10a / RML2018.01A)")
     parser.add_argument(
         "--data-path",
         type=str,
-        default="/home/tahit/Modulation/RML2016.10a_dict.pkl",
+        default=_default_rml2016,
+        help=f"Path to dataset file. Default: {_default_rml2016} (auto-detected). For RML2018, use --data-path with --dataset rml2018a.",
     )
     parser.add_argument(
         "--dataset",
