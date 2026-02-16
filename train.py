@@ -162,6 +162,24 @@ def get_cls2dn_scale(epoch: int, args: argparse.Namespace) -> float:
     return float(getattr(args, "stage_b2_cls2dn_scale", 0.1))
 
 
+def get_lambda_feat(epoch: int, args: argparse.Namespace) -> float:
+    """
+    Ramp feature-preservation weight after Stage-A (or from epoch 0 if Stage-A disabled).
+    """
+    target = float(getattr(args, "lambda_feat", 0.0))
+    if target <= 0.0:
+        return 0.0
+    start_ep = int(max(0, getattr(args, "stage_a_epochs", 0)))
+    if epoch < start_ep:
+        return 0.0
+    ramp_epochs = int(max(0, getattr(args, "feat_ramp_epochs", 0)))
+    if ramp_epochs <= 0:
+        return target
+    progress = (epoch - start_ep + 1) / float(max(1, ramp_epochs))
+    progress = min(1.0, max(0.0, progress))
+    return target * progress
+
+
 def fit_noise_proxy_calibration(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -883,6 +901,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-noise", type=float, default=0.0, help="Weight for eta(noise-fraction) regression loss.")
     parser.add_argument("--lambda-dn", type=float, default=0.0, help="Weight for paired denoiser reconstruction loss L_dn.")
     parser.add_argument("--lambda-id", type=float, default=0.0, help="Weight for high-SNR identity loss L_id on denoiser output.")
+    parser.add_argument("--lambda-feat", type=float, default=0.0, help="Weight for feature-preservation loss L_feat.")
+    parser.add_argument(
+        "--feat-ramp-epochs",
+        type=int,
+        default=5,
+        help="Linear ramp epochs for lambda-feat after Stage-A start point (0 = no ramp).",
+    )
+    parser.add_argument(
+        "--feat-encoder-ckpt",
+        type=str,
+        default=None,
+        help="Optional checkpoint path used to build a fixed frozen early-feature encoder snapshot.",
+    )
     parser.add_argument("--stage-a-epochs", type=int, default=0, help="Stage A epochs (denoiser/noise-head bootstrap).")
     parser.add_argument("--stage-b-epochs", type=int, default=0, help="Stage B epochs (classifier warm start with controlled cls->dn gradients).")
     parser.add_argument("--stage-b1-cls2dn-scale", type=float, default=0.0, help="Classifier->denoiser gradient scale in first half of Stage B.")
@@ -1451,12 +1482,17 @@ def train(args: argparse.Namespace) -> None:
         or float(getattr(args, "lambda_noise", 0.0)) > 0
         or float(getattr(args, "lambda_dn", 0.0)) > 0
         or float(getattr(args, "lambda_id", 0.0)) > 0
+        or float(getattr(args, "lambda_feat", 0.0)) > 0
     ):
         raise ValueError("Noise/denoiser options are currently supported only for --arch cldnn.")
     if bool(getattr(args, "cldnn_denoiser_dual_path", False)) and not bool(getattr(args, "cldnn_denoiser", False)):
         raise ValueError("--cldnn-denoiser-dual-path requires --cldnn-denoiser.")
     if int(getattr(args, "stage_a_epochs", 0)) < 0 or int(getattr(args, "stage_b_epochs", 0)) < 0:
         raise ValueError("stage_a_epochs and stage_b_epochs must be >= 0.")
+    if int(getattr(args, "feat_ramp_epochs", 0)) < 0:
+        raise ValueError("feat_ramp_epochs must be >= 0.")
+    if float(getattr(args, "lambda_feat", 0.0)) > 0 and not bool(getattr(args, "cldnn_denoiser", False)):
+        raise ValueError("lambda_feat > 0 requires --cldnn-denoiser.")
     if float(getattr(args, "noise_rho_min", 1e-4)) <= 0 or float(getattr(args, "noise_rho_max", 1.0 - 1e-4)) >= 1:
         raise ValueError("noise_rho_min/max must satisfy 0 < min < max < 1.")
     if float(getattr(args, "noise_rho_min", 1e-4)) >= float(getattr(args, "noise_rho_max", 1.0 - 1e-4)):
@@ -1609,6 +1645,76 @@ def train(args: argparse.Namespace) -> None:
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("step", 0)
 
+    # Optional fixed early-feature encoder for L_feat, or lazy snapshot at Stage-B start.
+    if (
+        args.arch == "cldnn"
+        and float(getattr(args, "lambda_feat", 0.0)) > 0
+        and hasattr(model, "build_feat_encoder")
+        and hasattr(model, "set_feat_encoder")
+    ):
+        feat_ckpt = getattr(args, "feat_encoder_ckpt", None)
+        if feat_ckpt:
+            if not os.path.exists(feat_ckpt):
+                raise FileNotFoundError(f"feat_encoder_ckpt not found: {feat_ckpt}")
+            feat_model = CLDNNAMC(
+                num_classes=len(mods),
+                seq_len=seq_len,
+                conv_channels=int(args.cldnn_conv_ch),
+                merge_channels=int(args.cldnn_merge_ch),
+                lstm_hidden=int(args.cldnn_lstm_hidden),
+                lstm_layers=int(args.cldnn_lstm_layers),
+                bidirectional=bool(args.cldnn_bidir),
+                dropout=float(args.dropout),
+                pool=str(args.cldnn_pool),
+                snr_cond=bool(args.cldnn_snr_cond),
+                noise_cond=bool(getattr(args, "cldnn_noise_cond", False)),
+                snr_loss_detach_backbone=bool(getattr(args, "snr_loss_detach_backbone", False)),
+                snr_min_db=snr_min_db,
+                snr_max_db=snr_max_db,
+                noise_eta_min=float(getattr(args, "noise_eta_min", -8.0)),
+                noise_eta_max=float(getattr(args, "noise_eta_max", 5.5)),
+                denoiser=bool(getattr(args, "cldnn_denoiser", False)),
+                denoiser_dual_path=bool(getattr(args, "cldnn_denoiser_dual_path", False)),
+                denoiser_base_channels=int(getattr(args, "cldnn_denoiser_base_ch", 32)),
+                denoiser_dropout=float(getattr(args, "cldnn_denoiser_dropout", 0.0)),
+                denoiser_soft_high_snr_blend=bool(getattr(args, "cldnn_denoiser_soft_hi_blend", False)),
+                noise_head_hidden=int(getattr(args, "noise_head_hidden", 32)),
+                expert_features=bool(getattr(args, "cldnn_expert_features", False)),
+                expert_channels=int(getattr(args, "cldnn_expert_ch", 64)),
+                cls_hidden=int(getattr(args, "cldnn_cls_hidden", 0)),
+                supcon_proj_dim=int(getattr(args, "supcon_proj_dim", 0)) if getattr(args, "supcon", False) else 0,
+            ).to(device)
+            try:
+                ckpt_feat = torch.load(feat_ckpt, map_location="cpu", weights_only=False)
+            except TypeError:
+                ckpt_feat = torch.load(feat_ckpt, map_location="cpu")
+            state_dict = ckpt_feat.get("model", ckpt_feat) if isinstance(ckpt_feat, dict) else ckpt_feat
+            model_sd = feat_model.state_dict()
+            filtered_sd = {}
+            skipped_shape = []
+            for k, v in state_dict.items():
+                if k in model_sd and model_sd[k].shape == v.shape:
+                    filtered_sd[k] = v
+                elif k in model_sd:
+                    skipped_shape.append(k)
+            missing, unexpected = feat_model.load_state_dict(filtered_sd, strict=False)
+            if missing:
+                print(f"[l_feat] feat_encoder_ckpt missing keys (first 8): {missing[:8]}")
+            if unexpected:
+                print(f"[l_feat] feat_encoder_ckpt unexpected keys (first 8): {unexpected[:8]}")
+            if skipped_shape:
+                print(f"[l_feat] feat_encoder_ckpt shape-mismatch keys skipped (first 8): {skipped_shape[:8]}")
+            feat_model.build_feat_encoder()
+            feat_enc = feat_model.__dict__.get("_feat_encoder", None)
+            if feat_enc is None:
+                raise RuntimeError("Failed to build feature encoder snapshot from feat_encoder_ckpt.")
+            model.set_feat_encoder(feat_enc)
+            del feat_model
+            print(f"[l_feat] loaded fixed feature encoder from ckpt: {feat_ckpt}")
+        elif int(getattr(args, "stage_a_epochs", 0)) <= 0:
+            model.build_feat_encoder()
+            print("[l_feat] built feature encoder snapshot at epoch 0 (stage_a_epochs=0).")
+
     metrics_path = os.path.join(args.out_dir, "metrics.jsonl")
     best_val = -1.0
     best_epoch = None
@@ -1736,6 +1842,18 @@ def train(args: argparse.Namespace) -> None:
         if bool(getattr(args, "cldnn_denoiser", False)) and bool(getattr(args, "stage_a_no_cls", False)):
             if epoch < int(getattr(args, "stage_a_epochs", 0)):
                 cls_loss_mult = 0.0
+        lambda_feat = 0.0
+        if (
+            args.arch == "cldnn"
+            and float(getattr(args, "lambda_feat", 0.0)) > 0.0
+            and hasattr(model, "build_feat_encoder")
+            and bool(getattr(model, "has_feat_encoder", False)) is False
+            and epoch >= int(getattr(args, "stage_a_epochs", 0))
+        ):
+            model.build_feat_encoder()
+            print(f"[l_feat] built feature encoder snapshot at epoch {epoch}.")
+        if args.arch == "cldnn" and bool(getattr(model, "has_feat_encoder", False)):
+            lambda_feat = get_lambda_feat(epoch, args)
 
         # Curriculum learning: compute minimum SNR for this epoch
         curriculum_snr_min = get_curriculum_snr_min(
@@ -1747,6 +1865,7 @@ def train(args: argparse.Namespace) -> None:
 
         model.train()
         epoch_loss = 0.0
+        epoch_loss_feat = 0.0
         epoch_correct = 0
         epoch_total = 0
         start_time = time.time()
@@ -1867,6 +1986,7 @@ def train(args: argparse.Namespace) -> None:
             logits_for_acc = None
             logits_teacher_base = None
             eta_pred_for_noise = None
+            loss_feat = torch.tensor(0.0, device=device)
             if amp_enabled:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
                     if args.arch == "dit":
@@ -1991,10 +2111,26 @@ def train(args: argparse.Namespace) -> None:
                         m_hi = high_snr_soft_mask(snr_dn_ref)
                         id_vec = torch.mean(torch.abs(x_dn_hi.float() - x_dn_ref.float()), dim=(1, 2))
                         loss_id = (m_hi * id_vec).sum() / torch.clamp(m_hi.sum(), min=1.0)
+                        if (
+                            float(lambda_feat) > 0.0
+                            and hasattr(model, "early_features")
+                            and bool(getattr(model, "has_feat_encoder", False))
+                        ):
+                            if bool(getattr(model, "denoiser_dual_path", False)):
+                                feat_in_pred = torch.cat([x_low_dn.float(), x_dn_low.float()], dim=1)
+                                feat_in_tgt = torch.cat([x_low_dn.float(), x_dn_ref.float()], dim=1)
+                            else:
+                                feat_in_pred = x_dn_low.float()
+                                feat_in_tgt = x_dn_ref.float()
+                            with torch.autocast(device_type="cuda", enabled=False):
+                                feat_pred = model.early_features(feat_in_pred)
+                                feat_tgt = model.early_features(feat_in_tgt).detach()
+                                loss_feat = torch.mean(torch.abs(feat_pred - feat_tgt))
                         loss = (
                             loss
                             + float(getattr(args, "lambda_dn", 0.0)) * loss_dn
                             + float(getattr(args, "lambda_id", 0.0)) * loss_id
+                            + float(lambda_feat) * loss_feat
                         )
 
                     # --- Supervised Contrastive Loss (SupCon) ---
@@ -2200,10 +2336,25 @@ def train(args: argparse.Namespace) -> None:
                     m_hi = high_snr_soft_mask(snr_dn_ref)
                     id_vec = torch.mean(torch.abs(x_dn_hi.float() - x_dn_ref.float()), dim=(1, 2))
                     loss_id = (m_hi * id_vec).sum() / torch.clamp(m_hi.sum(), min=1.0)
+                    if (
+                        float(lambda_feat) > 0.0
+                        and hasattr(model, "early_features")
+                        and bool(getattr(model, "has_feat_encoder", False))
+                    ):
+                        if bool(getattr(model, "denoiser_dual_path", False)):
+                            feat_in_pred = torch.cat([x_low_dn.float(), x_dn_low.float()], dim=1)
+                            feat_in_tgt = torch.cat([x_low_dn.float(), x_dn_ref.float()], dim=1)
+                        else:
+                            feat_in_pred = x_dn_low.float()
+                            feat_in_tgt = x_dn_ref.float()
+                        feat_pred = model.early_features(feat_in_pred)
+                        feat_tgt = model.early_features(feat_in_tgt).detach()
+                        loss_feat = torch.mean(torch.abs(feat_pred - feat_tgt))
                     loss = (
                         loss
                         + float(getattr(args, "lambda_dn", 0.0)) * loss_dn
                         + float(getattr(args, "lambda_id", 0.0)) * loss_id
+                        + float(lambda_feat) * loss_feat
                     )
 
                 # --- Supervised Contrastive Loss (SupCon) ---
@@ -2307,6 +2458,7 @@ def train(args: argparse.Namespace) -> None:
             logits_for_acc_batch = logits_for_acc if logits_for_acc is not None else logits
             batch_size = x_clean.shape[0]
             epoch_loss += loss.item() * batch_size
+            epoch_loss_feat += float(loss_feat.detach().item()) * batch_size
             epoch_correct += (logits_for_acc_batch.argmax(dim=1) == y).sum().item()
             epoch_total += batch_size
             if epoch_total > 0:
@@ -2317,6 +2469,7 @@ def train(args: argparse.Namespace) -> None:
                 )
 
         train_loss = epoch_loss / max(1, epoch_total)
+        train_loss_feat = epoch_loss_feat / max(1, epoch_total)
         train_acc = epoch_correct / max(1, epoch_total)
         train_acc_clean = None
         if train_eval_loader is not None:
@@ -2398,6 +2551,8 @@ def train(args: argparse.Namespace) -> None:
             "lambda_noise": float(getattr(args, "lambda_noise", 0.0)),
             "lambda_dn": float(getattr(args, "lambda_dn", 0.0)),
             "lambda_id": float(getattr(args, "lambda_id", 0.0)),
+            "lambda_feat": float(lambda_feat),
+            "train_loss_feat": float(train_loss_feat),
             "cls2dn_scale": float(cls2dn_scale),
             "p_clean": p_clean,
             "t_schedule": args.t_schedule,

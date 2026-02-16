@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import Optional, Tuple
 
@@ -988,6 +989,9 @@ class CLDNNAMC(nn.Module):
         self._eta_pred: Optional[torch.Tensor] = None
         self._x_dn_flat: Optional[torch.Tensor] = None
         self._x_dn: Optional[torch.Tensor] = None
+        # Frozen early-feature encoder used by perceptual/feature-preservation loss.
+        # Stored outside nn.Module registration to keep checkpoint compatibility.
+        self.__dict__["_feat_encoder"] = None
 
     def set_noise_proxy_calibration(self, scale: float, bias: float) -> None:
         if self.noise_fraction_net is not None:
@@ -1046,6 +1050,78 @@ class CLDNNAMC(nn.Module):
             return x, eta_pred, eta_cond
         x_dn = self.denoiser(x, eta_cond)
         return x_dn, eta_pred, eta_cond
+
+    @property
+    def has_feat_encoder(self) -> bool:
+        return self.__dict__.get("_feat_encoder", None) is not None
+
+    def set_feat_encoder(self, feat_encoder: nn.Module) -> None:
+        """
+        Set a frozen early-feature encoder snapshot used for feature-preservation loss.
+        """
+        feat_enc = copy.deepcopy(feat_encoder)
+        feat_enc = feat_enc.to(device=next(self.parameters()).device, dtype=torch.float32)
+        feat_enc.eval()
+        for p in feat_enc.parameters():
+            p.requires_grad_(False)
+        self.__dict__["_feat_encoder"] = feat_enc
+
+    def build_feat_encoder(self) -> None:
+        """
+        Snapshot early CLDNN convolutions as a fixed feature encoder.
+        """
+        feat_enc = nn.ModuleDict(
+            {
+                "conv_iq": copy.deepcopy(self.conv_iq),
+                "conv_i": copy.deepcopy(self.conv_i),
+                "conv_q": copy.deepcopy(self.conv_q),
+                "conv_fuse": copy.deepcopy(self.conv_fuse),
+                "conv_merge": copy.deepcopy(self.conv_merge),
+            }
+        )
+        self.set_feat_encoder(feat_enc)
+
+    def early_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract frozen early features in float32 while preserving gradients w.r.t input x.
+
+        Args:
+            x: (B, C, L) where C == 2 * classifier_paths (2 for single-path, 4 for dual-path)
+               or (B, K, C, L), which will be flattened to (B*K, C, L).
+        Returns:
+            (B, D) pooled early features.
+        """
+        feat_enc = self.__dict__.get("_feat_encoder", None)
+        if feat_enc is None:
+            raise RuntimeError("Feature encoder is not initialized. Call build_feat_encoder() first.")
+
+        if x.ndim == 4:
+            x = x.reshape(-1, x.shape[2], x.shape[3])
+        if x.ndim != 3:
+            raise ValueError(f"early_features expects (B,C,L) or (B,K,C,L), got {tuple(x.shape)}")
+
+        expected_c = 2 * int(self.classifier_paths)
+        if x.shape[1] != expected_c:
+            raise ValueError(f"early_features expects C={expected_c}, got C={x.shape[1]}")
+
+        x_f = x.float()
+        b = x_f.shape[0]
+        L = x_f.shape[-1]
+        x_paths = x_f.view(b, self.classifier_paths, 2, L)
+
+        # Mirror the early CLDNN stack but intentionally omit dropout for deterministic targets.
+        h_iq = F.relu(feat_enc["conv_iq"](x_paths))
+        i = x_paths[:, :, 0, :]
+        q = x_paths[:, :, 1, :]
+        h_i = F.relu(feat_enc["conv_i"](i)).unsqueeze(2)
+        h_q = F.relu(feat_enc["conv_q"](q)).unsqueeze(2)
+        h_iq_sep = torch.cat([h_i, h_q], dim=2)
+        h_sep = F.relu(feat_enc["conv_fuse"](h_iq_sep))
+        h = torch.cat([h_iq, h_sep], dim=1)
+        h = F.relu(feat_enc["conv_merge"](h)).squeeze(2)  # (B, merge_ch, T)
+
+        # Time-average to keep memory/compute bounded and stable across sequence lengths.
+        return h.mean(dim=-1)
 
     def _forward_windows(
         self,
