@@ -5,7 +5,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - tqdm is optional
 from data import (
     build_tensors,
     filter_indices_by_snrs,
+    load_rml2018a_hdf5,
     load_rml2016a,
     parse_snrs,
     RML2016aDataset,
@@ -36,13 +37,300 @@ from data import (
     RML2016aVariableGroupedDataset,
 )
 from diffusion import DiffusionSchedule
-from model import CLDNNAMC, DiffusionAMC
+from model import CLDNNAMC, DiffusionAMC, MultiViewCLDNNAMC
 
 
 PRESETS = {
     "S": {"patch_size": 8, "dim": 192, "depth": 10, "heads": 6, "lr": 2e-4},
     "B": {"patch_size": 4, "dim": 256, "depth": 12, "heads": 8, "lr": 1e-4},
 }
+
+
+# =============================================================================
+# SNR-path consistency: calibrated noise injection + KL consistency loss
+# =============================================================================
+def snr_path_degrade(
+    x: torch.Tensor,
+    snr_db: torch.Tensor,
+    delta_min: float = 2.0,
+    delta_max: float = 8.0,
+    snr_floor: float = -20.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Create a harder view of each sample by adding calibrated AWGN to reduce
+    the effective SNR by a random amount Δ ∈ [delta_min, delta_max] dB.
+
+    The noise power is computed analytically so that:
+        SNR_new = SNR_original − Δ
+
+    Args:
+        x: (B, 2, L) or (B, K, 2, L) — IQ signal (assumed RMS-normalized)
+        snr_db: (B,) — per-sample SNR labels in dB
+        delta_min: minimum SNR degradation in dB
+        delta_max: maximum SNR degradation in dB
+        snr_floor: don't degrade below this SNR (dataset minimum)
+
+    Returns:
+        x_low: degraded signal (same shape as x)
+        delta_actual: (B,) actual degradation applied (may be clipped by floor)
+    """
+    device = x.device
+    B = snr_db.shape[0]
+
+    # Sample random Δ per sample
+    delta = torch.empty(B, device=device).uniform_(delta_min, delta_max)
+
+    # Clamp so we don't go below the dataset's minimum SNR
+    snr_new = torch.clamp(snr_db.float() - delta, min=float(snr_floor))
+    delta_actual = snr_db.float() - snr_new  # may be less than requested if clamped
+
+    # Convert SNR from dB to linear scale
+    # SNR_linear = 10^(SNR_dB / 10)
+    snr_orig_lin = 10.0 ** (snr_db.float() / 10.0)
+    snr_new_lin = 10.0 ** (snr_new / 10.0)
+
+    # ---------------------------------------------------------------
+    # CRITICAL: x is already noisy (x = signal + existing_noise).
+    # What we measure is P_total = P_signal + P_noise_existing.
+    # We must disentangle P_signal using the known SNR label:
+    #   P_total = P_signal × (1 + 1/SNR_orig_lin)
+    #   P_signal = P_total / (1 + 1/SNR_orig_lin)
+    # ---------------------------------------------------------------
+    p_total = x.view(B, -1).pow(2).mean(dim=1)  # (B,) — total power
+
+    # Derive pure signal power from total power and label SNR
+    p_signal = p_total / (1.0 + 1.0 / (snr_orig_lin + 1e-8))  # (B,)
+
+    # Additional noise variance needed:
+    # We want P_noise_new  = P_signal / SNR_new_lin
+    # We have P_noise_orig = P_signal / SNR_orig_lin
+    # Added:  σ²_add = P_signal × (1/SNR_new_lin − 1/SNR_orig_lin)
+    noise_var = p_signal * (1.0 / (snr_new_lin + 1e-8) - 1.0 / (snr_orig_lin + 1e-8))
+    noise_var = torch.clamp(noise_var, min=0.0)  # safety: never subtract noise
+    noise_std = torch.sqrt(noise_var + 1e-12)
+
+    # Reshape for broadcasting
+    if x.ndim == 4:
+        noise_std = noise_std.view(B, 1, 1, 1)
+    else:
+        noise_std = noise_std.view(B, 1, 1)
+
+    # Add calibrated Gaussian noise
+    noise = torch.randn_like(x) * noise_std
+    x_low = x + noise
+
+    return x_low, delta_actual
+
+
+def snr_db_to_eta_target(
+    snr_db: torch.Tensor,
+    rho_min: float = 1e-4,
+    rho_max: float = 1.0 - 1e-4,
+    eta_min: float = -8.0,
+    eta_max: float = 5.5,
+) -> torch.Tensor:
+    """
+    Convert SNR(dB) labels to eta=logit(rho) targets, where rho=P_noise/P_total.
+    """
+    snr_lin = torch.pow(10.0, snr_db.float() / 10.0)
+    rho = 1.0 / (1.0 + snr_lin)
+    rho = torch.clamp(rho, min=float(rho_min), max=float(rho_max))
+    eta = torch.log(rho) - torch.log1p(-rho)
+    eta = torch.clamp(eta, min=float(eta_min), max=float(eta_max))
+    return eta
+
+
+def high_snr_soft_mask(snr_db: torch.Tensor, center_db: float = 10.0, width_db: float = 2.0) -> torch.Tensor:
+    return torch.sigmoid((snr_db.float() - float(center_db)) / max(1e-6, float(width_db)))
+
+
+def get_cls2dn_scale(epoch: int, args: argparse.Namespace) -> float:
+    if not bool(getattr(args, "cldnn_denoiser", False)):
+        return 1.0
+    stage_a = int(max(0, getattr(args, "stage_a_epochs", 0)))
+    stage_b = int(max(0, getattr(args, "stage_b_epochs", 0)))
+    if epoch < stage_a:
+        return 0.0
+    if stage_b <= 0:
+        return 1.0
+    in_b = epoch - stage_a
+    if in_b >= stage_b:
+        return 1.0
+    b_half = max(1, stage_b // 2)
+    if in_b < b_half:
+        return float(getattr(args, "stage_b1_cls2dn_scale", 0.0))
+    return float(getattr(args, "stage_b2_cls2dn_scale", 0.1))
+
+
+def fit_noise_proxy_calibration(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    rho_min: float,
+    rho_max: float,
+    eta_min: float,
+    eta_max: float,
+    max_batches: int = 256,
+) -> Dict[str, float]:
+    """
+    Fit a monotonic linear calibration eta0 = a * e_proxy + b for the analytic proxy.
+    """
+    if not hasattr(model, "noise_fraction_net") or getattr(model, "noise_fraction_net") is None:
+        return {}
+
+    e_all: List[torch.Tensor] = []
+    eta_all: List[torch.Tensor] = []
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for bidx, batch in enumerate(loader):
+            if len(batch) == 4:
+                x, _y, snr, _mask = batch
+            else:
+                x, _y, snr = batch[:3]
+            x = x.to(device)
+            snr = snr.to(device)
+            if x.ndim == 4:
+                g = x.shape[1]
+                x_flat = x.reshape(-1, x.shape[2], x.shape[3])
+                snr_flat = snr.repeat_interleave(g)
+            else:
+                x_flat = x
+                snr_flat = snr
+            e_proxy = model.noise_fraction_net.proxy.compute_proxy_energy(x_flat[:, :2, :])  # type: ignore[attr-defined]
+            eta_tgt = snr_db_to_eta_target(
+                snr_flat,
+                rho_min=float(rho_min),
+                rho_max=float(rho_max),
+                eta_min=float(eta_min),
+                eta_max=float(eta_max),
+            )
+            e_all.append(e_proxy.detach().float().cpu())
+            eta_all.append(eta_tgt.detach().float().cpu())
+            if (bidx + 1) >= int(max_batches):
+                break
+    if was_training:
+        model.train()
+
+    if not e_all:
+        return {}
+
+    e = torch.cat(e_all, dim=0).numpy()
+    y = torch.cat(eta_all, dim=0).numpy()
+    xmat = np.stack([e, np.ones_like(e)], axis=1)
+    sol, *_ = np.linalg.lstsq(xmat, y, rcond=None)
+    scale = float(max(sol[0], 1e-6))
+    bias = float(sol[1])
+    model.set_noise_proxy_calibration(scale=scale, bias=bias)  # type: ignore[attr-defined]
+    return {"proxy_cal_scale": scale, "proxy_cal_bias": bias}
+
+
+def snr_consistency_loss(
+    logits_clean: torch.Tensor,
+    logits_noisy: torch.Tensor,
+    temperature: float = 2.0,
+    snr_db: Optional[torch.Tensor] = None,
+    snr_lo: float = -6.0,
+    snr_hi: float = 6.0,
+    conf_thresh: float = 0.0,
+    snr_new_db: Optional[torch.Tensor] = None,
+    snr_new_lo: float = -999.0,
+    snr_new_hi: float = 999.0,
+) -> torch.Tensor:
+    """
+    KL-divergence consistency loss between clean-view and noisy-view predictions.
+
+    The clean view's softmax is treated as the target (stop-gradient).
+    Temperature > 1 softens the distributions for better gradient flow.
+
+    Optional improvements over naive KL:
+      - **Confidence weighting**: only distill from teacher when its max-prob
+        exceeds conf_thresh (prevents garbage-teaching at low SNR).
+      - **SNR gating**: only apply loss to samples in the transition zone
+        [snr_lo, snr_hi] dB where the consistency signal is most useful.
+        (Outside: high-SNR is trivially consistent; very-low-SNR is hopeless.)
+      - **Student SNR gating** (optional): additionally gate based on the
+        degraded-view SNR (snr_new_db) to focus robustness where you want it.
+
+    Args:
+        logits_clean: (B, C) logits from the original (higher-SNR) view
+        logits_noisy: (B, C) logits from the degraded (lower-SNR) view
+        temperature: softmax temperature (higher = softer targets)
+        snr_db: (B,) per-sample SNR in dB (optional; enables SNR gating)
+        snr_lo: lower SNR bound for gating (dB)
+        snr_hi: upper SNR bound for gating (dB)
+        conf_thresh: minimum teacher confidence to apply loss (0 = disabled)
+        snr_new_db: (B,) degraded-view SNR in dB (optional; enables student SNR gating)
+        snr_new_lo: lower bound for degraded-view SNR gating (dB)
+        snr_new_hi: upper bound for degraded-view SNR gating (dB)
+
+    Returns:
+        loss: scalar weighted KL divergence
+    """
+    B = logits_clean.shape[0]
+
+    # Soft targets from clean view (stop gradient)
+    p_clean = F.softmax(logits_clean.detach() / temperature, dim=1)
+
+    # Log-softmax from noisy view
+    log_p_noisy = F.log_softmax(logits_noisy / temperature, dim=1)
+
+    # Per-sample KL divergence
+    kl_per_sample = F.kl_div(log_p_noisy, p_clean, reduction="none").sum(dim=1)  # (B,)
+
+    # Build per-sample weight mask
+    weight = torch.ones(B, device=logits_clean.device)
+
+    # Confidence gating: only distill when teacher is confident
+    if conf_thresh > 0:
+        teacher_conf, _ = p_clean.max(dim=1)
+        weight = weight * (teacher_conf >= conf_thresh).float()
+
+    # SNR gating: only apply in transition zone
+    if snr_db is not None:
+        snr_f = snr_db.float()
+        in_zone = (snr_f >= float(snr_lo)) & (snr_f <= float(snr_hi))
+        weight = weight * in_zone.float()
+
+    # Student SNR gating: optionally gate based on degraded-view SNR
+    if snr_new_db is not None:
+        snr_new_f = snr_new_db.float()
+        in_zone_new = (snr_new_f >= float(snr_new_lo)) & (snr_new_f <= float(snr_new_hi))
+        weight = weight * in_zone_new.float()
+
+    # Weighted mean, scaled by T² to match CE gradient magnitude
+    denom = torch.clamp(weight.sum(), min=1.0)
+    kl = (kl_per_sample * weight).sum() / denom * (temperature ** 2)
+
+    return kl
+
+
+# =============================================================================
+# Focal loss
+# =============================================================================
+def focal_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+    label_smoothing: float = 0.0,
+    reduction: str = "none",
+) -> torch.Tensor:
+    """
+    Focal loss: FL(p_t) = -(1 - p_t)^gamma * CE(p, y)
+
+    Down-weights easy (high confidence) samples, focuses on hard samples.
+    When gamma=0, this is standard cross-entropy.
+    """
+    ce = F.cross_entropy(logits, targets, reduction="none", label_smoothing=label_smoothing)
+    if gamma == 0.0:
+        return ce if reduction == "none" else ce.mean()
+    # p_t = probability of correct class
+    p_t = torch.exp(-ce)
+    focal_weight = (1.0 - p_t) ** gamma
+    loss = focal_weight * ce
+    if reduction == "mean":
+        return loss.mean()
+    return loss
 
 
 # =============================================================================
@@ -53,7 +341,8 @@ def mixup_data(
     y: torch.Tensor,
     snr: torch.Tensor,
     alpha: float = 0.4,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor]:
+    snr_min: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Apply mixup augmentation.
     Returns: (mixed_x, y_a, y_b, lam, mixed_snr)
@@ -66,11 +355,20 @@ def mixup_data(
     batch_size = x.size(0)
     index = torch.randperm(batch_size, device=x.device)
 
-    mixed_x = lam * x + (1 - lam) * x[index]
-    y_a, y_b = y, y[index]
-    mixed_snr = lam * snr + (1 - lam) * snr[index]
+    lam_t = torch.full((batch_size,), lam, device=x.device, dtype=torch.float32)
+    if snr_min is not None:
+        snr_f = snr.float()
+        # Only mix pairs where BOTH samples are above the SNR threshold.
+        eligible = (snr_f >= float(snr_min)) & (snr_f[index] >= float(snr_min))
+        lam_t = torch.where(eligible, lam_t, torch.ones_like(lam_t))
 
-    return mixed_x, y_a, y_b, lam, mixed_snr
+    lam_x = lam_t.view(batch_size, *([1] * (x.ndim - 1))).to(dtype=x.dtype)
+    mixed_x = lam_x * x + (1.0 - lam_x) * x[index]
+    y_a, y_b = y, y[index]
+    snr_f = snr.float()
+    mixed_snr = lam_t * snr_f + (1.0 - lam_t) * snr_f[index]
+
+    return mixed_x, y_a, y_b, lam_t, mixed_snr
 
 
 def mixup_criterion(
@@ -98,6 +396,32 @@ def get_curriculum_snr_min(epoch: int, curriculum_epochs: int, snr_start: float,
     return snr_start + progress * (snr_end - snr_start)
 
 
+def curriculum_weights(
+    snr: torch.Tensor,
+    curriculum_snr_min: float,
+    epoch: int,
+    curriculum_epochs: int,
+    soft: bool,
+    soft_low_weight: float,
+) -> torch.Tensor:
+    """
+    Per-sample curriculum weights (float32).
+    - Hard curriculum: weights are {0,1} based on snr >= curriculum_snr_min.
+    - Soft curriculum: below-threshold samples get a small weight that ramps to 1.0 by curriculum_epochs.
+    """
+    if curriculum_epochs <= 0:
+        return torch.ones_like(snr, dtype=torch.float32)
+    snr_f = snr.float()
+    if not soft:
+        return (snr_f >= float(curriculum_snr_min)).float()
+    progress = min(1.0, float(epoch) / float(curriculum_epochs))
+    w0 = float(soft_low_weight)
+    w_low = w0 + progress * (1.0 - w0)
+    ones = torch.ones_like(snr_f, dtype=torch.float32)
+    low = torch.full_like(snr_f, w_low, dtype=torch.float32)
+    return torch.where(snr_f >= float(curriculum_snr_min), ones, low)
+
+
 # =============================================================================
 # Consistency loss helper
 # =============================================================================
@@ -123,6 +447,127 @@ def consistency_loss(logits_list: List[torch.Tensor]) -> torch.Tensor:
         reduction="none",
     ).sum(dim=-1)  # (K, B)
     return kl_divs.mean()
+
+
+# =============================================================================
+# Contrastive learning (InfoNCE / NT-Xent loss)
+# =============================================================================
+def info_nce_loss(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """
+    Compute InfoNCE (NT-Xent) loss for contrastive learning.
+
+    Args:
+        features: (B*K, D) - features from K windows per sample, flattened
+        labels: (B,) - class labels for each sample (repeated K times internally)
+        temperature: softmax temperature (lower = sharper)
+
+    Returns:
+        loss: scalar contrastive loss
+
+    Windows from the same sample (same label and same batch position) are positive pairs.
+    Windows from different samples are negative pairs.
+    """
+    device = features.device
+    batch_size = labels.shape[0]
+    k = features.shape[0] // batch_size  # number of windows per sample
+
+    # Normalize features (important for cosine similarity)
+    features = F.normalize(features, dim=1)
+
+    # Compute similarity matrix: (B*K, B*K)
+    sim_matrix = torch.mm(features, features.T) / temperature
+
+    # Create mask for positive pairs (same sample = same batch index)
+    # sample_ids: [0,0,0,0, 1,1,1,1, 2,2,2,2, ...] if K=4
+    sample_ids = torch.arange(batch_size, device=device).repeat_interleave(k)
+    pos_mask = (sample_ids.unsqueeze(0) == sample_ids.unsqueeze(1)).float()
+
+    # Remove self-similarity from positive mask
+    eye = torch.eye(features.shape[0], device=device)
+    pos_mask = pos_mask - eye
+
+    # For each row, we want: log(sum(exp(pos)) / sum(exp(all except self)))
+    # Mask out self-similarity with large negative
+    sim_matrix = sim_matrix - eye * 1e9
+
+    # Compute log-softmax over all pairs (except self)
+    log_softmax = F.log_softmax(sim_matrix, dim=1)
+
+    # Average log-prob of positive pairs
+    # Each sample has (K-1) positive pairs (other windows from same sample)
+    num_positives = pos_mask.sum(dim=1).clamp(min=1)
+    loss = -(log_softmax * pos_mask).sum(dim=1) / num_positives
+
+    return loss.mean()
+
+
+# =============================================================================
+# Supervised Contrastive Loss  (Khosla et al., NeurIPS 2020)
+# =============================================================================
+def supervised_contrastive_loss(
+    z: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 0.07,
+) -> torch.Tensor:
+    """
+    Supervised contrastive (SupCon) loss using *in-batch* positives.
+
+    For each anchor i the set of positives is
+        P(i) = { j ≠ i : y_j == y_i }
+    and the loss is
+
+        L_i = -(1/|P(i)|) Σ_{p∈P(i)} log  exp(z_i·z_p/τ)
+                                            ────────────────────
+                                            Σ_{a≠i} exp(z_i·z_a/τ)
+
+    Anchors with no positives in the batch are excluded from the mean.
+
+    Args:
+        z:      (B, D) — **already L2-normalised** embeddings
+        labels: (B,)   — integer class labels
+        temperature: τ  (lower → sharper; 0.07 is standard for normalised embeddings)
+
+    Returns:
+        scalar loss
+    """
+    device = z.device
+    B = z.shape[0]
+    if B <= 1:
+        return torch.tensor(0.0, device=device)
+
+    # ------- similarity matrix (B, B) -------
+    sim = torch.mm(z, z.T) / temperature          # (B, B)
+
+    # numerical stability: subtract row-wise max before exp
+    sim_max, _ = sim.max(dim=1, keepdim=True)
+    sim = sim - sim_max.detach()
+
+    # ------- masks -------
+    self_mask = torch.eye(B, dtype=torch.bool, device=device)          # True on diagonal
+    pos_mask  = (labels.unsqueeze(1) == labels.unsqueeze(0)) & ~self_mask  # (B, B)
+
+    # ------- denominator: log Σ_{a≠i} exp(sim_ia) -------
+    exp_sim = torch.exp(sim)
+    exp_sim = exp_sim.masked_fill(self_mask, 0.0)          # zero diagonal
+    log_denom = torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-12)   # (B, 1)
+
+    # ------- per-pair log-prob -------
+    log_prob = sim - log_denom                             # (B, B)
+
+    # ------- mean over positives for each anchor -------
+    num_pos = pos_mask.float().sum(dim=1)                  # (B,)
+    has_pos = num_pos > 0                                  # bool (B,)
+
+    mean_log_prob_pos = (pos_mask.float() * log_prob).sum(dim=1) / (num_pos + 1e-8)
+
+    # loss = - mean positive log-prob, averaged over anchors that have positives
+    loss = -mean_log_prob_pos * has_pos.float()
+    n_valid = has_pos.float().sum().clamp(min=1.0)
+    return loss.sum() / n_valid
 
 
 def _cuda_amp_dtype() -> torch.dtype:
@@ -184,20 +629,27 @@ class EMA:
         self.shadow = {k: v.detach().clone() for k, v in sd.items()}
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Diffusion-regularized AMC (RML2016.10a)")
+    parser = argparse.ArgumentParser(description="Diffusion-regularized AMC (RML2016.10a / RML2018.01A)")
     parser.add_argument(
         "--data-path",
         type=str,
         default="/home/tahit/Modulation/RML2016.10a_dict.pkl",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["rml2016a", "rml2018a"],
+        default="rml2016a",
+        help="Dataset format. rml2016a=pickle dict (RML2016.10a). rml2018a=HDF5 with X/Y/Z (RadioML 2018.01A).",
     )
     parser.add_argument("--out-dir", type=str, default="./runs/dit_amc")
     parser.add_argument("--preset", type=str, choices=["S", "B"], default="S")
     parser.add_argument(
         "--arch",
         type=str,
-        choices=["dit", "cldnn"],
+        choices=["dit", "cldnn", "multiview"],
         default="dit",
-        help="Model architecture. dit=DiffusionAMC (token-space diffusion). cldnn=CNN+LSTM (K=1-first, no diffusion).",
+        help="Model architecture. dit=DiffusionAMC. cldnn=CNN+LSTM. multiview=IQ+STFT dual-branch with cross-view attention.",
     )
 
     parser.add_argument("--patch-size", type=int, default=None)
@@ -222,18 +674,111 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cldnn-bidir", action="store_true", help="Use bidirectional LSTM.")
     parser.add_argument("--cldnn-pool", type=str, default="attn", choices=["attn", "last", "mean"], help="Temporal pooling over LSTM outputs.")
     parser.add_argument("--cldnn-snr-cond", action="store_true", help="Enable SNR conditioning via FiLM for CLDNN.")
+    parser.add_argument("--cldnn-noise-cond", action="store_true", help="Enable noise-fraction conditioning via eta=logit(rho) FiLM for CLDNN.")
+    parser.add_argument("--cldnn-denoiser", action="store_true", help="Enable residual conditional U-Net denoiser preprocessor.")
+    parser.add_argument("--cldnn-denoiser-dual-path", action="store_true", help="Use mandatory dual-path classifier input [x_raw, x_dn] when denoiser is enabled.")
+    parser.add_argument("--cldnn-denoiser-base-ch", type=int, default=32, help="Base channels for the denoiser U-Net.")
+    parser.add_argument("--cldnn-denoiser-dropout", type=float, default=0.0, help="Dropout inside denoiser residual blocks.")
+    parser.add_argument("--cldnn-denoiser-soft-hi-blend", action="store_true", help="Enable soft high-SNR residual suppression in denoiser.")
+    parser.add_argument("--cldnn-denoiser-bypass-eval", action="store_true", help="Bypass denoiser at eval/inference (A2b sanity mode).")
+    parser.add_argument("--noise-head-hidden", type=int, default=32, help="Hidden channels for lightweight NoiseFractionNet.")
+    parser.add_argument("--fit-noise-proxy-calibration", action="store_true", help="Fit analytic proxy calibration eta0=a*e+b on train data before training.")
+    parser.add_argument("--noise-proxy-calibration-batches", type=int, default=256, help="Max train batches for fitting analytic proxy calibration.")
+    parser.add_argument("--noise-eta-min", type=float, default=-8.0, help="Minimum eta clamp for noise-fraction conditioning/prediction.")
+    parser.add_argument("--noise-eta-max", type=float, default=5.5, help="Maximum eta clamp for noise-fraction conditioning/prediction.")
+    parser.add_argument("--noise-rho-min", type=float, default=1e-4, help="Minimum rho clamp when converting SNR labels to eta targets.")
+    parser.add_argument("--noise-rho-max", type=float, default=1.0 - 1e-4, help="Maximum rho clamp when converting SNR labels to eta targets.")
+    parser.add_argument("--cldnn-expert-features", action="store_true", help="Enable expert feature branch (conjugate products, cyclostationary stats).")
+    parser.add_argument("--cldnn-expert-ch", type=int, default=64, help="Channels for expert feature CNN.")
+    parser.add_argument("--cldnn-cls-hidden", type=int, default=0, help="Classifier head hidden dim (0=auto: max(128, num_classes*8)).")
+
+    # Multi-view architecture options (used when --arch multiview)
+    parser.add_argument("--stft-nfft", type=int, default=64, help="STFT FFT size for spectral branch.")
+    parser.add_argument("--stft-hop", type=int, default=8, help="STFT hop length for spectral branch.")
+    parser.add_argument("--stft-channels", type=int, default=64, help="Output channels of STFT Conv2D stack.")
+    parser.add_argument("--cross-view-heads", type=int, default=4, help="Number of heads for cross-view attention fusion.")
+    parser.add_argument("--snr-gate", action="store_true", help="Enable SNR-conditioned gating in cross-view fusion.")
+
+    parser.add_argument("--focal-gamma", type=float, default=0.0, help="Focal loss gamma (0=standard CE, 2=strong focal).")
 
     # Mixup augmentation
     parser.add_argument("--mixup-alpha", type=float, default=0.0, help="Mixup alpha (0 = disabled). Recommended: 0.2-0.4.")
     parser.add_argument("--mixup-prob", type=float, default=0.5, help="Probability of applying mixup per batch (when alpha > 0).")
+    parser.add_argument(
+        "--mixup-snr-min",
+        type=float,
+        default=None,
+        help="If set, only mix pairs where BOTH samples have SNR >= this threshold (training-time label only).",
+    )
+    parser.add_argument(
+        "--mixup-cls-only",
+        dest="mixup_cls_only",
+        action="store_true",
+        help="Apply mixup only to classification loss; keep denoiser/noise auxiliary losses on clean (unmixed) inputs.",
+    )
+    parser.add_argument(
+        "--mixup-all-losses",
+        dest="mixup_cls_only",
+        action="store_false",
+        help="Legacy behavior: apply mixup to all losses (including denoiser/noise auxiliary losses).",
+    )
+    parser.set_defaults(mixup_cls_only=True)
 
     # Curriculum learning (SNR-based)
     parser.add_argument("--curriculum-epochs", type=int, default=0, help="Number of epochs for curriculum (0 = disabled). SNR min increases from curriculum-snr-start to -20.")
     parser.add_argument("--curriculum-snr-start", type=float, default=0.0, help="Starting SNR min for curriculum (e.g., 0 means start with SNR >= 0 only).")
+    parser.add_argument(
+        "--curriculum-soft",
+        action="store_true",
+        help="Soft curriculum: downweight below-threshold samples instead of dropping them (weight ramps to 1.0 by curriculum-epochs).",
+    )
+    parser.add_argument(
+        "--curriculum-soft-low-weight",
+        type=float,
+        default=0.1,
+        help="Below-threshold sample weight at epoch 0 when --curriculum-soft is enabled (ramps to 1.0).",
+    )
 
     # Consistency loss for multi-window training
     parser.add_argument("--consistency-lambda", type=float, default=0.0, help="Weight for consistency loss across K windows (0 = disabled).")
     parser.add_argument("--consistency-k", type=int, default=4, help="Number of windows for consistency loss (used when consistency-lambda > 0).")
+
+    # SNR-path consistency training (core novelty)
+    parser.add_argument("--snr-consist", action="store_true", help="Enable SNR-path consistency training (add calibrated noise → enforce prediction consistency).")
+    parser.add_argument("--snr-consist-lambda", type=float, default=1.0, help="Weight for SNR-path consistency KL loss.")
+    parser.add_argument("--snr-consist-delta-min", type=float, default=2.0, help="Minimum SNR degradation in dB for consistency view.")
+    parser.add_argument("--snr-consist-delta-max", type=float, default=8.0, help="Maximum SNR degradation in dB for consistency view.")
+    parser.add_argument("--snr-consist-temp", type=float, default=2.0, help="Temperature for consistency soft targets (higher = softer).")
+    parser.add_argument("--snr-consist-warmup", type=int, default=5, help="Number of epochs before consistency loss kicks in (let CE stabilize first).")
+    parser.add_argument(
+        "--snr-consist-ramp",
+        type=int,
+        default=0,
+        help="Linearly ramp consistency weight over this many epochs after warmup (0 = no ramp; immediate full weight).",
+    )
+    parser.add_argument(
+        "--snr-consist-teacher-eval",
+        action="store_true",
+        help="Use a 'clean-eval' teacher for consistency: recompute clean-view logits with model.eval() + no_grad() (dropout off) to stabilize targets.",
+    )
+    parser.add_argument("--snr-consist-conf-thresh", type=float, default=0.0, help="Min teacher confidence to apply consistency (0=disabled). E.g. 0.5 filters out uncertain teachers.")
+    parser.add_argument("--snr-consist-snr-lo", type=float, default=-999.0, help="Lower SNR bound for consistency gating (dB). Default -999 = no lower bound.")
+    parser.add_argument("--snr-consist-snr-hi", type=float, default=999.0, help="Upper SNR bound for consistency gating (dB). Default 999 = no upper bound.")
+    parser.add_argument("--snr-consist-snr-new-lo", type=float, default=-999.0, help="Lower bound for degraded-view SNR gating (dB). Default -999 = no lower bound.")
+    parser.add_argument("--snr-consist-snr-new-hi", type=float, default=999.0, help="Upper bound for degraded-view SNR gating (dB). Default 999 = no upper bound.")
+
+    # Contrastive pre-training
+    parser.add_argument("--contrastive-pretrain-epochs", type=int, default=0, help="Number of epochs for contrastive pre-training (0 = disabled).")
+    parser.add_argument("--contrastive-k", type=int, default=4, help="Number of windows per sample for contrastive learning.")
+    parser.add_argument("--contrastive-temp", type=float, default=0.1, help="Temperature for InfoNCE loss.")
+    parser.add_argument("--contrastive-lr", type=float, default=None, help="Learning rate for contrastive pre-training (defaults to --lr).")
+
+    # Supervised Contrastive Learning (SupCon)  –  Khosla et al., NeurIPS 2020
+    parser.add_argument("--supcon", action="store_true", help="Enable supervised contrastive loss (SupCon) alongside CE.")
+    parser.add_argument("--supcon-lambda", type=float, default=0.1, help="Weight for SupCon loss (relative to CE). Start with 0.1.")
+    parser.add_argument("--supcon-temp", type=float, default=0.07, help="Temperature τ for cosine similarities (0.07 is standard for L2-normed embeddings).")
+    parser.add_argument("--supcon-proj-dim", type=int, default=128, help="Output dimension of the MLP projection head for SupCon.")
+    parser.add_argument("--supcon-warmup", type=int, default=0, help="Number of epochs before SupCon loss kicks in (0 = from the start).")
 
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=50)
@@ -241,10 +786,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument(
+        "--lr-decay-start-epoch",
+        type=int,
+        default=0,
+        help="Keep LR flat (after warmup) until this epoch, then cosine decay to --min-lr. Useful to align LR decay with curriculum (e.g., set to --curriculum-epochs).",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=2016)
-    parser.add_argument("--train-per", type=int, default=600)
-    parser.add_argument("--val-per", type=int, default=200)
+    parser.add_argument(
+        "--train-per",
+        type=int,
+        default=None,
+        help="Samples per (mod,SNR) bucket for training. Default: auto (600 for rml2016a, 3200 for rml2018a).",
+    )
+    parser.add_argument(
+        "--val-per",
+        type=int,
+        default=None,
+        help="Samples per (mod,SNR) bucket for validation. Default: auto (200 for rml2016a, 500 for rml2018a).",
+    )
     parser.add_argument("--normalize", type=str, choices=["rms", "none"], default="rms")
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--snr-balanced", action="store_true", help="Use SNR-balanced sampling for the training loader.")
@@ -274,8 +835,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--snr-cap-max-db",
         type=float,
-        default=18.0,
-        help="Upper SNR (dB) used for per-sample timestep cap scaling.",
+        default=None,
+        help="Upper SNR (dB) used for per-sample timestep cap scaling. Auto-detected from dataset if not set.",
     )
     parser.add_argument(
         "--low-snr-boost",
@@ -300,6 +861,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lambda-diff", type=float, default=0.2)
     parser.add_argument("--lambda-snr", type=float, default=0.1)
+    parser.add_argument("--lambda-noise", type=float, default=0.0, help="Weight for eta(noise-fraction) regression loss.")
+    parser.add_argument("--lambda-dn", type=float, default=0.0, help="Weight for paired denoiser reconstruction loss L_dn.")
+    parser.add_argument("--lambda-id", type=float, default=0.0, help="Weight for high-SNR identity loss L_id on denoiser output.")
+    parser.add_argument("--stage-a-epochs", type=int, default=0, help="Stage A epochs (denoiser/noise-head bootstrap).")
+    parser.add_argument("--stage-b-epochs", type=int, default=0, help="Stage B epochs (classifier warm start with controlled cls->dn gradients).")
+    parser.add_argument("--stage-b1-cls2dn-scale", type=float, default=0.0, help="Classifier->denoiser gradient scale in first half of Stage B.")
+    parser.add_argument("--stage-b2-cls2dn-scale", type=float, default=0.1, help="Classifier->denoiser gradient scale in second half of Stage B.")
+    parser.add_argument("--stage-a-no-cls", action="store_true", help="Disable classification loss during Stage A.")
+    parser.add_argument(
+        "--snr-loss-detach-backbone",
+        action="store_true",
+        help="Head-only SNR supervision (CLDNN): do not backprop SNR loss into the backbone.",
+    )
     parser.add_argument("--snr-mode", type=str, choices=["predict", "known", "none"], default="predict")
     parser.add_argument("--snr-scale", type=float, default=20.0)
     parser.add_argument("--t-eval", type=int, default=0)
@@ -345,12 +919,21 @@ def _seed_worker(worker_id: int) -> None:
 
 
 def build_loaders(args: argparse.Namespace, device: torch.device):
-    X, y, snr, mods, snrs, train_idx, val_idx, test_idx = load_rml2016a(
-        args.data_path,
-        seed=args.seed,
-        train_per=args.train_per,
-        val_per=args.val_per,
-    )
+    if str(getattr(args, "dataset", "rml2016a")) == "rml2018a":
+        X, y, snr, mods, snrs, train_idx, val_idx, test_idx = load_rml2018a_hdf5(
+            args.data_path,
+            seed=args.seed,
+            train_per=args.train_per,
+            val_per=args.val_per,
+        )
+    else:
+        X, y, snr, mods, snrs, train_idx, val_idx, test_idx = load_rml2016a(
+            args.data_path,
+            seed=args.seed,
+            train_per=args.train_per,
+            val_per=args.val_per,
+        )
+    seq_len = int(X.shape[-1])
     train_snrs = parse_snrs(args.train_snrs)
     val_snrs = parse_snrs(args.val_snrs) if args.val_snrs is not None else train_snrs
     test_snrs = parse_snrs(args.test_snrs)
@@ -472,16 +1055,25 @@ def build_loaders(args: argparse.Namespace, device: torch.device):
         worker_init_fn=_seed_worker,
         **common,
     )
-    return train_loader, val_loader, test_loader, mods, snrs
+    return train_loader, val_loader, test_loader, mods, snrs, seq_len
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int, min_lr: float):
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr: float,
+    decay_start_step: int = 0,
+):
     base_lrs = [group["lr"] for group in optimizer.param_groups]
+    decay_start_step = max(int(warmup_steps), int(decay_start_step))
 
     def lr_lambda(step: int):
         if step < warmup_steps:
             return float(step) / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        if step < decay_start_step:
+            return 1.0
+        progress = (step - decay_start_step) / max(1, total_steps - decay_start_step)
         progress = min(1.0, max(0.0, progress))
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         min_ratio = min_lr / max(1e-12, base_lrs[0])
@@ -726,8 +1318,132 @@ def evaluate_subset(
     return float(total_correct) / max(1, total)
 
 
+def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    if x.numel() < 2 or y.numel() < 2:
+        return 0.0
+    x = x.float()
+    y = y.float()
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = torch.sqrt(torch.clamp((x * x).sum() * (y * y).sum(), min=1e-12))
+    return float(((x * y).sum() / denom).item())
+
+
+def _spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    if x.numel() < 2 or y.numel() < 2:
+        return 0.0
+    # Approximate rank transform via double argsort (ties are rare for continuous preds).
+    xr = torch.argsort(torch.argsort(x)).float()
+    yr = torch.argsort(torch.argsort(y)).float()
+    return _pearson_corr(xr, yr)
+
+
+def evaluate_eta_calibration(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    t_eval: int,
+    snr_mode: str,
+    amp: bool,
+    rho_min: float,
+    rho_max: float,
+    eta_min: float,
+    eta_max: float,
+) -> Dict[str, object]:
+    """
+    Evaluate eta-head quality:
+      - Pearson/Spearman correlation vs eta target
+      - Per-SNR mean/std prediction and gap to target mean
+    """
+    model.eval()
+    eta_pred_all: List[torch.Tensor] = []
+    eta_tgt_all: List[torch.Tensor] = []
+    snr_all: List[torch.Tensor] = []
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) == 4:
+                x, _y, snr, mask = batch
+            else:
+                x, _y, snr = batch
+                mask = None
+            x = x.to(device)
+            snr = snr.to(device)
+            t = torch.full((x.shape[0],), t_eval, device=device, dtype=torch.long)
+            snr_in = snr if snr_mode == "known" else None
+            if amp and device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=_cuda_amp_dtype(), enabled=True):
+                    _logits, _x0, _aux = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
+            else:
+                _logits, _x0, _aux = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
+
+            eta_pred = getattr(model, "_eta_pred", None)
+            if eta_pred is None:
+                continue
+            eta_tgt = snr_db_to_eta_target(
+                snr,
+                rho_min=float(rho_min),
+                rho_max=float(rho_max),
+                eta_min=float(eta_min),
+                eta_max=float(eta_max),
+            )
+            eta_pred_all.append(eta_pred.detach().float().cpu())
+            eta_tgt_all.append(eta_tgt.detach().float().cpu())
+            snr_all.append(snr.detach().float().cpu())
+
+    if not eta_pred_all:
+        return {}
+
+    eta_pred_cat = torch.cat(eta_pred_all, dim=0)
+    eta_tgt_cat = torch.cat(eta_tgt_all, dim=0)
+    snr_cat = torch.cat(snr_all, dim=0)
+
+    pearson = _pearson_corr(eta_pred_cat, eta_tgt_cat)
+    spearman = _spearman_corr(eta_pred_cat, eta_tgt_cat)
+
+    by_snr: Dict[str, Dict[str, float]] = {}
+    unique_snr = torch.unique(snr_cat).tolist()
+    for s in sorted(unique_snr):
+        mask = snr_cat == float(s)
+        p = eta_pred_cat[mask]
+        t = eta_tgt_cat[mask]
+        if p.numel() == 0:
+            continue
+        by_snr[str(int(round(float(s))))] = {
+            "eta_pred_mean": float(p.mean().item()),
+            "eta_pred_std": float(p.std(unbiased=False).item()),
+            "eta_tgt_mean": float(t.mean().item()),
+            "eta_mae": float(torch.mean(torch.abs(p - t)).item()),
+        }
+
+    return {
+        "eta_pearson": pearson,
+        "eta_spearman": spearman,
+        "eta_by_snr": by_snr,
+    }
+
+
 def train(args: argparse.Namespace) -> None:
     apply_preset(args)
+    if bool(getattr(args, "cldnn_snr_cond", False)) and bool(getattr(args, "cldnn_noise_cond", False)):
+        raise ValueError("Use only one conditioning path: --cldnn-snr-cond OR --cldnn-noise-cond.")
+    if args.arch != "cldnn" and (
+        bool(getattr(args, "cldnn_noise_cond", False))
+        or bool(getattr(args, "cldnn_denoiser", False))
+        or float(getattr(args, "lambda_noise", 0.0)) > 0
+        or float(getattr(args, "lambda_dn", 0.0)) > 0
+        or float(getattr(args, "lambda_id", 0.0)) > 0
+    ):
+        raise ValueError("Noise/denoiser options are currently supported only for --arch cldnn.")
+    if bool(getattr(args, "cldnn_denoiser_dual_path", False)) and not bool(getattr(args, "cldnn_denoiser", False)):
+        raise ValueError("--cldnn-denoiser-dual-path requires --cldnn-denoiser.")
+    if int(getattr(args, "stage_a_epochs", 0)) < 0 or int(getattr(args, "stage_b_epochs", 0)) < 0:
+        raise ValueError("stage_a_epochs and stage_b_epochs must be >= 0.")
+    if float(getattr(args, "noise_rho_min", 1e-4)) <= 0 or float(getattr(args, "noise_rho_max", 1.0 - 1e-4)) >= 1:
+        raise ValueError("noise_rho_min/max must satisfy 0 < min < max < 1.")
+    if float(getattr(args, "noise_rho_min", 1e-4)) >= float(getattr(args, "noise_rho_max", 1.0 - 1e-4)):
+        raise ValueError("noise_rho_min must be < noise_rho_max.")
+    if float(getattr(args, "noise_eta_min", -8.0)) >= float(getattr(args, "noise_eta_max", 5.5)):
+        raise ValueError("noise_eta_min must be < noise_eta_max.")
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -741,7 +1457,9 @@ def train(args: argparse.Namespace) -> None:
         except AttributeError:
             pass
 
-    train_loader, val_loader, test_loader, mods, snrs = build_loaders(args, device)
+    train_loader, val_loader, test_loader, mods, snrs, seq_len = build_loaders(args, device)
+    snr_min_db = float(min(snrs)) if snrs else -20.0
+    snr_max_db = float(max(snrs)) if snrs else 18.0
     train_eval_loader = None
     if args.train_eval_batches > 0:
         pin_memory = device.type == "cuda"
@@ -759,6 +1477,7 @@ def train(args: argparse.Namespace) -> None:
     if args.arch == "dit":
         model = DiffusionAMC(
             num_classes=len(mods),
+            seq_len=seq_len,
             patch_size=args.patch_size,
             dim=args.dim,
             depth=args.depth,
@@ -771,10 +1490,10 @@ def train(args: argparse.Namespace) -> None:
             group_pool=args.group_pool,
         ).to(device)
         schedule = DiffusionSchedule(timesteps=args.timesteps).to(device)
-    else:
-        # K=1-first CNN+LSTM model (no diffusion)
-        model = CLDNNAMC(
+    elif args.arch == "multiview":
+        model = MultiViewCLDNNAMC(
             num_classes=len(mods),
+            seq_len=seq_len,
             conv_channels=int(args.cldnn_conv_ch),
             merge_channels=int(args.cldnn_merge_ch),
             lstm_hidden=int(args.cldnn_lstm_hidden),
@@ -783,12 +1502,78 @@ def train(args: argparse.Namespace) -> None:
             dropout=float(args.dropout),
             pool=str(args.cldnn_pool),
             snr_cond=bool(args.cldnn_snr_cond),
+            snr_loss_detach_backbone=bool(getattr(args, "snr_loss_detach_backbone", False)),
+            snr_min_db=snr_min_db,
+            snr_max_db=snr_max_db,
+            cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
+            stft_nfft=int(getattr(args, 'stft_nfft', 64)),
+            stft_hop=int(getattr(args, 'stft_hop', 8)),
+            stft_channels=int(getattr(args, 'stft_channels', 64)),
+            cross_view_heads=int(getattr(args, 'cross_view_heads', 4)),
+            snr_gate=bool(getattr(args, 'snr_gate', False)),
+        ).to(device)
+        schedule = None
+    else:
+        # K=1-first CNN+LSTM model (no diffusion)
+        model = CLDNNAMC(
+            num_classes=len(mods),
+            seq_len=seq_len,
+            conv_channels=int(args.cldnn_conv_ch),
+            merge_channels=int(args.cldnn_merge_ch),
+            lstm_hidden=int(args.cldnn_lstm_hidden),
+            lstm_layers=int(args.cldnn_lstm_layers),
+            bidirectional=bool(args.cldnn_bidir),
+            dropout=float(args.dropout),
+            pool=str(args.cldnn_pool),
+            snr_cond=bool(args.cldnn_snr_cond),
+            noise_cond=bool(getattr(args, "cldnn_noise_cond", False)),
+            snr_loss_detach_backbone=bool(getattr(args, "snr_loss_detach_backbone", False)),
+            snr_min_db=snr_min_db,
+            snr_max_db=snr_max_db,
+            noise_eta_min=float(getattr(args, "noise_eta_min", -8.0)),
+            noise_eta_max=float(getattr(args, "noise_eta_max", 5.5)),
+            denoiser=bool(getattr(args, "cldnn_denoiser", False)),
+            denoiser_dual_path=bool(getattr(args, "cldnn_denoiser_dual_path", False)),
+            denoiser_base_channels=int(getattr(args, "cldnn_denoiser_base_ch", 32)),
+            denoiser_dropout=float(getattr(args, "cldnn_denoiser_dropout", 0.0)),
+            denoiser_soft_high_snr_blend=bool(getattr(args, "cldnn_denoiser_soft_hi_blend", False)),
+            noise_head_hidden=int(getattr(args, "noise_head_hidden", 32)),
+            expert_features=bool(getattr(args, 'cldnn_expert_features', False)),
+            expert_channels=int(getattr(args, 'cldnn_expert_ch', 64)),
+            cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
+            supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
         schedule = None
 
+    proxy_fit_info: Dict[str, float] = {}
+    if (
+        args.arch == "cldnn"
+        and bool(getattr(args, "cldnn_denoiser", False))
+        and bool(getattr(args, "fit_noise_proxy_calibration", False))
+    ):
+        proxy_fit_info = fit_noise_proxy_calibration(
+            model,
+            train_loader,
+            device,
+            rho_min=float(getattr(args, "noise_rho_min", 1e-4)),
+            rho_max=float(getattr(args, "noise_rho_max", 1.0 - 1e-4)),
+            eta_min=float(getattr(args, "noise_eta_min", -8.0)),
+            eta_max=float(getattr(args, "noise_eta_max", 5.5)),
+            max_batches=int(getattr(args, "noise_proxy_calibration_batches", 256)),
+        )
+        if proxy_fit_info:
+            print(
+                f"[proxy-cal] scale={proxy_fit_info.get('proxy_cal_scale', 0.0):.6f}, "
+                f"bias={proxy_fit_info.get('proxy_cal_bias', 0.0):.6f}"
+            )
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    total_steps = args.epochs * max(1, len(train_loader))
-    scheduler = build_scheduler(optimizer, args.warmup_steps, total_steps, args.min_lr)
+    steps_per_epoch = max(1, len(train_loader))
+    total_steps = args.epochs * steps_per_epoch
+    decay_start_step = int(getattr(args, "lr_decay_start_epoch", 0)) * steps_per_epoch
+    scheduler = build_scheduler(
+        optimizer, args.warmup_steps, total_steps, args.min_lr, decay_start_step=decay_start_step
+    )
 
     amp_enabled = bool(args.amp and device.type == "cuda")
     amp_dtype = _cuda_amp_dtype() if amp_enabled else torch.float32
@@ -810,10 +1595,128 @@ def train(args: argparse.Namespace) -> None:
     best_epoch = None
     epochs_no_improve = 0
 
+    # =========================================================================
+    # CONTRASTIVE PRE-TRAINING PHASE (if enabled)
+    # =========================================================================
+    if args.contrastive_pretrain_epochs > 0 and args.arch in ("cldnn", "multiview"):
+        print(f"\n{'='*60}")
+        print(f"CONTRASTIVE PRE-TRAINING: {args.contrastive_pretrain_epochs} epochs, K={args.contrastive_k}")
+        print(f"{'='*60}\n")
+
+        # Build a grouped dataset for contrastive learning
+        from data import RML2016aGroupedDataset, load_rml2016a, load_rml2018a_hdf5, build_tensors
+        if str(getattr(args, "dataset", "rml2016a")) == "rml2018a":
+            X_cl, y_cl, snr_cl, mods_cl, snrs_cl, train_idx_cl, val_idx_cl, test_idx_cl = load_rml2018a_hdf5(
+                args.data_path, seed=args.seed, train_per=args.train_per, val_per=args.val_per
+            )
+        else:
+            X_cl, y_cl, snr_cl, mods_cl, snrs_cl, train_idx_cl, val_idx_cl, test_idx_cl = load_rml2016a(
+                args.data_path, seed=args.seed, train_per=args.train_per, val_per=args.val_per
+            )
+        X_t_cl, y_t_cl, snr_t_cl = build_tensors(X_cl, y_cl, snr_cl)
+        contrastive_dataset = RML2016aGroupedDataset(
+            X_t_cl, y_t_cl, snr_t_cl, train_idx_cl,
+            group_k=args.contrastive_k,
+            normalize=args.normalize,
+            aug_phase=args.aug_phase,
+            aug_shift=args.aug_shift,
+            aug_gain=args.aug_gain,
+            aug_cfo=args.aug_cfo,
+        )
+        contrastive_loader = DataLoader(
+            contrastive_dataset,
+            batch_size=args.batch_size // args.contrastive_k,  # Adjust for K windows
+            shuffle=True,
+            drop_last=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            worker_init_fn=_seed_worker,
+        )
+
+        # Optimizer for contrastive phase
+        contrastive_lr = args.contrastive_lr if args.contrastive_lr is not None else args.lr
+        contrastive_optimizer = torch.optim.AdamW(
+            model.parameters(), lr=contrastive_lr, weight_decay=args.weight_decay
+        )
+        contrastive_steps = args.contrastive_pretrain_epochs * len(contrastive_loader)
+        contrastive_scheduler = build_scheduler(
+            contrastive_optimizer, args.warmup_steps, contrastive_steps, args.min_lr, decay_start_step=0
+        )
+
+        for cl_epoch in range(args.contrastive_pretrain_epochs):
+            model.train()
+            epoch_loss = 0.0
+            epoch_total = 0
+
+            progress = tqdm(
+                contrastive_loader,
+                desc=f"Contrastive {cl_epoch + 1}/{args.contrastive_pretrain_epochs}",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+            for batch in progress:
+                x, y, snr = batch[:3]
+                x = x.to(device)  # (B, K, 2, 128)
+                y = y.to(device)  # (B,)
+                snr = snr.to(device)
+
+                contrastive_optimizer.zero_grad(set_to_none=True)
+
+                snr_in = snr if args.snr_mode == "known" else None
+                if amp_enabled:
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
+                        features = model.forward_features(x, snr=snr_in, snr_mode=args.snr_mode)
+                        loss = info_nce_loss(features, y, temperature=args.contrastive_temp)
+                else:
+                    features = model.forward_features(x, snr=snr_in, snr_mode=args.snr_mode)
+                    loss = info_nce_loss(features, y, temperature=args.contrastive_temp)
+
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(contrastive_optimizer)
+                    if args.grad_clip and args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    scaler.step(contrastive_optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if args.grad_clip and args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    contrastive_optimizer.step()
+
+                contrastive_scheduler.step()
+                epoch_loss += loss.item() * x.shape[0]
+                epoch_total += x.shape[0]
+
+                progress.set_postfix(
+                    loss=f"{epoch_loss / max(1, epoch_total):.4f}",
+                    lr=f"{contrastive_optimizer.param_groups[0]['lr']:.2e}",
+                )
+
+            tqdm.write(f"Contrastive epoch {cl_epoch + 1}: loss={epoch_loss / max(1, epoch_total):.4f}")
+
+        print(f"\n{'='*60}")
+        print("CONTRASTIVE PRE-TRAINING COMPLETE. Starting fine-tuning...")
+        print(f"{'='*60}\n")
+
+        # Reset optimizer for fine-tuning phase
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        steps_per_epoch = max(1, len(train_loader))
+        total_steps = args.epochs * steps_per_epoch
+        decay_start_step = int(getattr(args, "lr_decay_start_epoch", 0)) * steps_per_epoch
+        scheduler = build_scheduler(
+            optimizer, args.warmup_steps, total_steps, args.min_lr, decay_start_step=decay_start_step
+        )
+
     for epoch in range(start_epoch, args.epochs):
         phase1 = epoch < args.phase1_epochs
         lambda_diff = args.phase1_lambda_diff if phase1 else args.lambda_diff
         p_clean = args.phase1_p_clean if phase1 else args.p_clean
+        cls2dn_scale = get_cls2dn_scale(epoch, args)
+        cls_loss_mult = 1.0
+        if bool(getattr(args, "cldnn_denoiser", False)) and bool(getattr(args, "stage_a_no_cls", False)):
+            if epoch < int(getattr(args, "stage_a_epochs", 0)):
+                cls_loss_mult = 0.0
 
         # Curriculum learning: compute minimum SNR for this epoch
         curriculum_snr_min = get_curriculum_snr_min(
@@ -894,30 +1797,57 @@ def train(args: argparse.Namespace) -> None:
                 z0 = None
                 zt = None
 
-            # --- Curriculum learning: mask out samples below curriculum_snr_min ---
-            # curriculum_mask is 1.0 for samples to include, 0.0 for samples to skip
-            if args.curriculum_epochs > 0:
-                curriculum_mask = (snr >= curriculum_snr_min).float()
-            else:
-                curriculum_mask = torch.ones_like(snr)
+            # --- Curriculum learning: per-sample weighting (hard or soft) ---
+            curriculum_mask_base = curriculum_weights(
+                snr,
+                curriculum_snr_min,
+                epoch=epoch,
+                curriculum_epochs=int(args.curriculum_epochs),
+                soft=bool(getattr(args, "curriculum_soft", False)),
+                soft_low_weight=float(getattr(args, "curriculum_soft_low_weight", 0.1)),
+            )
 
-            # --- Mixup augmentation (only for CLDNN, with probability mixup_prob) ---
+            # Keep clean references for auxiliary losses.
+            x_clean = x
+            snr_clean = snr
+            x_cls = x_clean
+            snr_cls = snr_clean
+            curriculum_mask_cls = curriculum_mask_base
+
+            # --- Mixup augmentation (classification path only by default) ---
             use_mixup = False
+            mixup_cls_only = bool(getattr(args, "mixup_cls_only", True))
             y_a, y_b, lam = y, y, 1.0
             if args.arch != "dit" and args.mixup_alpha > 0 and random.random() < args.mixup_prob:
                 use_mixup = True
-                # Flatten x if grouped (K>1) for mixup - mix at sample level
-                if x.ndim == 4:
-                    # For grouped windows, mixup the whole group together
-                    x, y_a, y_b, lam, snr = mixup_data(x, y, snr, alpha=args.mixup_alpha)
-                else:
-                    x, y_a, y_b, lam, snr = mixup_data(x, y, snr, alpha=args.mixup_alpha)
-                # Update curriculum mask for mixed SNR
-                if args.curriculum_epochs > 0:
-                    curriculum_mask = (snr >= curriculum_snr_min).float()
+                x_cls, y_a, y_b, lam, snr_cls = mixup_data(
+                    x_clean,
+                    y,
+                    snr_clean,
+                    alpha=args.mixup_alpha,
+                    snr_min=getattr(args, "mixup_snr_min", None),
+                )
+                curriculum_mask_cls = curriculum_weights(
+                    snr_cls,
+                    curriculum_snr_min,
+                    epoch=epoch,
+                    curriculum_epochs=int(args.curriculum_epochs),
+                    soft=bool(getattr(args, "curriculum_soft", False)),
+                    soft_low_weight=float(getattr(args, "curriculum_soft_low_weight", 0.1)),
+                )
+
+            # Auxiliary losses should run on clean inputs unless legacy mixup-all is requested.
+            x_aux = x_clean if (not use_mixup or mixup_cls_only) else x_cls
+            snr_aux = snr_clean if (not use_mixup or mixup_cls_only) else snr_cls
 
             optimizer.zero_grad(set_to_none=True)
-            snr_in = snr if args.snr_mode == "known" else None
+            snr_in_aux = snr_aux if args.snr_mode == "known" else None
+            snr_in_cls = snr_cls if args.snr_mode == "known" else None
+            snr_in = snr_in_aux
+            extra_cls2dn = {"cls_to_denoiser_scale": cls2dn_scale} if args.arch == "cldnn" else {}
+            logits_for_acc = None
+            logits_teacher_base = None
+            eta_pred_for_noise = None
             if amp_enabled:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
                     if args.arch == "dit":
@@ -930,38 +1860,204 @@ def train(args: argparse.Namespace) -> None:
                             group_mask=mask,
                         )
                         loss_diff = F.mse_loss(x0_pred, z0)
+                        logits_for_acc = logits
+                        logits_teacher_base = logits
                     else:
-                        logits, _x0_pred, snr_pred = model(
-                            x, t, snr=snr_in, snr_mode=args.snr_mode, group_mask=mask
-                        )
+                        if use_mixup and mixup_cls_only:
+                            logits_clean, _x0_pred, snr_pred = model(
+                                x_aux,
+                                t,
+                                snr=snr_in_aux,
+                                snr_mode=args.snr_mode,
+                                group_mask=mask,
+                                **extra_cls2dn,
+                            )
+                            eta_pred_for_noise = getattr(model, "_eta_pred", None)
+                            logits, _x0_pred_mix, _snr_pred_mix = model(
+                                x_cls,
+                                t,
+                                snr=snr_in_cls,
+                                snr_mode=args.snr_mode,
+                                group_mask=mask,
+                                **extra_cls2dn,
+                            )
+                            logits_for_acc = logits_clean
+                            logits_teacher_base = logits_clean
+                        else:
+                            logits, _x0_pred, snr_pred = model(
+                                x_cls,
+                                t,
+                                snr=snr_in_cls,
+                                snr_mode=args.snr_mode,
+                                group_mask=mask,
+                                **extra_cls2dn,
+                            )
+                            eta_pred_for_noise = getattr(model, "_eta_pred", None)
+                            logits_for_acc = logits
+                            logits_teacher_base = logits
                         loss_diff = 0.0
 
                     # Compute classification loss (with optional mixup and curriculum)
+                    focal_gamma = float(getattr(args, 'focal_gamma', 0.0))
                     if use_mixup:
-                        # Mixup: blend losses for both labels
-                        ce_a = F.cross_entropy(logits, y_a, reduction="none", label_smoothing=float(args.label_smoothing))
-                        ce_b = F.cross_entropy(logits, y_b, reduction="none", label_smoothing=float(args.label_smoothing))
+                        ce_a = focal_cross_entropy(logits, y_a, gamma=focal_gamma, label_smoothing=float(args.label_smoothing))
+                        ce_b = focal_cross_entropy(logits, y_b, gamma=focal_gamma, label_smoothing=float(args.label_smoothing))
                         ce = lam * ce_a + (1 - lam) * ce_b
                     else:
-                        ce = F.cross_entropy(logits, y, reduction="none", label_smoothing=float(args.label_smoothing))
+                        ce = focal_cross_entropy(logits, y, gamma=focal_gamma, label_smoothing=float(args.label_smoothing))
 
                     # Apply low-SNR boost weighting
                     if args.low_snr_boost and args.low_snr_boost > 0 and args.snr_floor_db is not None:
                         snr_floor = float(args.snr_floor_db)
                         snr_cap_max = float(args.snr_cap_max_db)
                         denom = max(1e-6, snr_cap_max - snr_floor)
-                        snr_clamped = torch.clamp(snr.float(), min=snr_floor, max=snr_cap_max)
+                        snr_clamped = torch.clamp(snr_cls.float(), min=snr_floor, max=snr_cap_max)
                         frac = (snr_clamped - snr_floor) / denom
                         weights = 1.0 + float(args.low_snr_boost) * (1.0 - frac)
                         ce = ce * weights
 
                     # Apply curriculum mask (zero out samples below SNR threshold)
-                    ce = ce * curriculum_mask
-                    denom_curriculum = torch.clamp(curriculum_mask.sum(), min=1.0)
+                    ce = ce * curriculum_mask_cls
+                    denom_curriculum = torch.clamp(curriculum_mask_cls.sum(), min=1.0)
                     loss_cls = ce.sum() / denom_curriculum
 
-                    loss_snr = F.smooth_l1_loss(snr_pred, snr) if args.lambda_snr > 0 else 0.0
-                    loss = loss_cls + lambda_diff * loss_diff + args.lambda_snr * loss_snr
+                    loss_snr = F.smooth_l1_loss(snr_pred, snr_aux) if args.lambda_snr > 0 else 0.0
+                    loss_noise = 0.0
+                    if float(getattr(args, "lambda_noise", 0.0)) > 0:
+                        eta_pred = eta_pred_for_noise if eta_pred_for_noise is not None else getattr(model, "_eta_pred", None)
+                        if eta_pred is not None:
+                            eta_target = snr_db_to_eta_target(
+                                snr_aux,
+                                rho_min=float(getattr(args, "noise_rho_min", 1e-4)),
+                                rho_max=float(getattr(args, "noise_rho_max", 1.0 - 1e-4)),
+                                eta_min=float(getattr(args, "noise_eta_min", -8.0)),
+                                eta_max=float(getattr(args, "noise_eta_max", 5.5)),
+                            )
+                            loss_noise = F.smooth_l1_loss(eta_pred.float(), eta_target.float())
+                    loss = (
+                        cls_loss_mult * loss_cls
+                        + lambda_diff * loss_diff
+                        + args.lambda_snr * loss_snr
+                        + float(getattr(args, "lambda_noise", 0.0)) * loss_noise
+                    )
+                    if (
+                        bool(getattr(args, "cldnn_denoiser", False))
+                        and args.arch == "cldnn"
+                        and hasattr(model, "denoise_only")
+                    ):
+                        if x_aux.ndim == 4:
+                            g = x_aux.shape[1]
+                            x_dn_ref = x_aux.reshape(-1, x_aux.shape[2], x_aux.shape[3])
+                            snr_dn_ref = snr_aux.repeat_interleave(g)
+                        else:
+                            x_dn_ref = x_aux
+                            snr_dn_ref = snr_aux
+                        x_low_dn, delta_dn = snr_path_degrade(
+                            x_dn_ref,
+                            snr_dn_ref,
+                            delta_min=float(getattr(args, "snr_consist_delta_min", 2.0)),
+                            delta_max=float(getattr(args, "snr_consist_delta_max", 8.0)),
+                            snr_floor=float(snr_min_db),
+                        )
+                        snr_new_dn = snr_dn_ref.float() - delta_dn.float()
+                        snr_for_low = snr_new_dn if args.snr_mode == "known" else None
+                        x_dn_low, _eta_low, _eta_cond_low = model.denoise_only(
+                            x_low_dn, snr=snr_for_low, snr_mode=args.snr_mode
+                        )
+                        loss_dn = torch.mean(torch.abs(x_dn_low.float() - x_dn_ref.float()))
+                        snr_for_hi = snr_dn_ref if args.snr_mode == "known" else None
+                        x_dn_hi, _eta_hi, _eta_cond_hi = model.denoise_only(
+                            x_dn_ref, snr=snr_for_hi, snr_mode=args.snr_mode
+                        )
+                        m_hi = high_snr_soft_mask(snr_dn_ref)
+                        id_vec = torch.mean(torch.abs(x_dn_hi.float() - x_dn_ref.float()), dim=(1, 2))
+                        loss_id = (m_hi * id_vec).sum() / torch.clamp(m_hi.sum(), min=1.0)
+                        loss = (
+                            loss
+                            + float(getattr(args, "lambda_dn", 0.0)) * loss_dn
+                            + float(getattr(args, "lambda_id", 0.0)) * loss_id
+                        )
+
+                    # --- Supervised Contrastive Loss (SupCon) ---
+                    # Skip on mixup batches — labels are ambiguous after interpolation.
+                    if (
+                        getattr(args, "supcon", False)
+                        and args.arch != "dit"
+                        and epoch >= int(getattr(args, "supcon_warmup", 0))
+                        and not use_mixup
+                        and hasattr(model, "proj_head")
+                        and model.proj_head is not None
+                    ):
+                        # Project pre-FiLM pooled features → L2-normalised embedding
+                        z_proj = model.proj_head(model._pooled_pre_film)
+                        z_proj = F.normalize(z_proj, dim=1)
+                        loss_supcon = supervised_contrastive_loss(
+                            z_proj, y,
+                            temperature=float(getattr(args, "supcon_temp", 0.07)),
+                        )
+                        loss = loss + float(getattr(args, "supcon_lambda", 0.1)) * loss_supcon
+
+                    # --- SNR-path consistency loss (core novelty) ---
+                    # Allow consistency when mixup is classification-only; the auxiliary
+                    # path still uses clean (physical) samples in that case.
+                    if (
+                        getattr(args, "snr_consist", False)
+                        and args.arch != "dit"
+                        and epoch >= getattr(args, "snr_consist_warmup", 5)
+                        and (not use_mixup or mixup_cls_only)
+                    ):
+                        # Optionally recompute teacher logits with dropout OFF (eval mode)
+                        logits_teacher = logits_teacher_base if logits_teacher_base is not None else logits
+                        if bool(getattr(args, "snr_consist_teacher_eval", False)):
+                            was_training = model.training
+                            model.eval()
+                            with torch.no_grad():
+                                logits_teacher, _, _ = model(
+                                    x_aux,
+                                    t,
+                                    snr=snr_in_aux,
+                                    snr_mode=args.snr_mode,
+                                    group_mask=mask,
+                                    **extra_cls2dn,
+                                )
+                            if was_training:
+                                model.train()
+
+                        x_low, _delta = snr_path_degrade(
+                            x_aux, snr_aux,
+                            delta_min=float(getattr(args, "snr_consist_delta_min", 2.0)),
+                            delta_max=float(getattr(args, "snr_consist_delta_max", 8.0)),
+                            snr_floor=float(snr_min_db),
+                        )
+                        snr_new = snr_aux.float() - _delta.float()
+                        logits_low, _, _ = model(
+                            x_low,
+                            t,
+                            snr=snr_in_aux,
+                            snr_mode=args.snr_mode,
+                            group_mask=mask,
+                            **extra_cls2dn,
+                        )
+                        loss_consist = snr_consistency_loss(
+                            logits_teacher, logits_low,
+                            temperature=float(getattr(args, "snr_consist_temp", 2.0)),
+                            snr_db=snr_aux,
+                            snr_lo=float(getattr(args, "snr_consist_snr_lo", -999.0)),
+                            snr_hi=float(getattr(args, "snr_consist_snr_hi", 999.0)),
+                            conf_thresh=float(getattr(args, "snr_consist_conf_thresh", 0.0)),
+                            snr_new_db=snr_new,
+                            snr_new_lo=float(getattr(args, "snr_consist_snr_new_lo", -999.0)),
+                            snr_new_hi=float(getattr(args, "snr_consist_snr_new_hi", 999.0)),
+                        )
+                        consist_lambda = float(getattr(args, "snr_consist_lambda", 1.0))
+                        ramp_epochs = int(getattr(args, "snr_consist_ramp", 0))
+                        warmup_ep = int(getattr(args, "snr_consist_warmup", 5))
+                        if ramp_epochs and ramp_epochs > 0:
+                            ramp = (epoch - warmup_ep + 1) / float(max(1, ramp_epochs))
+                            ramp = max(0.0, min(1.0, ramp))
+                        else:
+                            ramp = 1.0
+                        loss = loss + consist_lambda * ramp * loss_consist
             else:
                 if args.arch == "dit":
                     logits, x0_pred, snr_pred = model.forward_tokens(  # type: ignore[attr-defined]
@@ -973,38 +2069,203 @@ def train(args: argparse.Namespace) -> None:
                         group_mask=mask,
                     )
                     loss_diff = F.mse_loss(x0_pred, z0)
+                    logits_for_acc = logits
+                    logits_teacher_base = logits
                 else:
-                    logits, _x0_pred, snr_pred = model(
-                        x, t, snr=snr_in, snr_mode=args.snr_mode, group_mask=mask
-                    )
+                    if use_mixup and mixup_cls_only:
+                        logits_clean, _x0_pred, snr_pred = model(
+                            x_aux,
+                            t,
+                            snr=snr_in_aux,
+                            snr_mode=args.snr_mode,
+                            group_mask=mask,
+                            **extra_cls2dn,
+                        )
+                        eta_pred_for_noise = getattr(model, "_eta_pred", None)
+                        logits, _x0_pred_mix, _snr_pred_mix = model(
+                            x_cls,
+                            t,
+                            snr=snr_in_cls,
+                            snr_mode=args.snr_mode,
+                            group_mask=mask,
+                            **extra_cls2dn,
+                        )
+                        logits_for_acc = logits_clean
+                        logits_teacher_base = logits_clean
+                    else:
+                        logits, _x0_pred, snr_pred = model(
+                            x_cls,
+                            t,
+                            snr=snr_in_cls,
+                            snr_mode=args.snr_mode,
+                            group_mask=mask,
+                            **extra_cls2dn,
+                        )
+                        eta_pred_for_noise = getattr(model, "_eta_pred", None)
+                        logits_for_acc = logits
+                        logits_teacher_base = logits
                     loss_diff = 0.0
 
                 # Compute classification loss (with optional mixup and curriculum)
+                focal_gamma = float(getattr(args, 'focal_gamma', 0.0))
                 if use_mixup:
-                    # Mixup: blend losses for both labels
-                    ce_a = F.cross_entropy(logits, y_a, reduction="none", label_smoothing=float(args.label_smoothing))
-                    ce_b = F.cross_entropy(logits, y_b, reduction="none", label_smoothing=float(args.label_smoothing))
+                    ce_a = focal_cross_entropy(logits, y_a, gamma=focal_gamma, label_smoothing=float(args.label_smoothing))
+                    ce_b = focal_cross_entropy(logits, y_b, gamma=focal_gamma, label_smoothing=float(args.label_smoothing))
                     ce = lam * ce_a + (1 - lam) * ce_b
                 else:
-                    ce = F.cross_entropy(logits, y, reduction="none", label_smoothing=float(args.label_smoothing))
+                    ce = focal_cross_entropy(logits, y, gamma=focal_gamma, label_smoothing=float(args.label_smoothing))
 
                 # Apply low-SNR boost weighting
                 if args.low_snr_boost and args.low_snr_boost > 0 and args.snr_floor_db is not None:
                     snr_floor = float(args.snr_floor_db)
                     snr_cap_max = float(args.snr_cap_max_db)
                     denom = max(1e-6, snr_cap_max - snr_floor)
-                    snr_clamped = torch.clamp(snr.float(), min=snr_floor, max=snr_cap_max)
+                    snr_clamped = torch.clamp(snr_cls.float(), min=snr_floor, max=snr_cap_max)
                     frac = (snr_clamped - snr_floor) / denom
                     weights = 1.0 + float(args.low_snr_boost) * (1.0 - frac)
                     ce = ce * weights
 
                 # Apply curriculum mask (zero out samples below SNR threshold)
-                ce = ce * curriculum_mask
-                denom_curriculum = torch.clamp(curriculum_mask.sum(), min=1.0)
+                ce = ce * curriculum_mask_cls
+                denom_curriculum = torch.clamp(curriculum_mask_cls.sum(), min=1.0)
                 loss_cls = ce.sum() / denom_curriculum
 
-                loss_snr = F.smooth_l1_loss(snr_pred, snr) if args.lambda_snr > 0 else 0.0
-                loss = loss_cls + lambda_diff * loss_diff + args.lambda_snr * loss_snr
+                loss_snr = F.smooth_l1_loss(snr_pred, snr_aux) if args.lambda_snr > 0 else 0.0
+                loss_noise = 0.0
+                if float(getattr(args, "lambda_noise", 0.0)) > 0:
+                    eta_pred = eta_pred_for_noise if eta_pred_for_noise is not None else getattr(model, "_eta_pred", None)
+                    if eta_pred is not None:
+                        eta_target = snr_db_to_eta_target(
+                            snr_aux,
+                            rho_min=float(getattr(args, "noise_rho_min", 1e-4)),
+                            rho_max=float(getattr(args, "noise_rho_max", 1.0 - 1e-4)),
+                            eta_min=float(getattr(args, "noise_eta_min", -8.0)),
+                            eta_max=float(getattr(args, "noise_eta_max", 5.5)),
+                        )
+                        loss_noise = F.smooth_l1_loss(eta_pred.float(), eta_target.float())
+                loss = (
+                    cls_loss_mult * loss_cls
+                    + lambda_diff * loss_diff
+                    + args.lambda_snr * loss_snr
+                    + float(getattr(args, "lambda_noise", 0.0)) * loss_noise
+                )
+                if (
+                    bool(getattr(args, "cldnn_denoiser", False))
+                    and args.arch == "cldnn"
+                    and hasattr(model, "denoise_only")
+                ):
+                    if x_aux.ndim == 4:
+                        g = x_aux.shape[1]
+                        x_dn_ref = x_aux.reshape(-1, x_aux.shape[2], x_aux.shape[3])
+                        snr_dn_ref = snr_aux.repeat_interleave(g)
+                    else:
+                        x_dn_ref = x_aux
+                        snr_dn_ref = snr_aux
+                    x_low_dn, delta_dn = snr_path_degrade(
+                        x_dn_ref,
+                        snr_dn_ref,
+                        delta_min=float(getattr(args, "snr_consist_delta_min", 2.0)),
+                        delta_max=float(getattr(args, "snr_consist_delta_max", 8.0)),
+                        snr_floor=float(snr_min_db),
+                    )
+                    snr_new_dn = snr_dn_ref.float() - delta_dn.float()
+                    snr_for_low = snr_new_dn if args.snr_mode == "known" else None
+                    x_dn_low, _eta_low, _eta_cond_low = model.denoise_only(
+                        x_low_dn, snr=snr_for_low, snr_mode=args.snr_mode
+                    )
+                    loss_dn = torch.mean(torch.abs(x_dn_low.float() - x_dn_ref.float()))
+                    snr_for_hi = snr_dn_ref if args.snr_mode == "known" else None
+                    x_dn_hi, _eta_hi, _eta_cond_hi = model.denoise_only(
+                        x_dn_ref, snr=snr_for_hi, snr_mode=args.snr_mode
+                    )
+                    m_hi = high_snr_soft_mask(snr_dn_ref)
+                    id_vec = torch.mean(torch.abs(x_dn_hi.float() - x_dn_ref.float()), dim=(1, 2))
+                    loss_id = (m_hi * id_vec).sum() / torch.clamp(m_hi.sum(), min=1.0)
+                    loss = (
+                        loss
+                        + float(getattr(args, "lambda_dn", 0.0)) * loss_dn
+                        + float(getattr(args, "lambda_id", 0.0)) * loss_id
+                    )
+
+                # --- Supervised Contrastive Loss (SupCon) ---
+                # Skip on mixup batches — labels are ambiguous after interpolation.
+                if (
+                    getattr(args, "supcon", False)
+                    and args.arch != "dit"
+                    and epoch >= int(getattr(args, "supcon_warmup", 0))
+                    and not use_mixup
+                    and hasattr(model, "proj_head")
+                    and model.proj_head is not None
+                ):
+                    z_proj = model.proj_head(model._pooled_pre_film)
+                    z_proj = F.normalize(z_proj, dim=1)
+                    loss_supcon = supervised_contrastive_loss(
+                        z_proj, y,
+                        temperature=float(getattr(args, "supcon_temp", 0.07)),
+                    )
+                    loss = loss + float(getattr(args, "supcon_lambda", 0.1)) * loss_supcon
+
+                # --- SNR-path consistency loss (core novelty) ---
+                # Allow consistency when mixup is classification-only; the auxiliary
+                # path still uses clean (physical) samples in that case.
+                if (
+                    getattr(args, "snr_consist", False)
+                    and args.arch != "dit"
+                    and epoch >= getattr(args, "snr_consist_warmup", 5)
+                    and (not use_mixup or mixup_cls_only)
+                ):
+                    # Optionally recompute teacher logits with dropout OFF (eval mode)
+                    logits_teacher = logits_teacher_base if logits_teacher_base is not None else logits
+                    if bool(getattr(args, "snr_consist_teacher_eval", False)):
+                        was_training = model.training
+                        model.eval()
+                        with torch.no_grad():
+                            logits_teacher, _, _ = model(
+                                x_aux,
+                                t,
+                                snr=snr_in_aux,
+                                snr_mode=args.snr_mode,
+                                group_mask=mask,
+                                **extra_cls2dn,
+                            )
+                        if was_training:
+                            model.train()
+
+                    x_low, _delta = snr_path_degrade(
+                        x_aux, snr_aux,
+                        delta_min=float(getattr(args, "snr_consist_delta_min", 2.0)),
+                        delta_max=float(getattr(args, "snr_consist_delta_max", 8.0)),
+                        snr_floor=float(snr_min_db),
+                    )
+                    snr_new = snr_aux.float() - _delta.float()
+                    logits_low, _, _ = model(
+                        x_low,
+                        t,
+                        snr=snr_in_aux,
+                        snr_mode=args.snr_mode,
+                        group_mask=mask,
+                        **extra_cls2dn,
+                    )
+                    loss_consist = snr_consistency_loss(
+                        logits_teacher, logits_low,
+                        temperature=float(getattr(args, "snr_consist_temp", 2.0)),
+                        snr_db=snr_aux,
+                        snr_lo=float(getattr(args, "snr_consist_snr_lo", -999.0)),
+                        snr_hi=float(getattr(args, "snr_consist_snr_hi", 999.0)),
+                        conf_thresh=float(getattr(args, "snr_consist_conf_thresh", 0.0)),
+                        snr_new_db=snr_new,
+                        snr_new_lo=float(getattr(args, "snr_consist_snr_new_lo", -999.0)),
+                        snr_new_hi=float(getattr(args, "snr_consist_snr_new_hi", 999.0)),
+                    )
+                    consist_lambda = float(getattr(args, "snr_consist_lambda", 1.0))
+                    ramp_epochs = int(getattr(args, "snr_consist_ramp", 0))
+                    warmup_ep = int(getattr(args, "snr_consist_warmup", 5))
+                    if ramp_epochs and ramp_epochs > 0:
+                        ramp = (epoch - warmup_ep + 1) / float(max(1, ramp_epochs))
+                        ramp = max(0.0, min(1.0, ramp))
+                    else:
+                        ramp = 1.0
+                    loss = loss + consist_lambda * ramp * loss_consist
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -1024,9 +2285,11 @@ def train(args: argparse.Namespace) -> None:
             if ema is not None and global_step >= args.ema_start and (global_step % max(1, args.ema_every) == 0):
                 ema.update(model)
 
-            epoch_loss += loss.item() * x.shape[0]
-            epoch_correct += (logits.argmax(dim=1) == y).sum().item()
-            epoch_total += x.shape[0]
+            logits_for_acc_batch = logits_for_acc if logits_for_acc is not None else logits
+            batch_size = x_clean.shape[0]
+            epoch_loss += loss.item() * batch_size
+            epoch_correct += (logits_for_acc_batch.argmax(dim=1) == y).sum().item()
+            epoch_total += batch_size
             if epoch_total > 0:
                 progress.set_postfix(
                     train_loss=f"{epoch_loss / epoch_total:.4f}",
@@ -1048,6 +2311,12 @@ def train(args: argparse.Namespace) -> None:
                 max_batches=args.train_eval_batches,
             )
 
+        eval_bypass = bool(getattr(args, "cldnn_denoiser_bypass_eval", False))
+        prev_eval_bypass = None
+        if hasattr(model, "force_denoiser_bypass"):
+            prev_eval_bypass = bool(getattr(model, "force_denoiser_bypass", False))
+            model.force_denoiser_bypass = eval_bypass  # type: ignore[attr-defined]
+
         if ema is not None:
             ema.store(model)
             ema.copy_to(model)
@@ -1060,6 +2329,44 @@ def train(args: argparse.Namespace) -> None:
                 model, val_loader, device, args.t_eval, args.snr_mode, amp=args.amp
             )
 
+        noise_calib: Dict[str, object] = {}
+        if args.arch == "cldnn" and (
+            bool(getattr(args, "cldnn_noise_cond", False))
+            or bool(getattr(args, "cldnn_denoiser", False))
+        ):
+            if ema is not None:
+                ema.store(model)
+                ema.copy_to(model)
+                noise_calib = evaluate_eta_calibration(
+                    model,
+                    val_loader,
+                    device,
+                    args.t_eval,
+                    args.snr_mode,
+                    amp=args.amp,
+                    rho_min=float(getattr(args, "noise_rho_min", 1e-4)),
+                    rho_max=float(getattr(args, "noise_rho_max", 1.0 - 1e-4)),
+                    eta_min=float(getattr(args, "noise_eta_min", -8.0)),
+                    eta_max=float(getattr(args, "noise_eta_max", 5.5)),
+                )
+                ema.restore(model)
+            else:
+                noise_calib = evaluate_eta_calibration(
+                    model,
+                    val_loader,
+                    device,
+                    args.t_eval,
+                    args.snr_mode,
+                    amp=args.amp,
+                    rho_min=float(getattr(args, "noise_rho_min", 1e-4)),
+                    rho_max=float(getattr(args, "noise_rho_max", 1.0 - 1e-4)),
+                    eta_min=float(getattr(args, "noise_eta_min", -8.0)),
+                    eta_max=float(getattr(args, "noise_eta_max", 5.5)),
+                )
+
+        if prev_eval_bypass is not None:
+            model.force_denoiser_bypass = prev_eval_bypass  # type: ignore[attr-defined]
+
         record = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -1069,12 +2376,28 @@ def train(args: argparse.Namespace) -> None:
             "lr": optimizer.param_groups[0]["lr"],
             "time_sec": time.time() - start_time,
             "lambda_diff": lambda_diff,
+            "lambda_noise": float(getattr(args, "lambda_noise", 0.0)),
+            "lambda_dn": float(getattr(args, "lambda_dn", 0.0)),
+            "lambda_id": float(getattr(args, "lambda_id", 0.0)),
+            "cls2dn_scale": float(cls2dn_scale),
             "p_clean": p_clean,
             "t_schedule": args.t_schedule,
             "snr_floor_db": args.snr_floor_db,
             "snr_cap_max_db": args.snr_cap_max_db,
             "low_snr_boost": args.low_snr_boost,
+            "lr_decay_start_epoch": getattr(args, "lr_decay_start_epoch", 0),
+            "curriculum_soft": bool(getattr(args, "curriculum_soft", False)),
+            "curriculum_soft_low_weight": float(getattr(args, "curriculum_soft_low_weight", 0.1)),
+            "mixup_snr_min": getattr(args, "mixup_snr_min", None),
+            "mixup_cls_only": bool(getattr(args, "mixup_cls_only", True)),
+            "cldnn_noise_cond": bool(getattr(args, "cldnn_noise_cond", False)),
+            "cldnn_denoiser": bool(getattr(args, "cldnn_denoiser", False)),
         }
+        if proxy_fit_info:
+            record.update(proxy_fit_info)
+        if noise_calib:
+            record["eta_pearson"] = float(noise_calib.get("eta_pearson", 0.0))
+            record["eta_spearman"] = float(noise_calib.get("eta_spearman", 0.0))
         write_jsonl(metrics_path, record)
 
         improved = val_acc > (best_val + float(args.early_stop_min_delta))
@@ -1109,6 +2432,9 @@ def train(args: argparse.Namespace) -> None:
         if val_acc_by_snr:
             with open(os.path.join(args.out_dir, "val_acc_by_snr.json"), "w", encoding="utf-8") as f:
                 json.dump(val_acc_by_snr, f, indent=2)
+        if noise_calib and noise_calib.get("eta_by_snr"):
+            with open(os.path.join(args.out_dir, "eta_calibration_by_snr.json"), "w", encoding="utf-8") as f:
+                json.dump(noise_calib["eta_by_snr"], f, indent=2)
 
         tqdm.write(
             f"Epoch {epoch + 1}/{args.epochs} summary | "
@@ -1131,6 +2457,8 @@ def train(args: argparse.Namespace) -> None:
         ckpt = load_checkpoint(best_path, model, ema=ema)
         if ema is not None and ckpt.get("ema") is not None:
             ema.copy_to(model)
+    if hasattr(model, "force_denoiser_bypass"):
+        model.force_denoiser_bypass = bool(getattr(args, "cldnn_denoiser_bypass_eval", False))  # type: ignore[attr-defined]
     test_acc, _, test_acc_by_snr = evaluate(
         model, test_loader, device, args.t_eval, args.snr_mode, amp=args.amp
     )
@@ -1165,12 +2493,21 @@ def train(args: argparse.Namespace) -> None:
 
 def run_eval(args: argparse.Namespace) -> None:
     apply_preset(args)
+    if bool(getattr(args, "cldnn_snr_cond", False)) and bool(getattr(args, "cldnn_noise_cond", False)):
+        raise ValueError("Use only one conditioning path: --cldnn-snr-cond OR --cldnn-noise-cond.")
+    if args.arch != "cldnn" and (
+        bool(getattr(args, "cldnn_noise_cond", False)) or bool(getattr(args, "cldnn_denoiser", False))
+    ):
+        raise ValueError("Noise/denoiser options are currently supported only for --arch cldnn.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    _, _, test_loader, mods, _ = build_loaders(args, device)
+    _, _, test_loader, mods, snrs, seq_len = build_loaders(args, device)
+    snr_min_db = float(min(snrs)) if snrs else -20.0
+    snr_max_db = float(max(snrs)) if snrs else 18.0
 
     if args.arch == "dit":
         model = DiffusionAMC(
             num_classes=len(mods),
+            seq_len=seq_len,
             patch_size=args.patch_size,
             dim=args.dim,
             depth=args.depth,
@@ -1182,9 +2519,10 @@ def run_eval(args: argparse.Namespace) -> None:
             stem_layers=args.stem_layers,
             group_pool=args.group_pool,
         ).to(device)
-    else:
-        model = CLDNNAMC(
+    elif args.arch == "multiview":
+        model = MultiViewCLDNNAMC(
             num_classes=len(mods),
+            seq_len=seq_len,
             conv_channels=int(args.cldnn_conv_ch),
             merge_channels=int(args.cldnn_merge_ch),
             lstm_hidden=int(args.cldnn_lstm_hidden),
@@ -1193,6 +2531,44 @@ def run_eval(args: argparse.Namespace) -> None:
             dropout=float(args.dropout),
             pool=str(args.cldnn_pool),
             snr_cond=bool(args.cldnn_snr_cond),
+            snr_loss_detach_backbone=bool(getattr(args, "snr_loss_detach_backbone", False)),
+            snr_min_db=snr_min_db,
+            snr_max_db=snr_max_db,
+            cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
+            stft_nfft=int(getattr(args, 'stft_nfft', 64)),
+            stft_hop=int(getattr(args, 'stft_hop', 8)),
+            stft_channels=int(getattr(args, 'stft_channels', 64)),
+            cross_view_heads=int(getattr(args, 'cross_view_heads', 4)),
+            snr_gate=bool(getattr(args, 'snr_gate', False)),
+        ).to(device)
+    else:
+        model = CLDNNAMC(
+            num_classes=len(mods),
+            seq_len=seq_len,
+            conv_channels=int(args.cldnn_conv_ch),
+            merge_channels=int(args.cldnn_merge_ch),
+            lstm_hidden=int(args.cldnn_lstm_hidden),
+            lstm_layers=int(args.cldnn_lstm_layers),
+            bidirectional=bool(args.cldnn_bidir),
+            dropout=float(args.dropout),
+            pool=str(args.cldnn_pool),
+            snr_cond=bool(args.cldnn_snr_cond),
+            noise_cond=bool(getattr(args, "cldnn_noise_cond", False)),
+            snr_loss_detach_backbone=bool(getattr(args, "snr_loss_detach_backbone", False)),
+            snr_min_db=snr_min_db,
+            snr_max_db=snr_max_db,
+            noise_eta_min=float(getattr(args, "noise_eta_min", -8.0)),
+            noise_eta_max=float(getattr(args, "noise_eta_max", 5.5)),
+            denoiser=bool(getattr(args, "cldnn_denoiser", False)),
+            denoiser_dual_path=bool(getattr(args, "cldnn_denoiser_dual_path", False)),
+            denoiser_base_channels=int(getattr(args, "cldnn_denoiser_base_ch", 32)),
+            denoiser_dropout=float(getattr(args, "cldnn_denoiser_dropout", 0.0)),
+            denoiser_soft_high_snr_blend=bool(getattr(args, "cldnn_denoiser_soft_hi_blend", False)),
+            noise_head_hidden=int(getattr(args, "noise_head_hidden", 32)),
+            expert_features=bool(getattr(args, 'cldnn_expert_features', False)),
+            expert_channels=int(getattr(args, 'cldnn_expert_ch', 64)),
+            cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
+            supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
 
     if args.ckpt is None:
@@ -1201,6 +2577,8 @@ def run_eval(args: argparse.Namespace) -> None:
     ckpt = load_checkpoint(args.ckpt, model, ema=ema)
     if ema is not None and ckpt.get("ema") is not None:
         ema.copy_to(model)
+    if hasattr(model, "force_denoiser_bypass"):
+        model.force_denoiser_bypass = bool(getattr(args, "cldnn_denoiser_bypass_eval", False))  # type: ignore[attr-defined]
 
     test_acc, _, test_acc_by_snr = evaluate(
         model, test_loader, device, args.t_eval, args.snr_mode, amp=args.amp
@@ -1209,8 +2587,24 @@ def run_eval(args: argparse.Namespace) -> None:
     print("Test acc by SNR:", test_acc_by_snr)
 
 
+def _resolve_dataset_defaults(args: argparse.Namespace) -> None:
+    """Fill in None-valued args with dataset-aware defaults."""
+    is_2018 = str(getattr(args, "dataset", "rml2016a")) == "rml2018a"
+
+    # Per-bucket split sizes: RML2016.10a has ~1000/bucket, RML2018.01A has 4096/bucket.
+    if args.train_per is None:
+        args.train_per = 3200 if is_2018 else 600
+    if args.val_per is None:
+        args.val_per = 500 if is_2018 else 200
+
+    # SNR cap: default to dataset max (18 for RML2016.10a, 30 for RML2018.01A).
+    if args.snr_cap_max_db is None:
+        args.snr_cap_max_db = 30.0 if is_2018 else 18.0
+
+
 def main() -> None:
     args = parse_args()
+    _resolve_dataset_defaults(args)
     if args.lr is None:
         args.lr = PRESETS[args.preset]["lr"]
     if args.eval_only:

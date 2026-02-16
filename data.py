@@ -76,6 +76,166 @@ def load_rml2016a(
     return X, y, snr, mods, snrs, train_idx, val_idx, test_idx
 
 
+# Canonical class names for RadioML 2018.01A (24 mods).
+# Many public mirrors provide a mis-ordered `classes.txt`; use this list for stable labeling.
+RML2018A_CLASSES_FIXED: List[str] = [
+    "OOK",
+    "4ASK",
+    "8ASK",
+    "BPSK",
+    "QPSK",
+    "8PSK",
+    "16PSK",
+    "32PSK",
+    "16APSK",
+    "32APSK",
+    "64APSK",
+    "128APSK",
+    "16QAM",
+    "32QAM",
+    "64QAM",
+    "128QAM",
+    "256QAM",
+    "AM-SSB-WC",
+    "AM-SSB-SC",
+    "AM-DSB-WC",
+    "AM-DSB-SC",
+    "FM",
+    "GMSK",
+    "OQPSK",
+]
+
+
+def load_rml2018a_hdf5(
+    path: str,
+    seed: int = 2016,
+    train_per: int = 600,
+    val_per: int = 200,
+    class_names: Optional[List[str]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str], List[int], List[int], List[int], List[int]]:
+    """
+    Load RadioML 2018.01A (DeepSig) from an HDF5 file with datasets:
+      - X: (N, 1024, 2) float32
+      - Y: (N, 24) one-hot {0,1}
+      - Z: (N, 1) int (SNR in dB)
+
+    Returns X in the same layout as RML2016.10a loader: (N, 2, 1024).
+    """
+    try:
+        import h5py  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise ImportError("h5py is required to load RML2018.01A HDF5 files") from e
+
+    with h5py.File(path, "r") as f:
+        if "X" not in f or "Y" not in f or "Z" not in f:
+            raise ValueError(f"Expected datasets X/Y/Z in HDF5 file: {path}")
+        X = f["X"][:]
+        Y = f["Y"][:]
+        Z = f["Z"][:]
+
+    if X.ndim != 3 or X.shape[-1] != 2:
+        raise ValueError(f"Expected X with shape (N, 1024, 2); got {X.shape}")
+    if Y.ndim != 2:
+        raise ValueError(f"Expected Y with shape (N, C); got {Y.shape}")
+    if Z.ndim == 2 and Z.shape[1] == 1:
+        Z = Z[:, 0]
+    if Z.ndim != 1:
+        raise ValueError(f"Expected Z with shape (N,) or (N,1); got {Z.shape}")
+
+    n = int(X.shape[0])
+    if Y.shape[0] != n or Z.shape[0] != n:
+        raise ValueError(f"Mismatched N across X/Y/Z: X={X.shape}, Y={Y.shape}, Z={Z.shape}")
+
+    # Convert to our common layout (N,2,1024) and labels (N,)
+    X = np.transpose(X, (0, 2, 1)).astype(np.float32, copy=False)
+    y = np.argmax(Y, axis=1).astype(np.int64, copy=False)
+    snr = Z.astype(np.float32, copy=False)
+
+    mods = list(class_names) if class_names is not None else list(RML2018A_CLASSES_FIXED)
+    snr_int = np.asarray(Z, dtype=np.int32)
+    snrs = sorted(np.unique(snr_int).tolist())
+    n_mods = int(Y.shape[1])
+    if len(mods) != n_mods:
+        # If the caller provided a different naming list, keep training working but warn via exception.
+        raise ValueError(f"class_names length {len(mods)} != number of classes in Y ({n_mods})")
+
+    # Balanced per-(mod,SNR) split, matching the RML2016.10a loader behavior.
+    rng = np.random.RandomState(seed)
+    train_idx: List[int] = []
+    val_idx: List[int] = []
+
+    unique_snrs = np.asarray(snrs, dtype=np.int32)
+    n_snrs = int(unique_snrs.shape[0])
+    if n_snrs <= 0:
+        raise ValueError("No SNR levels found in Z")
+
+    # Fast-path: RML2018.01A public releases are typically stored as contiguous blocks:
+    #   for class in 0..C-1:
+    #     for snr in sorted(SNRs):
+    #       4096 examples
+    bucket_n = n // max(1, (n_mods * n_snrs))
+    ordered = (bucket_n * n_mods * n_snrs) == n and bucket_n > 0
+    if ordered:
+        # Validate a few sentinels to avoid silently relying on wrong assumptions.
+        probe = [
+            (0, 0),
+            (0, n_snrs - 1),
+            (n_mods - 1, 0),
+            (n_mods - 1, n_snrs - 1),
+        ]
+        for c, s_i in probe:
+            start = (c * n_snrs + s_i) * bucket_n
+            if int(y[start]) != int(c) or int(snr_int[start]) != int(unique_snrs[s_i]):
+                ordered = False
+                break
+
+    if ordered:
+        for c in range(n_mods):
+            for s_i in range(n_snrs):
+                start = (c * n_snrs + s_i) * bucket_n
+                seg = np.arange(start, start + bucket_n, dtype=np.int64)
+                if int(train_per) + int(val_per) > int(seg.shape[0]):
+                    raise ValueError(
+                        f"train_per+val_per exceeds samples for (class={c}, snr={int(unique_snrs[s_i])}). "
+                        f"Have {int(seg.shape[0])}, need {int(train_per)+int(val_per)}."
+                    )
+                train_sel = rng.choice(seg, size=int(train_per), replace=False)
+                remain = np.setdiff1d(seg, train_sel)
+                val_sel = rng.choice(remain, size=int(val_per), replace=False)
+                train_idx.extend(train_sel.tolist())
+                val_idx.extend(val_sel.tolist())
+    else:
+        # General-path: group indices by (class, snr) without assuming storage order.
+        snr_ord = np.searchsorted(unique_snrs, snr_int)
+        bucket_id = y.astype(np.int64) * int(n_snrs) + snr_ord.astype(np.int64)
+        order = np.argsort(bucket_id, kind="stable")
+        buckets_sorted = bucket_id[order]
+        boundaries = np.flatnonzero(np.diff(buckets_sorted)) + 1
+        boundaries = np.concatenate(([0], boundaries, [order.shape[0]]))
+        for bi in range(boundaries.shape[0] - 1):
+            seg = order[boundaries[bi] : boundaries[bi + 1]]
+            if int(train_per) + int(val_per) > int(seg.shape[0]):
+                raise ValueError(
+                    f"train_per+val_per exceeds samples for a (class,snr) bucket. "
+                    f"Have {int(seg.shape[0])}, need {int(train_per)+int(val_per)}."
+                )
+            train_sel = rng.choice(seg, size=int(train_per), replace=False)
+            remain = np.setdiff1d(seg, train_sel)
+            val_sel = rng.choice(remain, size=int(val_per), replace=False)
+            train_idx.extend(train_sel.tolist())
+            val_idx.extend(val_sel.tolist())
+
+    all_idx = np.arange(n, dtype=np.int64)
+    used = np.union1d(np.asarray(train_idx, dtype=np.int64), np.asarray(val_idx, dtype=np.int64))
+    test_idx = np.setdiff1d(all_idx, used).tolist()
+
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    rng.shuffle(test_idx)
+
+    return X, y, snr, mods, snrs, train_idx, val_idx, test_idx
+
+
 def parse_snrs(value: Optional[str]) -> Optional[List[float]]:
     if value is None or value.strip() == "":
         return None
@@ -178,7 +338,7 @@ class RML2016aDataset(Dataset):
 class RML2016aGroupedDataset(Dataset):
     """
     Returns K random windows from the same (class, SNR) bucket within the provided indices.
-    Output x has shape (K, 2, 128).
+    Output x has shape (K, 2, L).
     """
 
     def __init__(
@@ -278,7 +438,7 @@ class RML2016aGroupedDataset(Dataset):
             if self.aug_phase or self.aug_shift or (self.aug_gain and self.aug_gain > 0) or (self.aug_cfo and self.aug_cfo > 0):
                 x = self._augment(x)
             xs.append(x)
-        xg = torch.stack(xs, dim=0)  # (K,2,128)
+        xg = torch.stack(xs, dim=0)  # (K,2,L)
         return xg, self.y[anchor], self.snr[anchor]
 
 
@@ -290,7 +450,7 @@ class RML2016aVariableGroupedDataset(Dataset):
     dynamic-K evaluation (progressively unmask more windows).
 
     Output:
-      xg: (K_max, 2, 128)
+      xg: (K_max, 2, L)
       y: ()
       snr: ()
       mask: (K_max,) float32 in {0,1}
@@ -413,7 +573,7 @@ class RML2016aVariableGroupedDataset(Dataset):
         else:
             mask = torch.ones(self.k_max, dtype=torch.float32)
 
-        xg = torch.stack(xs, dim=0)  # (K_max,2,128)
+        xg = torch.stack(xs, dim=0)  # (K_max,2,L)
         return xg, self.y[anchor], self.snr[anchor], mask
 
 
