@@ -579,7 +579,13 @@ class ExpertFeatureExtractor(nn.Module):
 
     EXPERT_INPUT_CHANNELS = 9  # 2*3 (conj products) + 1 (mag) + 2 (phase diff sin/cos)
 
-    def __init__(self, out_channels: int = 64, time_out: int = 124, dropout: float = 0.3) -> None:
+    def __init__(
+        self,
+        out_channels: int = 64,
+        time_out: int = 124,
+        dropout: float = 0.3,
+        stacf_window: int = 0,
+    ) -> None:
         super().__init__()
         n_in = self.EXPERT_INPUT_CHANNELS
         self.conv1 = nn.Conv1d(n_in, out_channels, kernel_size=7, padding=3)
@@ -591,6 +597,28 @@ class ExpertFeatureExtractor(nn.Module):
         self.bn3 = nn.BatchNorm1d(out_channels)
         self.act = nn.ReLU()
         self.drop = nn.Dropout(dropout)
+        self.stacf_window = max(0, int(stacf_window))
+        # Use odd window for centered smoothing without temporal bias.
+        if self.stacf_window > 1 and (self.stacf_window % 2 == 0):
+            self.stacf_window += 1
+
+    def _smooth_1d(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Deterministic short-time expectation approximation for low-SNR robustness.
+
+        Args:
+            x: (B, L) real-valued sequence.
+        Returns:
+            (B, L) smoothed sequence (or identity when stacf_window <= 1).
+        """
+        if self.stacf_window <= 1:
+            return x
+        w = int(self.stacf_window)
+        pad = w // 2
+        y = F.avg_pool1d(x.unsqueeze(1), kernel_size=w, stride=1, padding=pad)
+        if y.shape[-1] > x.shape[-1]:
+            y = y[..., : x.shape[-1]]
+        return y.squeeze(1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -625,11 +653,23 @@ class ExpertFeatureExtractor(nn.Module):
         pd_sin = torch.sin(phase_diff)  # (B, L)
         pd_cos = torch.cos(phase_diff)  # (B, L)
 
+        # Optional short-time ACF smoothing before CNN:
+        # smooth real/imag separately (avg_pool1d expects real tensors).
+        conj_1_real = self._smooth_1d(conj_1.real)
+        conj_1_imag = self._smooth_1d(conj_1.imag)
+        conj_2_real = self._smooth_1d(conj_2.real)
+        conj_2_imag = self._smooth_1d(conj_2.imag)
+        conj_3_real = self._smooth_1d(conj_3.real)
+        conj_3_imag = self._smooth_1d(conj_3.imag)
+        mag = self._smooth_1d(mag)
+        pd_sin = self._smooth_1d(pd_sin)
+        pd_cos = self._smooth_1d(pd_cos)
+
         # Stack all features: (B, 9, L)
         feats = torch.stack([
-            conj_1.real, conj_1.imag,
-            conj_2.real, conj_2.imag,
-            conj_3.real, conj_3.imag,
+            conj_1_real, conj_1_imag,
+            conj_2_real, conj_2_imag,
+            conj_3_real, conj_3_imag,
             mag,
             pd_sin, pd_cos,
         ], dim=1)
@@ -756,6 +796,14 @@ class CLDNNAMC(nn.Module):
         noise_head_hidden: int = 32,
         expert_features: bool = False,  # Enable expert feature branch
         expert_channels: int = 64,  # Channels for expert feature CNN
+        expert_stacf_window: int = 0,  # Window size for short-time ACF smoothing (0/1=off)
+        expert_use_cyclo_stats: bool = True,  # Append global cyclostationary stats to classifier feature
+        raw_low_snr_drop_prob: float = 0.0,  # Probability of attenuating raw branch in dual-path mode
+        raw_low_snr_drop_gate: str = "auto",  # Gate source for raw attenuation: auto|eta|snr
+        raw_low_snr_drop_eta_thresh: float = 1.0,  # Apply raw-branch attenuation when eta >= threshold
+        raw_low_snr_drop_snr_thresh: float = -6.0,  # Fallback gate when eta unavailable: apply when snr <= threshold
+        raw_low_snr_drop_min_scale: float = 0.0,  # Min multiplicative scale for gated raw branch
+        raw_low_snr_drop_max_scale: float = 0.0,  # Max multiplicative scale for gated raw branch
         cls_hidden: int = 0,  # Classifier hidden dim (0 = auto: max(128, num_classes*8))
         supcon_proj_dim: int = 0,  # >0 enables a SupCon MLP projection head
     ) -> None:
@@ -791,6 +839,24 @@ class CLDNNAMC(nn.Module):
         self.noise_eta_max = float(noise_eta_max)
         self._noise_eta_center = 0.5 * (self.noise_eta_min + self.noise_eta_max)
         self._noise_eta_half_range = 0.5 * (self.noise_eta_max - self.noise_eta_min)
+        self.expert_stacf_window = max(0, int(expert_stacf_window))
+        self.expert_use_cyclo_stats = bool(expert_use_cyclo_stats)
+        self.raw_low_snr_drop_prob = float(raw_low_snr_drop_prob)
+        if self.raw_low_snr_drop_prob < 0.0 or self.raw_low_snr_drop_prob > 1.0:
+            raise ValueError("raw_low_snr_drop_prob must be in [0,1].")
+        self.raw_low_snr_drop_gate = str(raw_low_snr_drop_gate).strip().lower()
+        if self.raw_low_snr_drop_gate not in {"auto", "eta", "snr"}:
+            raise ValueError("raw_low_snr_drop_gate must be one of: auto|eta|snr.")
+        self.raw_low_snr_drop_eta_thresh = float(raw_low_snr_drop_eta_thresh)
+        self.raw_low_snr_drop_snr_thresh = float(raw_low_snr_drop_snr_thresh)
+        self.raw_low_snr_drop_min_scale = float(raw_low_snr_drop_min_scale)
+        self.raw_low_snr_drop_max_scale = float(raw_low_snr_drop_max_scale)
+        if self.raw_low_snr_drop_min_scale < 0.0 or self.raw_low_snr_drop_max_scale < 0.0:
+            raise ValueError("raw_low_snr_drop_min_scale/max_scale must be >= 0.")
+        if self.raw_low_snr_drop_min_scale > 1.0 or self.raw_low_snr_drop_max_scale > 1.0:
+            raise ValueError("raw_low_snr_drop_min_scale/max_scale must be <= 1.")
+        if self.raw_low_snr_drop_max_scale < self.raw_low_snr_drop_min_scale:
+            raise ValueError("raw_low_snr_drop_max_scale must be >= raw_low_snr_drop_min_scale.")
 
         # Branch 1: IQ joint Conv2D over (2 x L) per path.
         self.conv_iq = nn.Conv2d(
@@ -826,9 +892,12 @@ class CLDNNAMC(nn.Module):
         # Expert feature branch (conjugate products, magnitude, phase diffs)
         if self.use_expert:
             self.expert_extractor = ExpertFeatureExtractor(
-                out_channels=expert_channels, time_out=self.time_out, dropout=float(dropout)
+                out_channels=expert_channels,
+                time_out=self.time_out,
+                dropout=float(dropout),
+                stacf_window=self.expert_stacf_window,
             )
-            self.cyclo_stats = CyclostationaryStats(seq_len=self.seq_len)
+            self.cyclo_stats = CyclostationaryStats(seq_len=self.seq_len) if self.expert_use_cyclo_stats else None
             reduce_in = merge_channels + expert_channels
         else:
             self.expert_extractor = None
@@ -953,7 +1022,7 @@ class CLDNNAMC(nn.Module):
             self.denoiser = None
 
         # Classifier head — auto-scale hidden size to num_classes
-        n_cyclo = self.cyclo_stats.N_STATS if self.use_expert else 0
+        n_cyclo = self.cyclo_stats.N_STATS if self.cyclo_stats is not None else 0
         cls_input_dim = lstm_out_dim + n_cyclo
         if cls_hidden > 0:
             _cls_h = int(cls_hidden)
@@ -1014,6 +1083,63 @@ class CLDNNAMC(nn.Module):
         if s >= 1.0:
             return x
         return x.detach() + s * (x - x.detach())
+
+    def _maybe_low_snr_raw_dropout(
+        self,
+        x_raw: torch.Tensor,
+        eta_cond: Optional[torch.Tensor] = None,
+        snr_flat: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        In dual-path mode, attenuate raw branch for a subset of low-SNR samples so
+        the classifier cannot ignore the denoised path.
+        """
+        if (
+            (not self.training)
+            or (not self.denoiser_dual_path)
+            or self.raw_low_snr_drop_prob <= 0.0
+        ):
+            return x_raw
+
+        b = int(x_raw.shape[0])
+        gate = None
+        gate_mode = str(self.raw_low_snr_drop_gate)
+        if gate_mode == "eta":
+            if eta_cond is not None:
+                eta_f = eta_cond.float().view(-1)
+                if eta_f.numel() == b:
+                    gate = eta_f >= float(self.raw_low_snr_drop_eta_thresh)
+        elif gate_mode == "snr":
+            if snr_flat is not None:
+                snr_f = snr_flat.float().view(-1)
+                if snr_f.numel() == b:
+                    gate = snr_f <= float(self.raw_low_snr_drop_snr_thresh)
+        else:
+            if eta_cond is not None:
+                eta_f = eta_cond.float().view(-1)
+                if eta_f.numel() == b:
+                    gate = eta_f >= float(self.raw_low_snr_drop_eta_thresh)
+            if gate is None and snr_flat is not None:
+                snr_f = snr_flat.float().view(-1)
+                if snr_f.numel() == b:
+                    gate = snr_f <= float(self.raw_low_snr_drop_snr_thresh)
+        if gate is None:
+            return x_raw
+        if not bool(torch.any(gate)):
+            return x_raw
+
+        apply_mask = gate & (torch.rand((b,), device=x_raw.device) < float(self.raw_low_snr_drop_prob))
+        if not bool(torch.any(apply_mask)):
+            return x_raw
+
+        lo = float(self.raw_low_snr_drop_min_scale)
+        hi = float(self.raw_low_snr_drop_max_scale)
+        if hi <= lo + 1e-12:
+            scales = torch.full((b,), lo, device=x_raw.device, dtype=x_raw.dtype)
+        else:
+            scales = lo + (hi - lo) * torch.rand((b,), device=x_raw.device, dtype=x_raw.dtype)
+        scales = torch.where(apply_mask, scales, torch.ones_like(scales))
+        return x_raw * scales.view(-1, 1, 1)
 
     def denoise_only(
         self,
@@ -1309,7 +1435,12 @@ class CLDNNAMC(nn.Module):
             eta_pred_external = eta_pred_dn
             x_dn_for_clf = self._scale_grad(x_dn, cls_to_denoiser_scale)
             if self.denoiser_dual_path:
-                x_for_clf = torch.cat([x_raw, x_dn_for_clf], dim=1)
+                x_raw_for_clf = self._maybe_low_snr_raw_dropout(
+                    x_raw,
+                    eta_cond=_eta_cond,
+                    snr_flat=snr_flat,
+                )
+                x_for_clf = torch.cat([x_raw_for_clf, x_dn_for_clf], dim=1)
             else:
                 x_for_clf = x_dn_for_clf
 

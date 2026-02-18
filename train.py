@@ -714,6 +714,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cldnn-noise-cond", action="store_true", help="Enable noise-fraction conditioning via eta=logit(rho) FiLM for CLDNN.")
     parser.add_argument("--cldnn-denoiser", action="store_true", help="Enable residual conditional U-Net denoiser preprocessor.")
     parser.add_argument("--cldnn-denoiser-dual-path", action="store_true", help="Use mandatory dual-path classifier input [x_raw, x_dn] when denoiser is enabled.")
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-prob",
+        type=float,
+        default=0.0,
+        help="Dual-path only: probability of attenuating raw branch for low-SNR samples so classifier must use denoised path.",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-gate",
+        type=str,
+        default="auto",
+        choices=["auto", "eta", "snr"],
+        help="Gate source for low-SNR raw attenuation: auto (eta then SNR fallback), eta-only, or snr-only.",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-eta-thresh",
+        type=float,
+        default=1.0,
+        help="Apply raw-branch attenuation when eta_cond >= threshold (higher eta = noisier sample).",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-snr-thresh",
+        type=float,
+        default=-6.0,
+        help="Apply raw-branch attenuation when SNR <= threshold (dB); used directly in gate=snr or as fallback in gate=auto.",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-min-scale",
+        type=float,
+        default=0.0,
+        help="Minimum multiplicative raw-branch scale for gated samples (0 = hard zero).",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-max-scale",
+        type=float,
+        default=0.0,
+        help="Maximum multiplicative raw-branch scale for gated samples.",
+    )
     parser.add_argument("--cldnn-denoiser-base-ch", type=int, default=32, help="Base channels for the denoiser U-Net.")
     parser.add_argument("--cldnn-denoiser-dropout", type=float, default=0.0, help="Dropout inside denoiser residual blocks.")
     parser.add_argument("--cldnn-denoiser-soft-hi-blend", action="store_true", help="Enable soft high-SNR residual suppression in denoiser.")
@@ -727,6 +764,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise-rho-max", type=float, default=1.0 - 1e-4, help="Maximum rho clamp when converting SNR labels to eta targets.")
     parser.add_argument("--cldnn-expert-features", action="store_true", help="Enable expert feature branch (conjugate products, cyclostationary stats).")
     parser.add_argument("--cldnn-expert-ch", type=int, default=64, help="Channels for expert feature CNN.")
+    parser.add_argument(
+        "--cldnn-expert-stacf-win",
+        type=int,
+        default=0,
+        help="Short-time ACF smoothing window for expert features (0/1 disables, odd windows recommended: 5/9/13).",
+    )
+    parser.add_argument(
+        "--cldnn-cyclo-stats",
+        dest="cldnn_cyclo_stats",
+        action="store_true",
+        help="Append global cyclostationary scalar statistics in expert branch.",
+    )
+    parser.add_argument(
+        "--cldnn-no-cyclo-stats",
+        dest="cldnn_cyclo_stats",
+        action="store_false",
+        help="Disable global cyclostationary scalar statistics (expert-map-only ablation).",
+    )
+    parser.set_defaults(cldnn_cyclo_stats=True)
     parser.add_argument("--cldnn-cls-hidden", type=int, default=0, help="Classifier head hidden dim (0=auto: max(128, num_classes*8)).")
 
     # Multi-view architecture options (used when --arch multiview)
@@ -1487,6 +1543,22 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("Noise/denoiser options are currently supported only for --arch cldnn.")
     if bool(getattr(args, "cldnn_denoiser_dual_path", False)) and not bool(getattr(args, "cldnn_denoiser", False)):
         raise ValueError("--cldnn-denoiser-dual-path requires --cldnn-denoiser.")
+    raw_drop_prob = float(getattr(args, "cldnn_raw_low_snr_drop_prob", 0.0))
+    raw_drop_min = float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0))
+    raw_drop_max = float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0))
+    raw_drop_gate = str(getattr(args, "cldnn_raw_low_snr_drop_gate", "auto")).strip().lower()
+    if raw_drop_prob < 0.0 or raw_drop_prob > 1.0:
+        raise ValueError("cldnn_raw_low_snr_drop_prob must be in [0,1].")
+    if raw_drop_gate not in {"auto", "eta", "snr"}:
+        raise ValueError("cldnn_raw_low_snr_drop_gate must be one of: auto|eta|snr.")
+    if raw_drop_min < 0.0 or raw_drop_min > 1.0 or raw_drop_max < 0.0 or raw_drop_max > 1.0:
+        raise ValueError("cldnn_raw_low_snr_drop_min_scale/max_scale must be in [0,1].")
+    if raw_drop_max < raw_drop_min:
+        raise ValueError("cldnn_raw_low_snr_drop_max_scale must be >= cldnn_raw_low_snr_drop_min_scale.")
+    if raw_drop_prob > 0.0 and not bool(getattr(args, "cldnn_denoiser_dual_path", False)):
+        raise ValueError("--cldnn-raw-low-snr-drop-prob requires --cldnn-denoiser-dual-path.")
+    if int(getattr(args, "cldnn_expert_stacf_win", 0)) < 0:
+        raise ValueError("cldnn_expert_stacf_win must be >= 0.")
     if int(getattr(args, "stage_a_epochs", 0)) < 0 or int(getattr(args, "stage_b_epochs", 0)) < 0:
         raise ValueError("stage_a_epochs and stage_b_epochs must be >= 0.")
     if int(getattr(args, "feat_ramp_epochs", 0)) < 0:
@@ -1595,6 +1667,14 @@ def train(args: argparse.Namespace) -> None:
             noise_head_hidden=int(getattr(args, "noise_head_hidden", 32)),
             expert_features=bool(getattr(args, 'cldnn_expert_features', False)),
             expert_channels=int(getattr(args, 'cldnn_expert_ch', 64)),
+            expert_stacf_window=int(getattr(args, "cldnn_expert_stacf_win", 0)),
+            expert_use_cyclo_stats=bool(getattr(args, "cldnn_cyclo_stats", True)),
+            raw_low_snr_drop_prob=float(getattr(args, "cldnn_raw_low_snr_drop_prob", 0.0)),
+            raw_low_snr_drop_gate=str(getattr(args, "cldnn_raw_low_snr_drop_gate", "auto")),
+            raw_low_snr_drop_eta_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_eta_thresh", 1.0)),
+            raw_low_snr_drop_snr_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_snr_thresh", -6.0)),
+            raw_low_snr_drop_min_scale=float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0)),
+            raw_low_snr_drop_max_scale=float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0)),
             cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
@@ -1681,6 +1761,14 @@ def train(args: argparse.Namespace) -> None:
                 noise_head_hidden=int(getattr(args, "noise_head_hidden", 32)),
                 expert_features=bool(getattr(args, "cldnn_expert_features", False)),
                 expert_channels=int(getattr(args, "cldnn_expert_ch", 64)),
+                expert_stacf_window=int(getattr(args, "cldnn_expert_stacf_win", 0)),
+                expert_use_cyclo_stats=bool(getattr(args, "cldnn_cyclo_stats", True)),
+                raw_low_snr_drop_prob=float(getattr(args, "cldnn_raw_low_snr_drop_prob", 0.0)),
+                raw_low_snr_drop_gate=str(getattr(args, "cldnn_raw_low_snr_drop_gate", "auto")),
+                raw_low_snr_drop_eta_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_eta_thresh", 1.0)),
+                raw_low_snr_drop_snr_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_snr_thresh", -6.0)),
+                raw_low_snr_drop_min_scale=float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0)),
+                raw_low_snr_drop_max_scale=float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0)),
                 cls_hidden=int(getattr(args, "cldnn_cls_hidden", 0)),
                 supcon_proj_dim=int(getattr(args, "supcon_proj_dim", 0)) if getattr(args, "supcon", False) else 0,
             ).to(device)
@@ -2741,6 +2829,14 @@ def run_eval(args: argparse.Namespace) -> None:
             noise_head_hidden=int(getattr(args, "noise_head_hidden", 32)),
             expert_features=bool(getattr(args, 'cldnn_expert_features', False)),
             expert_channels=int(getattr(args, 'cldnn_expert_ch', 64)),
+            expert_stacf_window=int(getattr(args, "cldnn_expert_stacf_win", 0)),
+            expert_use_cyclo_stats=bool(getattr(args, "cldnn_cyclo_stats", True)),
+            raw_low_snr_drop_prob=float(getattr(args, "cldnn_raw_low_snr_drop_prob", 0.0)),
+            raw_low_snr_drop_gate=str(getattr(args, "cldnn_raw_low_snr_drop_gate", "auto")),
+            raw_low_snr_drop_eta_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_eta_thresh", 1.0)),
+            raw_low_snr_drop_snr_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_snr_thresh", -6.0)),
+            raw_low_snr_drop_min_scale=float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0)),
+            raw_low_snr_drop_max_scale=float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0)),
             cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
