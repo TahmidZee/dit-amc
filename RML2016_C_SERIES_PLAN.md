@@ -10,29 +10,49 @@
 - Main bottleneck: low-SNR band (`-14..-6 dB`) where current best is ~0.311.
 - Execution policy: run **8 experiments at a time**, but run **multiple waves** (not limited to 8 total).
 
-## What Was Just Implemented in Code
+## What Is Implemented in Code (Current)
 
-The following capabilities are now available in `train.py` + `model.py`:
+The following capabilities are available in `train.py` + `model.py`:
 
-1. **Short-Time ACF smoothing in expert branch** (physics-guided denoising before expert CNN):
-   - `--cldnn-expert-stacf-win <int>`
-   - `0/1` disables smoothing; odd windows recommended (`5`, `9`, `13`).
-   - Smoothing is complex-safe: moving-average is applied separately to real/imag channels.
+1. **Expert-v2 branch (new)**:
+   - `--cldnn-expert-v2`
+   - normalized local short-time correlations (Re/Im/|r_k|) with local power normalization
+   - stable phase-diff features via dot/cross (no `atan2`)
+   - tunable normalization epsilon: `--cldnn-expert-corr-eps`
 
-2. **Cyclostationary scalar ablation switch**:
+2. **Eta-gated expert fusion (new)**:
+   - `--cldnn-expert-eta-gate`
+   - `--cldnn-expert-eta-gate-center`, `--cldnn-expert-eta-gate-tau`
+   - `--cldnn-expert-eta-gate-min`, `--cldnn-expert-eta-gate-max`
+   - gates expert maps/scalars down at high-SNR, up at low-SNR
+
+3. **Cyclostationary scalar ablation switch**:
    - `--cldnn-cyclo-stats` (default on)
-   - `--cldnn-no-cyclo-stats` (disable late global scalars)
+   - `--cldnn-no-cyclo-stats`
 
-3. **Low-SNR raw-path attenuation in dual-path classifier** (prevents raw shortcut):
-   - `--cldnn-raw-low-snr-drop-prob`
-   - `--cldnn-raw-low-snr-drop-gate` (`auto|eta|snr`)
-   - `--cldnn-raw-low-snr-drop-eta-thresh`
-   - `--cldnn-raw-low-snr-drop-snr-thresh`
-   - `--cldnn-raw-low-snr-drop-min-scale`
-   - `--cldnn-raw-low-snr-drop-max-scale`
-   - Applied only in train mode and dual-path denoiser mode.
+4. **Low-SNR raw-path attenuation in dual-path classifier**:
+   - base controls: `--cldnn-raw-low-snr-drop-prob`, `--cldnn-raw-low-snr-drop-gate`, `--cldnn-raw-low-snr-drop-eta-thresh`, `--cldnn-raw-low-snr-drop-snr-thresh`, `--cldnn-raw-low-snr-drop-min-scale`, `--cldnn-raw-low-snr-drop-max-scale`
+   - **SNR-shaped probability schedule (new)**:
+     - `--cldnn-raw-low-snr-drop-prob-lo`, `--cldnn-raw-low-snr-drop-prob-mid`, `--cldnn-raw-low-snr-drop-prob-hi`
+     - `--cldnn-raw-low-snr-drop-snr-lo`, `--cldnn-raw-low-snr-drop-snr-mid`
 
-4. Validation guards were added for invalid ranges and incompatible settings.
+5. **Targeted L_feat controls (new)**:
+   - source-band mask: `--lfeat-snr-lo`, `--lfeat-snr-hi`
+   - degraded-band mask: `--lfeat-snr-new-lo`, `--lfeat-snr-new-hi`
+   - log metric: `train_lfeat_active_frac` to verify L_feat is active in the intended band
+
+6. **Constrained denoiser paired degradation controls (new)**:
+   - `--dn-pair-delta-min`, `--dn-pair-delta-max`
+   - `--dn-pair-snr-floor-db`
+   - `--dn-pair-snr-new-lo`, `--dn-pair-snr-new-hi`
+   - prevents over-hard pair generation (e.g., not forcing `-14 -> -20` unless requested)
+
+7. **Low-SNR adaptive consistency deltas (new)**:
+   - `--snr-consist-adaptive-delta`
+   - `--snr-consist-low-snr-thresh`
+   - `--snr-consist-low-delta-min`, `--snr-consist-low-delta-max`
+
+8. Validation guards were added for invalid ranges and incompatible settings.
 
 ## Clarified Technical Position (from last discussion)
 
@@ -112,25 +132,29 @@ Wave-2 exit criterion:
 
 ---
 
-## Wave 3 (8 runs): Full Aggressive Stack + FiLM Head-to-Head + Seed Robustness
+## Wave 3R (8 runs): Mixed Expert-v2 + Targeted Denoiser Training
 
-Purpose: maximize performance while testing whether classifier FiLM adds anything once denoiser + gating are strong.
+Purpose: run **4 expert-v2 ablations** plus **4 non-expert low-SNR improvements** in one wave.
 
-Use `<W2_BEST_FLAGS>` from Wave 2 winner in all runs below.
+Wave-2 signals to exploit:
+- consistency gave best overall trend
+- soft SNR-gated attenuation gave best low-band trend
+- L_feat was active but not targeted
 
-| ID | Run name | Delta flags (plus `<W2_BEST_FLAGS>`) | Expected effect |
+| ID | Run name | Delta flags vs base | Expected effect |
 |---|---|---|---|
-| W3-0 | `w3_best_anchor` | none | wave-3 control |
-| W3-1 | `w3_reg_mixup` | `--mixup-alpha 0.2 --mixup-prob 0.3 --mixup-snr-min 6 --mixup-cls-only --dropout 0.20 --aug-cfo 0.005 --aug-gain 0.15` | stronger regularization |
-| W3-2 | `w3_reg_mixup_snrbal` | W3-1 + `--snr-balanced --snr-balance-power 0.5` | low-SNR gradient reweighting |
-| W3-3 | `w3_reg_mixup_snrbal_supcon` | W3-2 + `--supcon --supcon-lambda 0.1 --supcon-temp 0.07 --supcon-proj-dim 128 --supcon-warmup 30` | representation robustness |
-| W3-4 | `w3_noise_film_head` | W3-3 + `--cldnn-noise-cond` | classifier eta-FiLM comparison |
-| W3-5 | `w3_snr_film_head` | W3-3 + `--cldnn-snr-cond` | classifier SNR-FiLM comparison |
-| W3-6 | `w3_best_seed2017` | best of W3-0..W3-5 + `--seed 2017` | seed robustness |
-| W3-7 | `w3_best_seed2018` | best of W3-0..W3-5 + `--seed 2018` | seed robustness |
+| W3R-0 | `w3r_noexp_anchor_consist` | `--cldnn-raw-low-snr-drop-gate eta --cldnn-raw-low-snr-drop-prob 0.4 --cldnn-raw-low-snr-drop-eta-thresh 1.0 --cldnn-raw-low-snr-drop-min-scale 0.0 --cldnn-raw-low-snr-drop-max-scale 0.0 --snr-consist --snr-consist-lambda 0.5 --snr-consist-warmup 30 --snr-consist-ramp 10 --snr-consist-temp 2.0 --snr-consist-delta-min 2 --snr-consist-delta-max 6 --snr-consist-snr-lo -14 --snr-consist-snr-hi 6 --snr-consist-conf-thresh 0.3` | reproducible overall anchor |
+| W3R-1 | `w3r_noexp_softsched` | `--cldnn-raw-low-snr-drop-gate snr --cldnn-raw-low-snr-drop-snr-thresh 18 --cldnn-raw-low-snr-drop-prob-lo 0.75 --cldnn-raw-low-snr-drop-prob-mid 0.45 --cldnn-raw-low-snr-drop-prob-hi 0.05 --cldnn-raw-low-snr-drop-snr-lo -10 --cldnn-raw-low-snr-drop-snr-mid -6 --cldnn-raw-low-snr-drop-min-scale 0.1 --cldnn-raw-low-snr-drop-max-scale 0.3` | stronger low-SNR shortcut suppression |
+| W3R-2 | `w3r_noexp_softsched_consist_adapt` | W3R-1 + `--snr-consist --snr-consist-lambda 0.5 --snr-consist-warmup 30 --snr-consist-ramp 10 --snr-consist-temp 2.0 --snr-consist-delta-min 2 --snr-consist-delta-max 6 --snr-consist-snr-lo -14 --snr-consist-snr-hi -4 --snr-consist-snr-new-lo -16 --snr-consist-snr-new-hi -6 --snr-consist-conf-thresh 0.3 --snr-consist-adaptive-delta --snr-consist-low-snr-thresh -6 --snr-consist-low-delta-min 2 --snr-consist-low-delta-max 4` | low-band-biased consistency |
+| W3R-3 | `w3r_noexp_softsched_lfeat_target` | W3R-1 + `--lambda-feat 0.03 --feat-ramp-epochs 5 --feat-encoder-ckpt ./runs/rml2016_athena/b0_a3_baseline/best.pt --dn-pair-delta-min 2 --dn-pair-delta-max 6 --dn-pair-snr-floor-db -14 --dn-pair-snr-new-lo -14 --dn-pair-snr-new-hi -6 --lfeat-snr-lo -14 --lfeat-snr-hi -6 --lfeat-snr-new-lo -14 --lfeat-snr-new-hi -6` | targeted L_feat + constrained pairs |
+| W3R-4 | `w3r_expv2_plain` | W3R-1 + `--cldnn-expert-features --cldnn-expert-v2` | expert-v2 baseline |
+| W3R-5 | `w3r_expv2_eta_gate` | W3R-1 + `--cldnn-expert-features --cldnn-expert-v2 --cldnn-expert-eta-gate --cldnn-expert-eta-gate-center 0.8 --cldnn-expert-eta-gate-tau 0.7 --cldnn-expert-eta-gate-min 0.0 --cldnn-expert-eta-gate-max 1.0` | test eta-gated fusion |
+| W3R-6 | `w3r_expv2_eta_gate_no_cyclo` | W3R-5 + `--cldnn-no-cyclo-stats` | check if global scalars hurt after gating |
+| W3R-7 | `w3r_expv2_eta_gate_lfeat_consist` | W3R-6 + targeted L_feat block from W3R-3 + adaptive low-band consistency block from W3R-2 | full expert-v2 stack |
 
-Wave-3 exit criterion:
-- Top candidate must beat b3 on overall and low-SNR with acceptable high-SNR retention.
+Wave-3R exit criterion:
+- Promote top-2 by low-band first, then overall.
+- Require high-band drop no worse than `-0.002` vs `b3_dn48`.
 
 ---
 
@@ -149,7 +173,7 @@ Promotion gate vs `b3_dn48`:
   - low-band >= +0.015 absolute
 
 Aggressive gate for 70% trajectory:
-- by end of Wave 3, low-band should be >= 0.340 and overall >= 0.650
+- by end of Wave 3R, low-band should be >= 0.340 and overall >= 0.650
 - if not achieved, consider architecture changes (sequence length, stronger denoiser depth, or pretext training), not just regularization tweaks.
 
 ---

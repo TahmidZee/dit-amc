@@ -568,16 +568,22 @@ class ExpertFeatureExtractor(nn.Module):
     """
     Computes domain-specific features from raw I/Q signals for improved low-SNR classification.
 
-    Features computed:
+    Features computed (v1):
       - Conjugate products x[n]x*[n-k] for k=1,2,3 (phase-invariant, CFO-robust)
       - Magnitude |x|
-      - Phase differences as (sin, cos) for continuity
+      - Phase differences as (sin, cos) for continuity (computed without atan2)
+
+    Features computed (v2):
+      - Normalized local short-time correlations r_k[n] / (eps + local_power[n])
+      - For each k=1,2,3: Re, Im, |r_k|
+      - Stable phase-diff (sin/cos) via dot/cross formulation (no atan2)
 
     These are processed by a small 1D CNN to produce feature maps that merge
     with the main CLDNN branch before the LSTM.
     """
 
-    EXPERT_INPUT_CHANNELS = 9  # 2*3 (conj products) + 1 (mag) + 2 (phase diff sin/cos)
+    EXPERT_INPUT_CHANNELS_V1 = 9   # 2*3 (conj products) + 1 (mag) + 2 (phase diff sin/cos)
+    EXPERT_INPUT_CHANNELS_V2 = 11  # 3*3 (Re,Im,|r_k| for k=1,2,3) + 2 (phase diff sin/cos)
 
     def __init__(
         self,
@@ -585,9 +591,13 @@ class ExpertFeatureExtractor(nn.Module):
         time_out: int = 124,
         dropout: float = 0.3,
         stacf_window: int = 0,
+        v2_mode: bool = False,
+        corr_norm_eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        n_in = self.EXPERT_INPUT_CHANNELS
+        self.use_v2 = bool(v2_mode)
+        self.corr_norm_eps = max(1e-9, float(corr_norm_eps))
+        n_in = self.EXPERT_INPUT_CHANNELS_V2 if self.use_v2 else self.EXPERT_INPUT_CHANNELS_V1
         self.conv1 = nn.Conv1d(n_in, out_channels, kernel_size=7, padding=3)
         self.bn1 = nn.BatchNorm1d(out_channels)
         self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=5, padding=2)
@@ -601,6 +611,43 @@ class ExpertFeatureExtractor(nn.Module):
         # Use odd window for centered smoothing without temporal bias.
         if self.stacf_window > 1 and (self.stacf_window % 2 == 0):
             self.stacf_window += 1
+
+    def _stable_phase_diff(self, I: torch.Tensor, Q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Stable phase-difference representation without atan2:
+          cos(dphi) = dot / (|x_n||x_{n-1}| + eps)
+          sin(dphi) = cross / (|x_n||x_{n-1}| + eps)
+        """
+        I_curr = I[:, 1:]
+        Q_curr = Q[:, 1:]
+        I_prev = I[:, :-1]
+        Q_prev = Q[:, :-1]
+
+        dot = I_curr * I_prev + Q_curr * Q_prev
+        cross = Q_curr * I_prev - I_curr * Q_prev
+        mag_curr = torch.sqrt(torch.clamp(I_curr * I_curr + Q_curr * Q_curr, min=0.0) + self.corr_norm_eps)
+        mag_prev = torch.sqrt(torch.clamp(I_prev * I_prev + Q_prev * Q_prev, min=0.0) + self.corr_norm_eps)
+        denom = mag_curr * mag_prev + self.corr_norm_eps
+
+        pd_cos = F.pad(dot / denom, (0, 1))
+        pd_sin = F.pad(cross / denom, (0, 1))
+        return pd_sin, pd_cos
+
+    def _normalized_local_corr(
+        self,
+        x_complex: torch.Tensor,
+        lag: int,
+        local_power: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rk = x_complex[:, lag:] * x_complex[:, :-lag].conj()
+        rk = F.pad(rk, (0, lag))
+        rk_re = self._smooth_1d(rk.real)
+        rk_im = self._smooth_1d(rk.imag)
+        denom = local_power + self.corr_norm_eps
+        rk_re = rk_re / denom
+        rk_im = rk_im / denom
+        rk_abs = torch.sqrt(torch.clamp(rk_re * rk_re + rk_im * rk_im, min=0.0) + self.corr_norm_eps)
+        return rk_re, rk_im, rk_abs
 
     def _smooth_1d(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -633,46 +680,46 @@ class ExpertFeatureExtractor(nn.Module):
         # Build complex signal
         x_complex = torch.complex(I, Q)  # (B, L)
 
-        # Conjugate products: x[n] * conj(x[n-k]) — phase-invariant, CFO-robust
-        conj_1 = x_complex[:, 1:] * x_complex[:, :-1].conj()  # (B, 127)
-        conj_2 = x_complex[:, 2:] * x_complex[:, :-2].conj()  # (B, 126)
-        conj_3 = x_complex[:, 3:] * x_complex[:, :-3].conj()  # (B, 125)
-
-        # Pad back to length L
-        conj_1 = F.pad(conj_1, (0, 1))  # (B, L)
-        conj_2 = F.pad(conj_2, (0, 2))  # (B, L)
-        conj_3 = F.pad(conj_3, (0, 3))  # (B, L)
-
-        # Magnitude
-        mag = torch.abs(x_complex)  # (B, L)
-
-        # Phase differences as (sin, cos) — avoids phase wrapping issues
-        phase = torch.atan2(Q, I)  # (B, L)
-        phase_diff = phase[:, 1:] - phase[:, :-1]  # (B, L-1)
-        phase_diff = F.pad(phase_diff, (0, 1))  # (B, L)
-        pd_sin = torch.sin(phase_diff)  # (B, L)
-        pd_cos = torch.cos(phase_diff)  # (B, L)
-
-        # Optional short-time ACF smoothing before CNN:
-        # smooth real/imag separately (avg_pool1d expects real tensors).
-        conj_1_real = self._smooth_1d(conj_1.real)
-        conj_1_imag = self._smooth_1d(conj_1.imag)
-        conj_2_real = self._smooth_1d(conj_2.real)
-        conj_2_imag = self._smooth_1d(conj_2.imag)
-        conj_3_real = self._smooth_1d(conj_3.real)
-        conj_3_imag = self._smooth_1d(conj_3.imag)
-        mag = self._smooth_1d(mag)
+        pd_sin, pd_cos = self._stable_phase_diff(I, Q)
         pd_sin = self._smooth_1d(pd_sin)
         pd_cos = self._smooth_1d(pd_cos)
 
-        # Stack all features: (B, 9, L)
-        feats = torch.stack([
-            conj_1_real, conj_1_imag,
-            conj_2_real, conj_2_imag,
-            conj_3_real, conj_3_imag,
-            mag,
-            pd_sin, pd_cos,
-        ], dim=1)
+        if self.use_v2:
+            # Local power normalization approximates short-time expectation and
+            # suppresses amplitude-driven variance at low SNR.
+            pow2 = I * I + Q * Q
+            local_power = self._smooth_1d(pow2)
+            r1_re, r1_im, r1_abs = self._normalized_local_corr(x_complex, lag=1, local_power=local_power)
+            r2_re, r2_im, r2_abs = self._normalized_local_corr(x_complex, lag=2, local_power=local_power)
+            r3_re, r3_im, r3_abs = self._normalized_local_corr(x_complex, lag=3, local_power=local_power)
+            feats = torch.stack([
+                r1_re, r1_im, r1_abs,
+                r2_re, r2_im, r2_abs,
+                r3_re, r3_im, r3_abs,
+                pd_sin, pd_cos,
+            ], dim=1)
+        else:
+            # Conjugate products: x[n] * conj(x[n-k]) — phase-invariant, CFO-robust
+            conj_1 = x_complex[:, 1:] * x_complex[:, :-1].conj()
+            conj_2 = x_complex[:, 2:] * x_complex[:, :-2].conj()
+            conj_3 = x_complex[:, 3:] * x_complex[:, :-3].conj()
+            conj_1 = F.pad(conj_1, (0, 1))
+            conj_2 = F.pad(conj_2, (0, 2))
+            conj_3 = F.pad(conj_3, (0, 3))
+            mag = self._smooth_1d(torch.abs(x_complex))
+            conj_1_real = self._smooth_1d(conj_1.real)
+            conj_1_imag = self._smooth_1d(conj_1.imag)
+            conj_2_real = self._smooth_1d(conj_2.real)
+            conj_2_imag = self._smooth_1d(conj_2.imag)
+            conj_3_real = self._smooth_1d(conj_3.real)
+            conj_3_imag = self._smooth_1d(conj_3.imag)
+            feats = torch.stack([
+                conj_1_real, conj_1_imag,
+                conj_2_real, conj_2_imag,
+                conj_3_real, conj_3_imag,
+                mag,
+                pd_sin, pd_cos,
+            ], dim=1)
 
         # Process with small CNN
         h = self.drop(self.act(self.bn1(self.conv1(feats))))  # (B, out_ch, L)
@@ -797,6 +844,13 @@ class CLDNNAMC(nn.Module):
         expert_features: bool = False,  # Enable expert feature branch
         expert_channels: int = 64,  # Channels for expert feature CNN
         expert_stacf_window: int = 0,  # Window size for short-time ACF smoothing (0/1=off)
+        expert_v2: bool = False,  # Use normalized local-correlation expert extractor (v2)
+        expert_corr_norm_eps: float = 1e-6,  # Epsilon for normalized local-correlation expert features
+        expert_eta_gate: bool = False,  # Gate expert branch by predicted eta to avoid high-SNR harm
+        expert_eta_gate_center: float = 0.8,  # eta value where expert gate is ~0.5
+        expert_eta_gate_tau: float = 0.7,  # softness for expert eta gating sigmoid
+        expert_eta_gate_min: float = 0.0,  # minimum expert gate scale
+        expert_eta_gate_max: float = 1.0,  # maximum expert gate scale
         expert_use_cyclo_stats: bool = True,  # Append global cyclostationary stats to classifier feature
         raw_low_snr_drop_prob: float = 0.0,  # Probability of attenuating raw branch in dual-path mode
         raw_low_snr_drop_gate: str = "auto",  # Gate source for raw attenuation: auto|eta|snr
@@ -804,6 +858,11 @@ class CLDNNAMC(nn.Module):
         raw_low_snr_drop_snr_thresh: float = -6.0,  # Fallback gate when eta unavailable: apply when snr <= threshold
         raw_low_snr_drop_min_scale: float = 0.0,  # Min multiplicative scale for gated raw branch
         raw_low_snr_drop_max_scale: float = 0.0,  # Max multiplicative scale for gated raw branch
+        raw_low_snr_drop_prob_lo: float = -1.0,  # Optional SNR-shaped schedule prob for very low SNR
+        raw_low_snr_drop_prob_mid: float = -1.0,  # Optional SNR-shaped schedule prob for transition SNR
+        raw_low_snr_drop_prob_hi: float = -1.0,  # Optional SNR-shaped schedule prob for high SNR
+        raw_low_snr_drop_snr_lo: float = -10.0,  # lower SNR split for schedule
+        raw_low_snr_drop_snr_mid: float = -6.0,  # middle SNR split for schedule
         cls_hidden: int = 0,  # Classifier hidden dim (0 = auto: max(128, num_classes*8))
         supcon_proj_dim: int = 0,  # >0 enables a SupCon MLP projection head
     ) -> None:
@@ -840,6 +899,23 @@ class CLDNNAMC(nn.Module):
         self._noise_eta_center = 0.5 * (self.noise_eta_min + self.noise_eta_max)
         self._noise_eta_half_range = 0.5 * (self.noise_eta_max - self.noise_eta_min)
         self.expert_stacf_window = max(0, int(expert_stacf_window))
+        self.expert_v2 = bool(expert_v2)
+        self.expert_corr_norm_eps = max(1e-9, float(expert_corr_norm_eps))
+        self.expert_eta_gate = bool(expert_eta_gate)
+        self.expert_eta_gate_center = float(expert_eta_gate_center)
+        self.expert_eta_gate_tau = float(expert_eta_gate_tau)
+        self.expert_eta_gate_min = float(expert_eta_gate_min)
+        self.expert_eta_gate_max = float(expert_eta_gate_max)
+        if self.expert_eta_gate_tau <= 0.0:
+            raise ValueError("expert_eta_gate_tau must be > 0.")
+        if (
+            self.expert_eta_gate_min < 0.0
+            or self.expert_eta_gate_max < 0.0
+            or self.expert_eta_gate_min > 1.0
+            or self.expert_eta_gate_max > 1.0
+            or self.expert_eta_gate_max < self.expert_eta_gate_min
+        ):
+            raise ValueError("expert_eta_gate_min/max must be in [0,1] and max >= min.")
         self.expert_use_cyclo_stats = bool(expert_use_cyclo_stats)
         self.raw_low_snr_drop_prob = float(raw_low_snr_drop_prob)
         if self.raw_low_snr_drop_prob < 0.0 or self.raw_low_snr_drop_prob > 1.0:
@@ -857,6 +933,26 @@ class CLDNNAMC(nn.Module):
             raise ValueError("raw_low_snr_drop_min_scale/max_scale must be <= 1.")
         if self.raw_low_snr_drop_max_scale < self.raw_low_snr_drop_min_scale:
             raise ValueError("raw_low_snr_drop_max_scale must be >= raw_low_snr_drop_min_scale.")
+        self.raw_low_snr_drop_prob_lo = float(raw_low_snr_drop_prob_lo)
+        self.raw_low_snr_drop_prob_mid = float(raw_low_snr_drop_prob_mid)
+        self.raw_low_snr_drop_prob_hi = float(raw_low_snr_drop_prob_hi)
+        self.raw_low_snr_drop_snr_lo = float(raw_low_snr_drop_snr_lo)
+        self.raw_low_snr_drop_snr_mid = float(raw_low_snr_drop_snr_mid)
+        self.raw_low_snr_drop_schedule = (
+            self.raw_low_snr_drop_prob_lo >= 0.0
+            and self.raw_low_snr_drop_prob_mid >= 0.0
+            and self.raw_low_snr_drop_prob_hi >= 0.0
+        )
+        if self.raw_low_snr_drop_schedule:
+            for p in (
+                self.raw_low_snr_drop_prob_lo,
+                self.raw_low_snr_drop_prob_mid,
+                self.raw_low_snr_drop_prob_hi,
+            ):
+                if p < 0.0 or p > 1.0:
+                    raise ValueError("raw_low_snr_drop_prob_lo/mid/hi must be in [0,1] when schedule is enabled.")
+            if self.raw_low_snr_drop_snr_lo > self.raw_low_snr_drop_snr_mid:
+                raise ValueError("raw_low_snr_drop_snr_lo must be <= raw_low_snr_drop_snr_mid.")
 
         # Branch 1: IQ joint Conv2D over (2 x L) per path.
         self.conv_iq = nn.Conv2d(
@@ -896,6 +992,8 @@ class CLDNNAMC(nn.Module):
                 time_out=self.time_out,
                 dropout=float(dropout),
                 stacf_window=self.expert_stacf_window,
+                v2_mode=self.expert_v2,
+                corr_norm_eps=self.expert_corr_norm_eps,
             )
             self.cyclo_stats = CyclostationaryStats(seq_len=self.seq_len) if self.expert_use_cyclo_stats else None
             reduce_in = merge_channels + expert_channels
@@ -1056,6 +1154,8 @@ class CLDNNAMC(nn.Module):
         # Optional auxiliary eta predictions (noise-fraction logit), set during forward.
         self._eta_pred_flat: Optional[torch.Tensor] = None
         self._eta_pred: Optional[torch.Tensor] = None
+        self._expert_gate_flat: Optional[torch.Tensor] = None
+        self._expert_gate: Optional[torch.Tensor] = None
         self._x_dn_flat: Optional[torch.Tensor] = None
         self._x_dn: Optional[torch.Tensor] = None
         # Frozen early-feature encoder used by perceptual/feature-preservation loss.
@@ -1097,12 +1197,13 @@ class CLDNNAMC(nn.Module):
         if (
             (not self.training)
             or (not self.denoiser_dual_path)
-            or self.raw_low_snr_drop_prob <= 0.0
+            or (self.raw_low_snr_drop_prob <= 0.0 and not self.raw_low_snr_drop_schedule)
         ):
             return x_raw
 
         b = int(x_raw.shape[0])
         gate = None
+        snr_f = None
         gate_mode = str(self.raw_low_snr_drop_gate)
         if gate_mode == "eta":
             if eta_cond is not None:
@@ -1128,7 +1229,31 @@ class CLDNNAMC(nn.Module):
         if not bool(torch.any(gate)):
             return x_raw
 
-        apply_mask = gate & (torch.rand((b,), device=x_raw.device) < float(self.raw_low_snr_drop_prob))
+        # Optional SNR-shaped probability schedule:
+        #   snr <= split_lo  -> prob_lo
+        #   split_lo < snr <= split_mid -> prob_mid
+        #   snr > split_mid -> prob_hi
+        # Falls back to scalar raw_low_snr_drop_prob when schedule is disabled
+        # or SNR labels are unavailable.
+        if self.raw_low_snr_drop_schedule and snr_f is not None and snr_f.numel() == b:
+            p_lo = float(self.raw_low_snr_drop_prob_lo)
+            p_mid = float(self.raw_low_snr_drop_prob_mid)
+            p_hi = float(self.raw_low_snr_drop_prob_hi)
+            s_lo = float(self.raw_low_snr_drop_snr_lo)
+            s_mid = float(self.raw_low_snr_drop_snr_mid)
+            p_vec = torch.full((b,), p_hi, device=x_raw.device, dtype=x_raw.dtype)
+            p_vec = torch.where(snr_f <= s_mid, torch.full_like(p_vec, p_mid), p_vec)
+            p_vec = torch.where(snr_f <= s_lo, torch.full_like(p_vec, p_lo), p_vec)
+            p_vec = torch.clamp(p_vec, min=0.0, max=1.0)
+        else:
+            p_vec = torch.full(
+                (b,),
+                float(self.raw_low_snr_drop_prob),
+                device=x_raw.device,
+                dtype=x_raw.dtype,
+            )
+
+        apply_mask = gate & (torch.rand((b,), device=x_raw.device) < p_vec)
         if not bool(torch.any(apply_mask)):
             return x_raw
 
@@ -1294,9 +1419,32 @@ class CLDNNAMC(nn.Module):
         h = h.squeeze(2)  # (B, merge, L-4)  — channels-first for temporal_reduce
 
         # Expert feature branch: concatenate to main branch before temporal reduction
+        self._expert_gate_flat = None
         if self.use_expert and self.expert_extractor is not None:
             x_raw = x_flat[:, :2, :]
             h_expert = self.expert_extractor(x_raw)  # (B, expert_ch, L-4)
+            if self.expert_eta_gate:
+                eta_gate_in = None
+                if eta_pred_external is not None:
+                    eta_f = eta_pred_external.float().view(-1)
+                    if eta_f.numel() == b:
+                        eta_gate_in = eta_f
+                if eta_gate_in is None and snr_flat is not None:
+                    snr_f = snr_flat.float().view(-1)
+                    if snr_f.numel() == b:
+                        eta_gate_in = snr_db_to_eta(
+                            snr_f,
+                            eta_min=self.noise_eta_min,
+                            eta_max=self.noise_eta_max,
+                        )
+                if eta_gate_in is not None:
+                    tau = max(1e-6, float(self.expert_eta_gate_tau))
+                    gate = torch.sigmoid((eta_gate_in - float(self.expert_eta_gate_center)) / tau)
+                    gmin = float(self.expert_eta_gate_min)
+                    gmax = float(self.expert_eta_gate_max)
+                    gate = gmin + (gmax - gmin) * gate
+                    self._expert_gate_flat = gate
+                    h_expert = h_expert * gate.view(-1, 1, 1)
             h = torch.cat([h, h_expert], dim=1)       # (B, merge+expert_ch, L-4)
 
         # Temporal reduction (strided convs, channels-first)
@@ -1392,6 +1540,8 @@ class CLDNNAMC(nn.Module):
         # Append global cyclostationary stats to feature vector
         if self.use_expert and self.cyclo_stats is not None:
             global_stats = self.cyclo_stats(x_flat[:, :2, :])  # (B, 7)
+            if self._expert_gate_flat is not None:
+                global_stats = global_stats * self._expert_gate_flat.view(-1, 1)
             feat = torch.cat([feat, global_stats], dim=1)  # (B, D + 7)
 
         return feat, snr_pred
@@ -1467,6 +1617,11 @@ class CLDNNAMC(nn.Module):
                 self._eta_pred = torch.sum(eta_g * mask, dim=1) / denom.squeeze(-1)
             else:
                 self._eta_pred = None
+            if self._expert_gate_flat is not None:
+                eg_g = self._expert_gate_flat.view(b, group_size)
+                self._expert_gate = torch.sum(eg_g * mask, dim=1) / denom.squeeze(-1)
+            else:
+                self._expert_gate = None
             if self._x_dn_flat is not None:
                 xdn_g = self._x_dn_flat.view(
                     b, group_size, self._x_dn_flat.shape[1], self._x_dn_flat.shape[2]
@@ -1481,6 +1636,7 @@ class CLDNNAMC(nn.Module):
             feat = feat_flat
             snr_pred = snr_pred_flat
             self._eta_pred = self._eta_pred_flat
+            self._expert_gate = self._expert_gate_flat
             self._x_dn = self._x_dn_flat
 
         # Classifier head

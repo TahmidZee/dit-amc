@@ -5,7 +5,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -52,9 +52,11 @@ PRESETS = {
 def snr_path_degrade(
     x: torch.Tensor,
     snr_db: torch.Tensor,
-    delta_min: float = 2.0,
-    delta_max: float = 8.0,
+    delta_min: Union[float, torch.Tensor] = 2.0,
+    delta_max: Union[float, torch.Tensor] = 8.0,
     snr_floor: float = -20.0,
+    snr_target_min: Optional[float] = None,
+    snr_target_max: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Create a harder view of each sample by adding calibrated AWGN to reduce
@@ -77,16 +79,43 @@ def snr_path_degrade(
     device = x.device
     B = snr_db.shape[0]
 
-    # Sample random Δ per sample
-    delta = torch.empty(B, device=device).uniform_(delta_min, delta_max)
+    snr_db_f = snr_db.float()
+    if isinstance(delta_min, torch.Tensor):
+        dmin = delta_min.to(device=device, dtype=snr_db_f.dtype).view(-1)
+    else:
+        dmin = torch.full((B,), float(delta_min), device=device, dtype=snr_db_f.dtype)
+    if isinstance(delta_max, torch.Tensor):
+        dmax = delta_max.to(device=device, dtype=snr_db_f.dtype).view(-1)
+    else:
+        dmax = torch.full((B,), float(delta_max), device=device, dtype=snr_db_f.dtype)
+    if dmin.numel() != B or dmax.numel() != B:
+        raise ValueError(f"delta_min/delta_max must broadcast to batch size {B}.")
+    dmax = torch.maximum(dmax, dmin)
 
-    # Clamp so we don't go below the dataset's minimum SNR
-    snr_new = torch.clamp(snr_db.float() - delta, min=float(snr_floor))
+    # Sample random Δ per sample
+    delta = dmin + (dmax - dmin) * torch.rand((B,), device=device, dtype=snr_db_f.dtype)
+
+    # Optional targeted sampling: sample new SNR directly from an allowed range,
+    # then infer delta.  Falls back to delta-based degradation when infeasible.
+    if snr_target_min is not None or snr_target_max is not None:
+        tmin = float(snr_target_min) if snr_target_min is not None else -1e9
+        tmax = float(snr_target_max) if snr_target_max is not None else 1e9
+        low = torch.maximum(snr_db_f - dmax, torch.full_like(snr_db_f, max(float(snr_floor), tmin)))
+        high = torch.minimum(snr_db_f - dmin, torch.full_like(snr_db_f, tmax))
+        span = torch.clamp(high - low, min=0.0)
+        snr_new_target = low + span * torch.rand((B,), device=device, dtype=snr_db_f.dtype)
+        snr_new_fallback = torch.clamp(snr_db_f - delta, min=float(snr_floor))
+        feasible = high > low
+        snr_new = torch.where(feasible, snr_new_target, snr_new_fallback)
+    else:
+        # Clamp so we don't go below the dataset's minimum SNR
+        snr_new = torch.clamp(snr_db_f - delta, min=float(snr_floor))
+
     delta_actual = snr_db.float() - snr_new  # may be less than requested if clamped
 
     # Convert SNR from dB to linear scale
     # SNR_linear = 10^(SNR_dB / 10)
-    snr_orig_lin = 10.0 ** (snr_db.float() / 10.0)
+    snr_orig_lin = 10.0 ** (snr_db_f / 10.0)
     snr_new_lin = 10.0 ** (snr_new / 10.0)
 
     # ---------------------------------------------------------------
@@ -751,6 +780,36 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Maximum multiplicative raw-branch scale for gated samples.",
     )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-prob-lo",
+        type=float,
+        default=-1.0,
+        help="Optional SNR-shaped schedule: drop probability when SNR <= --cldnn-raw-low-snr-drop-snr-lo (set all lo/mid/hi >=0 to enable).",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-prob-mid",
+        type=float,
+        default=-1.0,
+        help="Optional SNR-shaped schedule: drop probability for --cldnn-raw-low-snr-drop-snr-lo < SNR <= --cldnn-raw-low-snr-drop-snr-mid.",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-prob-hi",
+        type=float,
+        default=-1.0,
+        help="Optional SNR-shaped schedule: drop probability when SNR > --cldnn-raw-low-snr-drop-snr-mid.",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-snr-lo",
+        type=float,
+        default=-10.0,
+        help="Lower SNR split (dB) for SNR-shaped raw-drop schedule.",
+    )
+    parser.add_argument(
+        "--cldnn-raw-low-snr-drop-snr-mid",
+        type=float,
+        default=-6.0,
+        help="Middle SNR split (dB) for SNR-shaped raw-drop schedule.",
+    )
     parser.add_argument("--cldnn-denoiser-base-ch", type=int, default=32, help="Base channels for the denoiser U-Net.")
     parser.add_argument("--cldnn-denoiser-dropout", type=float, default=0.0, help="Dropout inside denoiser residual blocks.")
     parser.add_argument("--cldnn-denoiser-soft-hi-blend", action="store_true", help="Enable soft high-SNR residual suppression in denoiser.")
@@ -770,6 +829,26 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Short-time ACF smoothing window for expert features (0/1 disables, odd windows recommended: 5/9/13).",
     )
+    parser.add_argument(
+        "--cldnn-expert-v2",
+        action="store_true",
+        help="Enable expert-v2 map: normalized local correlations (Re/Im/|r_k|) + stable phase-diff (no atan2).",
+    )
+    parser.add_argument(
+        "--cldnn-expert-corr-eps",
+        type=float,
+        default=1e-6,
+        help="Epsilon for normalized local-correlation expert features (v2).",
+    )
+    parser.add_argument(
+        "--cldnn-expert-eta-gate",
+        action="store_true",
+        help="Gate expert branch by eta (predicted noise level) so expert contribution is low at high SNR and high at low SNR.",
+    )
+    parser.add_argument("--cldnn-expert-eta-gate-center", type=float, default=0.8, help="eta center for expert gate sigmoid (gate ~0.5 here).")
+    parser.add_argument("--cldnn-expert-eta-gate-tau", type=float, default=0.7, help="Temperature/softness for expert eta gate sigmoid.")
+    parser.add_argument("--cldnn-expert-eta-gate-min", type=float, default=0.0, help="Minimum expert gate scale.")
+    parser.add_argument("--cldnn-expert-eta-gate-max", type=float, default=1.0, help="Maximum expert gate scale.")
     parser.add_argument(
         "--cldnn-cyclo-stats",
         dest="cldnn_cyclo_stats",
@@ -843,6 +922,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snr-consist-delta-max", type=float, default=8.0, help="Maximum SNR degradation in dB for consistency view.")
     parser.add_argument("--snr-consist-temp", type=float, default=2.0, help="Temperature for consistency soft targets (higher = softer).")
     parser.add_argument("--snr-consist-warmup", type=int, default=5, help="Number of epochs before consistency loss kicks in (let CE stabilize first).")
+    parser.add_argument(
+        "--snr-consist-adaptive-delta",
+        action="store_true",
+        help="Use smaller degradation deltas for lower-SNR anchors to keep consistency pairs learnable.",
+    )
+    parser.add_argument(
+        "--snr-consist-low-snr-thresh",
+        type=float,
+        default=-6.0,
+        help="Samples with SNR <= this threshold use low-SNR delta range when --snr-consist-adaptive-delta is enabled.",
+    )
+    parser.add_argument(
+        "--snr-consist-low-delta-min",
+        type=float,
+        default=2.0,
+        help="Minimum consistency degradation delta (dB) for low-SNR samples when adaptive delta is enabled.",
+    )
+    parser.add_argument(
+        "--snr-consist-low-delta-max",
+        type=float,
+        default=4.0,
+        help="Maximum consistency degradation delta (dB) for low-SNR samples when adaptive delta is enabled.",
+    )
     parser.add_argument(
         "--snr-consist-ramp",
         type=int,
@@ -963,6 +1065,60 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Linear ramp epochs for lambda-feat after Stage-A start point (0 = no ramp).",
+    )
+    parser.add_argument(
+        "--dn-pair-delta-min",
+        type=float,
+        default=2.0,
+        help="Minimum SNR degradation (dB) for denoiser paired losses (L_dn/L_feat).",
+    )
+    parser.add_argument(
+        "--dn-pair-delta-max",
+        type=float,
+        default=8.0,
+        help="Maximum SNR degradation (dB) for denoiser paired losses (L_dn/L_feat).",
+    )
+    parser.add_argument(
+        "--dn-pair-snr-floor-db",
+        type=float,
+        default=None,
+        help="Minimum degraded SNR (dB) for denoiser paired losses. Default: dataset minimum SNR.",
+    )
+    parser.add_argument(
+        "--dn-pair-snr-new-lo",
+        type=float,
+        default=-999.0,
+        help="Optional lower bound for degraded-view SNR in denoiser paired losses (set > -900 to enable).",
+    )
+    parser.add_argument(
+        "--dn-pair-snr-new-hi",
+        type=float,
+        default=999.0,
+        help="Optional upper bound for degraded-view SNR in denoiser paired losses (set < 900 to enable).",
+    )
+    parser.add_argument(
+        "--lfeat-snr-lo",
+        type=float,
+        default=-999.0,
+        help="Optional source-SNR lower bound for applying L_feat (set > -900 to enable).",
+    )
+    parser.add_argument(
+        "--lfeat-snr-hi",
+        type=float,
+        default=999.0,
+        help="Optional source-SNR upper bound for applying L_feat (set < 900 to enable).",
+    )
+    parser.add_argument(
+        "--lfeat-snr-new-lo",
+        type=float,
+        default=-999.0,
+        help="Optional degraded-SNR lower bound for applying L_feat (set > -900 to enable).",
+    )
+    parser.add_argument(
+        "--lfeat-snr-new-hi",
+        type=float,
+        default=999.0,
+        help="Optional degraded-SNR upper bound for applying L_feat (set < 900 to enable).",
     )
     parser.add_argument(
         "--feat-encoder-ckpt",
@@ -1547,6 +1703,16 @@ def train(args: argparse.Namespace) -> None:
     raw_drop_min = float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0))
     raw_drop_max = float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0))
     raw_drop_gate = str(getattr(args, "cldnn_raw_low_snr_drop_gate", "auto")).strip().lower()
+    raw_prob_lo = float(getattr(args, "cldnn_raw_low_snr_drop_prob_lo", -1.0))
+    raw_prob_mid = float(getattr(args, "cldnn_raw_low_snr_drop_prob_mid", -1.0))
+    raw_prob_hi = float(getattr(args, "cldnn_raw_low_snr_drop_prob_hi", -1.0))
+    raw_sched_enabled = raw_prob_lo >= 0.0 and raw_prob_mid >= 0.0 and raw_prob_hi >= 0.0
+    if (raw_prob_lo >= 0.0) or (raw_prob_mid >= 0.0) or (raw_prob_hi >= 0.0):
+        if not raw_sched_enabled:
+            raise ValueError(
+                "Enable SNR-shaped raw-drop schedule by setting all of "
+                "cldnn_raw_low_snr_drop_prob_lo/mid/hi >= 0."
+            )
     if raw_drop_prob < 0.0 or raw_drop_prob > 1.0:
         raise ValueError("cldnn_raw_low_snr_drop_prob must be in [0,1].")
     if raw_drop_gate not in {"auto", "eta", "snr"}:
@@ -1557,8 +1723,26 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("cldnn_raw_low_snr_drop_max_scale must be >= cldnn_raw_low_snr_drop_min_scale.")
     if raw_drop_prob > 0.0 and not bool(getattr(args, "cldnn_denoiser_dual_path", False)):
         raise ValueError("--cldnn-raw-low-snr-drop-prob requires --cldnn-denoiser-dual-path.")
+    if raw_sched_enabled and not bool(getattr(args, "cldnn_denoiser_dual_path", False)):
+        raise ValueError("SNR-shaped raw-drop schedule requires --cldnn-denoiser-dual-path.")
+    if raw_sched_enabled:
+        for p in (raw_prob_lo, raw_prob_mid, raw_prob_hi):
+            if p < 0.0 or p > 1.0:
+                raise ValueError("cldnn_raw_low_snr_drop_prob_lo/mid/hi must be in [0,1] when schedule is enabled.")
+        if float(getattr(args, "cldnn_raw_low_snr_drop_snr_lo", -10.0)) > float(getattr(args, "cldnn_raw_low_snr_drop_snr_mid", -6.0)):
+            raise ValueError("cldnn_raw_low_snr_drop_snr_lo must be <= cldnn_raw_low_snr_drop_snr_mid.")
     if int(getattr(args, "cldnn_expert_stacf_win", 0)) < 0:
         raise ValueError("cldnn_expert_stacf_win must be >= 0.")
+    if float(getattr(args, "cldnn_expert_corr_eps", 1e-6)) <= 0.0:
+        raise ValueError("cldnn_expert_corr_eps must be > 0.")
+    if float(getattr(args, "cldnn_expert_eta_gate_tau", 0.7)) <= 0.0:
+        raise ValueError("cldnn_expert_eta_gate_tau must be > 0.")
+    eg_min = float(getattr(args, "cldnn_expert_eta_gate_min", 0.0))
+    eg_max = float(getattr(args, "cldnn_expert_eta_gate_max", 1.0))
+    if eg_min < 0.0 or eg_max < 0.0 or eg_min > 1.0 or eg_max > 1.0 or eg_max < eg_min:
+        raise ValueError("cldnn_expert_eta_gate_min/max must be in [0,1] and max >= min.")
+    if bool(getattr(args, "cldnn_expert_eta_gate", False)) and not bool(getattr(args, "cldnn_expert_features", False)):
+        raise ValueError("--cldnn-expert-eta-gate requires --cldnn-expert-features.")
     if int(getattr(args, "stage_a_epochs", 0)) < 0 or int(getattr(args, "stage_b_epochs", 0)) < 0:
         raise ValueError("stage_a_epochs and stage_b_epochs must be >= 0.")
     if int(getattr(args, "feat_ramp_epochs", 0)) < 0:
@@ -1571,6 +1755,20 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("noise_rho_min must be < noise_rho_max.")
     if float(getattr(args, "noise_eta_min", -8.0)) >= float(getattr(args, "noise_eta_max", 5.5)):
         raise ValueError("noise_eta_min must be < noise_eta_max.")
+    if float(getattr(args, "dn_pair_delta_min", 2.0)) < 0.0 or float(getattr(args, "dn_pair_delta_max", 8.0)) < 0.0:
+        raise ValueError("dn_pair_delta_min/max must be >= 0.")
+    if float(getattr(args, "dn_pair_delta_max", 8.0)) < float(getattr(args, "dn_pair_delta_min", 2.0)):
+        raise ValueError("dn_pair_delta_max must be >= dn_pair_delta_min.")
+    if float(getattr(args, "lfeat_snr_lo", -999.0)) > float(getattr(args, "lfeat_snr_hi", 999.0)):
+        raise ValueError("lfeat_snr_lo must be <= lfeat_snr_hi.")
+    if float(getattr(args, "lfeat_snr_new_lo", -999.0)) > float(getattr(args, "lfeat_snr_new_hi", 999.0)):
+        raise ValueError("lfeat_snr_new_lo must be <= lfeat_snr_new_hi.")
+    if float(getattr(args, "dn_pair_snr_new_lo", -999.0)) > float(getattr(args, "dn_pair_snr_new_hi", 999.0)):
+        raise ValueError("dn_pair_snr_new_lo must be <= dn_pair_snr_new_hi.")
+    if float(getattr(args, "snr_consist_low_delta_min", 2.0)) < 0.0 or float(getattr(args, "snr_consist_low_delta_max", 4.0)) < 0.0:
+        raise ValueError("snr_consist_low_delta_min/max must be >= 0.")
+    if float(getattr(args, "snr_consist_low_delta_max", 4.0)) < float(getattr(args, "snr_consist_low_delta_min", 2.0)):
+        raise ValueError("snr_consist_low_delta_max must be >= snr_consist_low_delta_min.")
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1668,6 +1866,13 @@ def train(args: argparse.Namespace) -> None:
             expert_features=bool(getattr(args, 'cldnn_expert_features', False)),
             expert_channels=int(getattr(args, 'cldnn_expert_ch', 64)),
             expert_stacf_window=int(getattr(args, "cldnn_expert_stacf_win", 0)),
+            expert_v2=bool(getattr(args, "cldnn_expert_v2", False)),
+            expert_corr_norm_eps=float(getattr(args, "cldnn_expert_corr_eps", 1e-6)),
+            expert_eta_gate=bool(getattr(args, "cldnn_expert_eta_gate", False)),
+            expert_eta_gate_center=float(getattr(args, "cldnn_expert_eta_gate_center", 0.8)),
+            expert_eta_gate_tau=float(getattr(args, "cldnn_expert_eta_gate_tau", 0.7)),
+            expert_eta_gate_min=float(getattr(args, "cldnn_expert_eta_gate_min", 0.0)),
+            expert_eta_gate_max=float(getattr(args, "cldnn_expert_eta_gate_max", 1.0)),
             expert_use_cyclo_stats=bool(getattr(args, "cldnn_cyclo_stats", True)),
             raw_low_snr_drop_prob=float(getattr(args, "cldnn_raw_low_snr_drop_prob", 0.0)),
             raw_low_snr_drop_gate=str(getattr(args, "cldnn_raw_low_snr_drop_gate", "auto")),
@@ -1675,6 +1880,11 @@ def train(args: argparse.Namespace) -> None:
             raw_low_snr_drop_snr_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_snr_thresh", -6.0)),
             raw_low_snr_drop_min_scale=float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0)),
             raw_low_snr_drop_max_scale=float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0)),
+            raw_low_snr_drop_prob_lo=float(getattr(args, "cldnn_raw_low_snr_drop_prob_lo", -1.0)),
+            raw_low_snr_drop_prob_mid=float(getattr(args, "cldnn_raw_low_snr_drop_prob_mid", -1.0)),
+            raw_low_snr_drop_prob_hi=float(getattr(args, "cldnn_raw_low_snr_drop_prob_hi", -1.0)),
+            raw_low_snr_drop_snr_lo=float(getattr(args, "cldnn_raw_low_snr_drop_snr_lo", -10.0)),
+            raw_low_snr_drop_snr_mid=float(getattr(args, "cldnn_raw_low_snr_drop_snr_mid", -6.0)),
             cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
@@ -1762,6 +1972,13 @@ def train(args: argparse.Namespace) -> None:
                 expert_features=bool(getattr(args, "cldnn_expert_features", False)),
                 expert_channels=int(getattr(args, "cldnn_expert_ch", 64)),
                 expert_stacf_window=int(getattr(args, "cldnn_expert_stacf_win", 0)),
+                expert_v2=bool(getattr(args, "cldnn_expert_v2", False)),
+                expert_corr_norm_eps=float(getattr(args, "cldnn_expert_corr_eps", 1e-6)),
+                expert_eta_gate=bool(getattr(args, "cldnn_expert_eta_gate", False)),
+                expert_eta_gate_center=float(getattr(args, "cldnn_expert_eta_gate_center", 0.8)),
+                expert_eta_gate_tau=float(getattr(args, "cldnn_expert_eta_gate_tau", 0.7)),
+                expert_eta_gate_min=float(getattr(args, "cldnn_expert_eta_gate_min", 0.0)),
+                expert_eta_gate_max=float(getattr(args, "cldnn_expert_eta_gate_max", 1.0)),
                 expert_use_cyclo_stats=bool(getattr(args, "cldnn_cyclo_stats", True)),
                 raw_low_snr_drop_prob=float(getattr(args, "cldnn_raw_low_snr_drop_prob", 0.0)),
                 raw_low_snr_drop_gate=str(getattr(args, "cldnn_raw_low_snr_drop_gate", "auto")),
@@ -1769,6 +1986,11 @@ def train(args: argparse.Namespace) -> None:
                 raw_low_snr_drop_snr_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_snr_thresh", -6.0)),
                 raw_low_snr_drop_min_scale=float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0)),
                 raw_low_snr_drop_max_scale=float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0)),
+                raw_low_snr_drop_prob_lo=float(getattr(args, "cldnn_raw_low_snr_drop_prob_lo", -1.0)),
+                raw_low_snr_drop_prob_mid=float(getattr(args, "cldnn_raw_low_snr_drop_prob_mid", -1.0)),
+                raw_low_snr_drop_prob_hi=float(getattr(args, "cldnn_raw_low_snr_drop_prob_hi", -1.0)),
+                raw_low_snr_drop_snr_lo=float(getattr(args, "cldnn_raw_low_snr_drop_snr_lo", -10.0)),
+                raw_low_snr_drop_snr_mid=float(getattr(args, "cldnn_raw_low_snr_drop_snr_mid", -6.0)),
                 cls_hidden=int(getattr(args, "cldnn_cls_hidden", 0)),
                 supcon_proj_dim=int(getattr(args, "supcon_proj_dim", 0)) if getattr(args, "supcon", False) else 0,
             ).to(device)
@@ -1954,6 +2176,7 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         epoch_loss = 0.0
         epoch_loss_feat = 0.0
+        epoch_lfeat_active = 0.0
         epoch_correct = 0
         epoch_total = 0
         start_time = time.time()
@@ -2075,6 +2298,7 @@ def train(args: argparse.Namespace) -> None:
             logits_teacher_base = None
             eta_pred_for_noise = None
             loss_feat = torch.tensor(0.0, device=device)
+            lfeat_active_frac_batch = torch.tensor(0.0, device=device)
             if amp_enabled:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
                     if args.arch == "dit":
@@ -2179,12 +2403,25 @@ def train(args: argparse.Namespace) -> None:
                         else:
                             x_dn_ref = x_aux
                             snr_dn_ref = snr_aux
+                        dn_pair_delta_min = float(getattr(args, "dn_pair_delta_min", 2.0))
+                        dn_pair_delta_max = float(getattr(args, "dn_pair_delta_max", 8.0))
+                        dn_pair_snr_floor = (
+                            float(getattr(args, "dn_pair_snr_floor_db"))
+                            if getattr(args, "dn_pair_snr_floor_db", None) is not None
+                            else float(snr_min_db)
+                        )
+                        dn_pair_snr_new_lo_raw = float(getattr(args, "dn_pair_snr_new_lo", -999.0))
+                        dn_pair_snr_new_hi_raw = float(getattr(args, "dn_pair_snr_new_hi", 999.0))
+                        dn_pair_snr_new_lo = dn_pair_snr_new_lo_raw if dn_pair_snr_new_lo_raw > -900.0 else None
+                        dn_pair_snr_new_hi = dn_pair_snr_new_hi_raw if dn_pair_snr_new_hi_raw < 900.0 else None
                         x_low_dn, delta_dn = snr_path_degrade(
                             x_dn_ref,
                             snr_dn_ref,
-                            delta_min=float(getattr(args, "snr_consist_delta_min", 2.0)),
-                            delta_max=float(getattr(args, "snr_consist_delta_max", 8.0)),
-                            snr_floor=float(snr_min_db),
+                            delta_min=dn_pair_delta_min,
+                            delta_max=dn_pair_delta_max,
+                            snr_floor=dn_pair_snr_floor,
+                            snr_target_min=dn_pair_snr_new_lo,
+                            snr_target_max=dn_pair_snr_new_hi,
                         )
                         snr_new_dn = snr_dn_ref.float() - delta_dn.float()
                         snr_for_low = snr_new_dn if args.snr_mode == "known" else None
@@ -2213,7 +2450,24 @@ def train(args: argparse.Namespace) -> None:
                             with torch.autocast(device_type="cuda", enabled=False):
                                 feat_pred = model.early_features(feat_in_pred)
                                 feat_tgt = model.early_features(feat_in_tgt).detach()
-                                loss_feat = torch.mean(torch.abs(feat_pred - feat_tgt))
+                                feat_vec = torch.mean(torch.abs(feat_pred - feat_tgt), dim=1)
+                                lfeat_mask = torch.ones_like(snr_dn_ref.float())
+                                lfeat_src_lo = float(getattr(args, "lfeat_snr_lo", -999.0))
+                                lfeat_src_hi = float(getattr(args, "lfeat_snr_hi", 999.0))
+                                if lfeat_src_lo > -900.0 or lfeat_src_hi < 900.0:
+                                    lfeat_mask = lfeat_mask * (
+                                        (snr_dn_ref.float() >= lfeat_src_lo)
+                                        & (snr_dn_ref.float() <= lfeat_src_hi)
+                                    ).float()
+                                lfeat_new_lo = float(getattr(args, "lfeat_snr_new_lo", -999.0))
+                                lfeat_new_hi = float(getattr(args, "lfeat_snr_new_hi", 999.0))
+                                if lfeat_new_lo > -900.0 or lfeat_new_hi < 900.0:
+                                    lfeat_mask = lfeat_mask * (
+                                        (snr_new_dn.float() >= lfeat_new_lo)
+                                        & (snr_new_dn.float() <= lfeat_new_hi)
+                                    ).float()
+                                loss_feat = (feat_vec * lfeat_mask).sum() / torch.clamp(lfeat_mask.sum(), min=1.0)
+                                lfeat_active_frac_batch = lfeat_mask.mean()
                         loss = (
                             loss
                             + float(getattr(args, "lambda_dn", 0.0)) * loss_dn
@@ -2266,10 +2520,29 @@ def train(args: argparse.Namespace) -> None:
                             if was_training:
                                 model.train()
 
+                        consist_delta_min: Union[float, torch.Tensor] = float(getattr(args, "snr_consist_delta_min", 2.0))
+                        consist_delta_max: Union[float, torch.Tensor] = float(getattr(args, "snr_consist_delta_max", 8.0))
+                        if bool(getattr(args, "snr_consist_adaptive_delta", False)):
+                            s_aux = snr_aux.float()
+                            dmin_t = torch.full_like(s_aux, float(getattr(args, "snr_consist_delta_min", 2.0)))
+                            dmax_t = torch.full_like(s_aux, float(getattr(args, "snr_consist_delta_max", 8.0)))
+                            low_mask = s_aux <= float(getattr(args, "snr_consist_low_snr_thresh", -6.0))
+                            dmin_t = torch.where(
+                                low_mask,
+                                torch.full_like(dmin_t, float(getattr(args, "snr_consist_low_delta_min", 2.0))),
+                                dmin_t,
+                            )
+                            dmax_t = torch.where(
+                                low_mask,
+                                torch.full_like(dmax_t, float(getattr(args, "snr_consist_low_delta_max", 4.0))),
+                                dmax_t,
+                            )
+                            consist_delta_min = dmin_t
+                            consist_delta_max = dmax_t
                         x_low, _delta = snr_path_degrade(
                             x_aux, snr_aux,
-                            delta_min=float(getattr(args, "snr_consist_delta_min", 2.0)),
-                            delta_max=float(getattr(args, "snr_consist_delta_max", 8.0)),
+                            delta_min=consist_delta_min,
+                            delta_max=consist_delta_max,
                             snr_floor=float(snr_min_db),
                         )
                         snr_new = snr_aux.float() - _delta.float()
@@ -2404,12 +2677,25 @@ def train(args: argparse.Namespace) -> None:
                     else:
                         x_dn_ref = x_aux
                         snr_dn_ref = snr_aux
+                    dn_pair_delta_min = float(getattr(args, "dn_pair_delta_min", 2.0))
+                    dn_pair_delta_max = float(getattr(args, "dn_pair_delta_max", 8.0))
+                    dn_pair_snr_floor = (
+                        float(getattr(args, "dn_pair_snr_floor_db"))
+                        if getattr(args, "dn_pair_snr_floor_db", None) is not None
+                        else float(snr_min_db)
+                    )
+                    dn_pair_snr_new_lo_raw = float(getattr(args, "dn_pair_snr_new_lo", -999.0))
+                    dn_pair_snr_new_hi_raw = float(getattr(args, "dn_pair_snr_new_hi", 999.0))
+                    dn_pair_snr_new_lo = dn_pair_snr_new_lo_raw if dn_pair_snr_new_lo_raw > -900.0 else None
+                    dn_pair_snr_new_hi = dn_pair_snr_new_hi_raw if dn_pair_snr_new_hi_raw < 900.0 else None
                     x_low_dn, delta_dn = snr_path_degrade(
                         x_dn_ref,
                         snr_dn_ref,
-                        delta_min=float(getattr(args, "snr_consist_delta_min", 2.0)),
-                        delta_max=float(getattr(args, "snr_consist_delta_max", 8.0)),
-                        snr_floor=float(snr_min_db),
+                        delta_min=dn_pair_delta_min,
+                        delta_max=dn_pair_delta_max,
+                        snr_floor=dn_pair_snr_floor,
+                        snr_target_min=dn_pair_snr_new_lo,
+                        snr_target_max=dn_pair_snr_new_hi,
                     )
                     snr_new_dn = snr_dn_ref.float() - delta_dn.float()
                     snr_for_low = snr_new_dn if args.snr_mode == "known" else None
@@ -2437,7 +2723,24 @@ def train(args: argparse.Namespace) -> None:
                             feat_in_tgt = x_dn_ref.float()
                         feat_pred = model.early_features(feat_in_pred)
                         feat_tgt = model.early_features(feat_in_tgt).detach()
-                        loss_feat = torch.mean(torch.abs(feat_pred - feat_tgt))
+                        feat_vec = torch.mean(torch.abs(feat_pred - feat_tgt), dim=1)
+                        lfeat_mask = torch.ones_like(snr_dn_ref.float())
+                        lfeat_src_lo = float(getattr(args, "lfeat_snr_lo", -999.0))
+                        lfeat_src_hi = float(getattr(args, "lfeat_snr_hi", 999.0))
+                        if lfeat_src_lo > -900.0 or lfeat_src_hi < 900.0:
+                            lfeat_mask = lfeat_mask * (
+                                (snr_dn_ref.float() >= lfeat_src_lo)
+                                & (snr_dn_ref.float() <= lfeat_src_hi)
+                            ).float()
+                        lfeat_new_lo = float(getattr(args, "lfeat_snr_new_lo", -999.0))
+                        lfeat_new_hi = float(getattr(args, "lfeat_snr_new_hi", 999.0))
+                        if lfeat_new_lo > -900.0 or lfeat_new_hi < 900.0:
+                            lfeat_mask = lfeat_mask * (
+                                (snr_new_dn.float() >= lfeat_new_lo)
+                                & (snr_new_dn.float() <= lfeat_new_hi)
+                            ).float()
+                        loss_feat = (feat_vec * lfeat_mask).sum() / torch.clamp(lfeat_mask.sum(), min=1.0)
+                        lfeat_active_frac_batch = lfeat_mask.mean()
                     loss = (
                         loss
                         + float(getattr(args, "lambda_dn", 0.0)) * loss_dn
@@ -2489,10 +2792,29 @@ def train(args: argparse.Namespace) -> None:
                         if was_training:
                             model.train()
 
+                    consist_delta_min: Union[float, torch.Tensor] = float(getattr(args, "snr_consist_delta_min", 2.0))
+                    consist_delta_max: Union[float, torch.Tensor] = float(getattr(args, "snr_consist_delta_max", 8.0))
+                    if bool(getattr(args, "snr_consist_adaptive_delta", False)):
+                        s_aux = snr_aux.float()
+                        dmin_t = torch.full_like(s_aux, float(getattr(args, "snr_consist_delta_min", 2.0)))
+                        dmax_t = torch.full_like(s_aux, float(getattr(args, "snr_consist_delta_max", 8.0)))
+                        low_mask = s_aux <= float(getattr(args, "snr_consist_low_snr_thresh", -6.0))
+                        dmin_t = torch.where(
+                            low_mask,
+                            torch.full_like(dmin_t, float(getattr(args, "snr_consist_low_delta_min", 2.0))),
+                            dmin_t,
+                        )
+                        dmax_t = torch.where(
+                            low_mask,
+                            torch.full_like(dmax_t, float(getattr(args, "snr_consist_low_delta_max", 4.0))),
+                            dmax_t,
+                        )
+                        consist_delta_min = dmin_t
+                        consist_delta_max = dmax_t
                     x_low, _delta = snr_path_degrade(
                         x_aux, snr_aux,
-                        delta_min=float(getattr(args, "snr_consist_delta_min", 2.0)),
-                        delta_max=float(getattr(args, "snr_consist_delta_max", 8.0)),
+                        delta_min=consist_delta_min,
+                        delta_max=consist_delta_max,
                         snr_floor=float(snr_min_db),
                     )
                     snr_new = snr_aux.float() - _delta.float()
@@ -2547,6 +2869,7 @@ def train(args: argparse.Namespace) -> None:
             batch_size = x_clean.shape[0]
             epoch_loss += loss.item() * batch_size
             epoch_loss_feat += float(loss_feat.detach().item()) * batch_size
+            epoch_lfeat_active += float(lfeat_active_frac_batch.detach().item()) * batch_size
             epoch_correct += (logits_for_acc_batch.argmax(dim=1) == y).sum().item()
             epoch_total += batch_size
             if epoch_total > 0:
@@ -2558,6 +2881,7 @@ def train(args: argparse.Namespace) -> None:
 
         train_loss = epoch_loss / max(1, epoch_total)
         train_loss_feat = epoch_loss_feat / max(1, epoch_total)
+        train_lfeat_active_frac = epoch_lfeat_active / max(1, epoch_total)
         train_acc = epoch_correct / max(1, epoch_total)
         train_acc_clean = None
         if train_eval_loader is not None:
@@ -2641,6 +2965,7 @@ def train(args: argparse.Namespace) -> None:
             "lambda_id": float(getattr(args, "lambda_id", 0.0)),
             "lambda_feat": float(lambda_feat),
             "train_loss_feat": float(train_loss_feat),
+            "train_lfeat_active_frac": float(train_lfeat_active_frac),
             "cls2dn_scale": float(cls2dn_scale),
             "p_clean": p_clean,
             "t_schedule": args.t_schedule,
@@ -2830,6 +3155,13 @@ def run_eval(args: argparse.Namespace) -> None:
             expert_features=bool(getattr(args, 'cldnn_expert_features', False)),
             expert_channels=int(getattr(args, 'cldnn_expert_ch', 64)),
             expert_stacf_window=int(getattr(args, "cldnn_expert_stacf_win", 0)),
+            expert_v2=bool(getattr(args, "cldnn_expert_v2", False)),
+            expert_corr_norm_eps=float(getattr(args, "cldnn_expert_corr_eps", 1e-6)),
+            expert_eta_gate=bool(getattr(args, "cldnn_expert_eta_gate", False)),
+            expert_eta_gate_center=float(getattr(args, "cldnn_expert_eta_gate_center", 0.8)),
+            expert_eta_gate_tau=float(getattr(args, "cldnn_expert_eta_gate_tau", 0.7)),
+            expert_eta_gate_min=float(getattr(args, "cldnn_expert_eta_gate_min", 0.0)),
+            expert_eta_gate_max=float(getattr(args, "cldnn_expert_eta_gate_max", 1.0)),
             expert_use_cyclo_stats=bool(getattr(args, "cldnn_cyclo_stats", True)),
             raw_low_snr_drop_prob=float(getattr(args, "cldnn_raw_low_snr_drop_prob", 0.0)),
             raw_low_snr_drop_gate=str(getattr(args, "cldnn_raw_low_snr_drop_gate", "auto")),
@@ -2837,6 +3169,11 @@ def run_eval(args: argparse.Namespace) -> None:
             raw_low_snr_drop_snr_thresh=float(getattr(args, "cldnn_raw_low_snr_drop_snr_thresh", -6.0)),
             raw_low_snr_drop_min_scale=float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0)),
             raw_low_snr_drop_max_scale=float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0)),
+            raw_low_snr_drop_prob_lo=float(getattr(args, "cldnn_raw_low_snr_drop_prob_lo", -1.0)),
+            raw_low_snr_drop_prob_mid=float(getattr(args, "cldnn_raw_low_snr_drop_prob_mid", -1.0)),
+            raw_low_snr_drop_prob_hi=float(getattr(args, "cldnn_raw_low_snr_drop_prob_hi", -1.0)),
+            raw_low_snr_drop_snr_lo=float(getattr(args, "cldnn_raw_low_snr_drop_snr_lo", -10.0)),
+            raw_low_snr_drop_snr_mid=float(getattr(args, "cldnn_raw_low_snr_drop_snr_mid", -6.0)),
             cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
