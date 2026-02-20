@@ -853,6 +853,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional SNR-shaped schedule: drop probability when SNR > --cldnn-raw-low-snr-drop-snr-mid.",
     )
     parser.add_argument(
+        "--cldnn-raw-low-snr-drop-zero-hi",
+        action="store_true",
+        help="Force high-SNR raw-drop probability to 0.0 in SNR-shaped schedule (recommended to prevent high-SNR leakage).",
+    )
+    parser.add_argument(
         "--cldnn-raw-low-snr-drop-snr-lo",
         type=float,
         default=-10.0,
@@ -1025,6 +1030,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kd-conf-thresh", type=float, default=0.0, help="Minimum teacher confidence to apply KD (0 = disabled).")
     parser.add_argument("--kd-snr-lo", type=float, default=-999.0, help="Lower SNR bound for KD (low-band KD when set, e.g. -14).")
     parser.add_argument("--kd-snr-hi", type=float, default=999.0, help="Upper SNR bound for KD (low-band KD when set, e.g. -6).")
+    parser.add_argument(
+        "--kd-hi-preserve-scale",
+        type=float,
+        default=0.0,
+        help="Relative high-SNR KD weight. Effective high-band KD weight = lambda_kd * kd_hi_preserve_scale.",
+    )
+    parser.add_argument(
+        "--kd-hi-snr-lo",
+        type=float,
+        default=10.0,
+        help="Lower SNR bound for optional high-band KD preservation mask.",
+    )
+    parser.add_argument(
+        "--kd-hi-snr-hi",
+        type=float,
+        default=18.0,
+        help="Upper SNR bound for optional high-band KD preservation mask.",
+    )
+    parser.add_argument(
+        "--kd-hi-conf-thresh",
+        type=float,
+        default=-1.0,
+        help="Optional confidence threshold for high-band KD. If <0, reuses --kd-conf-thresh.",
+    )
     parser.add_argument(
         "--kd-teacher-snr-mode",
         type=str,
@@ -1210,6 +1239,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snr-mode", type=str, choices=["predict", "known", "none"], default="predict")
     parser.add_argument("--snr-scale", type=float, default=20.0)
     parser.add_argument("--t-eval", type=int, default=0)
+    parser.add_argument("--report-low-snr-lo", type=float, default=-14.0, help="Lower SNR bound (dB) for reporting low-band macro metrics.")
+    parser.add_argument("--report-low-snr-hi", type=float, default=-6.0, help="Upper SNR bound (dB) for reporting low-band macro metrics.")
 
     parser.add_argument("--train-snrs", type=str, default=None)
     parser.add_argument("--val-snrs", type=str, default=None)
@@ -1610,6 +1641,32 @@ def write_jsonl(path: str, record: Dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
+def _macro_metrics_from_confmat(conf_mat: np.ndarray) -> Dict[str, float]:
+    """
+    Compute macro-accuracy (mean class recall) and macro-F1 from confusion matrix.
+    conf_mat is expected in [true_class, predicted_class] layout.
+    """
+    if conf_mat.size == 0:
+        return {"macro_acc": 0.0, "macro_f1": 0.0}
+    conf = conf_mat.astype(np.float64, copy=False)
+    tp = np.diag(conf)
+    support = conf.sum(axis=1)  # true counts per class
+    pred_count = conf.sum(axis=0)  # predicted counts per class
+
+    recall = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
+    precision = np.divide(tp, pred_count, out=np.zeros_like(tp), where=pred_count > 0)
+    denom = precision + recall
+    f1 = np.divide(2.0 * precision * recall, denom, out=np.zeros_like(denom), where=denom > 0)
+
+    valid = support > 0
+    if not np.any(valid):
+        return {"macro_acc": 0.0, "macro_f1": 0.0}
+    return {
+        "macro_acc": float(np.mean(recall[valid])),
+        "macro_f1": float(np.mean(f1[valid])),
+    }
+
+
 def evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -1617,12 +1674,16 @@ def evaluate(
     t_eval: int,
     snr_mode: str,
     amp: bool = False,
-) -> Tuple[float, float, Dict[int, float]]:
+    low_snr_lo: float = -14.0,
+    low_snr_hi: float = -6.0,
+) -> Tuple[float, float, Dict[int, float], Dict[str, float]]:
     model.eval()
     total_correct = 0
     total = 0
     snr_correct: Dict[int, int] = {}
     snr_total: Dict[int, int] = {}
+    conf_all: Optional[np.ndarray] = None
+    conf_low: Optional[np.ndarray] = None
 
     with torch.no_grad():
         for batch in loader:
@@ -1647,6 +1708,31 @@ def evaluate(
             total_correct += correct
             total += y.shape[0]
 
+            # Class-macro metrics (overall + low-band).
+            ncls = int(logits.shape[1])
+            if conf_all is None:
+                conf_all = np.zeros((ncls, ncls), dtype=np.int64)
+            y_cpu_i64 = y.detach().cpu().to(torch.int64)
+            preds_cpu_i64 = preds.detach().cpu().to(torch.int64)
+            binc = torch.bincount(
+                y_cpu_i64 * ncls + preds_cpu_i64,
+                minlength=ncls * ncls,
+            ).view(ncls, ncls)
+            conf_all += binc.numpy()
+
+            snr_cpu_t = snr.detach().cpu().float()
+            low_mask_t = (snr_cpu_t >= float(low_snr_lo)) & (snr_cpu_t <= float(low_snr_hi))
+            if bool(torch.any(low_mask_t)):
+                if conf_low is None:
+                    conf_low = np.zeros((ncls, ncls), dtype=np.int64)
+                y_low = y_cpu_i64[low_mask_t]
+                p_low = preds_cpu_i64[low_mask_t]
+                binc_low = torch.bincount(
+                    y_low * ncls + p_low,
+                    minlength=ncls * ncls,
+                ).view(ncls, ncls)
+                conf_low += binc_low.numpy()
+
             snr_cpu = snr.detach().cpu().numpy().astype(np.int32)
             preds_cpu = preds.detach().cpu().numpy()
             y_cpu = y.detach().cpu().numpy()
@@ -1657,7 +1743,17 @@ def evaluate(
 
     acc = float(total_correct) / max(1, total)
     acc_by_snr = {snr: snr_correct[snr] / snr_total[snr] for snr in snr_total.keys()}
-    return acc, total, acc_by_snr
+    macro_all = _macro_metrics_from_confmat(conf_all if conf_all is not None else np.zeros((0, 0), dtype=np.int64))
+    macro_low = _macro_metrics_from_confmat(conf_low if conf_low is not None else np.zeros((0, 0), dtype=np.int64))
+    summary = {
+        "macro_acc": float(macro_all.get("macro_acc", 0.0)),
+        "macro_f1": float(macro_all.get("macro_f1", 0.0)),
+        "low_macro_acc": float(macro_low.get("macro_acc", 0.0)),
+        "low_macro_f1": float(macro_low.get("macro_f1", 0.0)),
+        "low_snr_lo": float(low_snr_lo),
+        "low_snr_hi": float(low_snr_hi),
+    }
+    return acc, total, acc_by_snr, summary
 
 
 def evaluate_dynamic_k(
@@ -1922,6 +2018,9 @@ def train(args: argparse.Namespace) -> None:
     raw_prob_lo = float(getattr(args, "cldnn_raw_low_snr_drop_prob_lo", -1.0))
     raw_prob_mid = float(getattr(args, "cldnn_raw_low_snr_drop_prob_mid", -1.0))
     raw_prob_hi = float(getattr(args, "cldnn_raw_low_snr_drop_prob_hi", -1.0))
+    if bool(getattr(args, "cldnn_raw_low_snr_drop_zero_hi", False)) and raw_prob_hi >= 0.0:
+        raw_prob_hi = 0.0
+        args.cldnn_raw_low_snr_drop_prob_hi = 0.0
     raw_sched_enabled = raw_prob_lo >= 0.0 and raw_prob_mid >= 0.0 and raw_prob_hi >= 0.0
     if (raw_prob_lo >= 0.0) or (raw_prob_mid >= 0.0) or (raw_prob_hi >= 0.0):
         if not raw_sched_enabled:
@@ -1947,6 +2046,11 @@ def train(args: argparse.Namespace) -> None:
                 raise ValueError("cldnn_raw_low_snr_drop_prob_lo/mid/hi must be in [0,1] when schedule is enabled.")
         if float(getattr(args, "cldnn_raw_low_snr_drop_snr_lo", -10.0)) > float(getattr(args, "cldnn_raw_low_snr_drop_snr_mid", -6.0)):
             raise ValueError("cldnn_raw_low_snr_drop_snr_lo must be <= cldnn_raw_low_snr_drop_snr_mid.")
+        if raw_prob_hi > 0.0:
+            print(
+                "[warn] cldnn_raw_low_snr_drop_prob_hi > 0 enables high-SNR raw attenuation. "
+                "This can hurt high-band accuracy; consider --cldnn-raw-low-snr-drop-zero-hi."
+            )
     if int(getattr(args, "cldnn_expert_stacf_win", 0)) < 0:
         raise ValueError("cldnn_expert_stacf_win must be >= 0.")
     if float(getattr(args, "cldnn_expert_corr_eps", 1e-6)) <= 0.0:
@@ -1975,8 +2079,18 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("kd_temp must be > 0.")
     if float(getattr(args, "kd_snr_lo", -999.0)) > float(getattr(args, "kd_snr_hi", 999.0)):
         raise ValueError("kd_snr_lo must be <= kd_snr_hi.")
+    if float(getattr(args, "kd_hi_preserve_scale", 0.0)) < 0.0:
+        raise ValueError("kd_hi_preserve_scale must be >= 0.")
+    if float(getattr(args, "kd_hi_snr_lo", 10.0)) > float(getattr(args, "kd_hi_snr_hi", 18.0)):
+        raise ValueError("kd_hi_snr_lo must be <= kd_hi_snr_hi.")
+    if float(getattr(args, "kd_hi_preserve_scale", 0.0)) > 0.0 and float(getattr(args, "lambda_kd", 0.0)) <= 0.0:
+        raise ValueError("kd_hi_preserve_scale > 0 requires lambda_kd > 0.")
+    if float(getattr(args, "kd_hi_conf_thresh", -1.0)) >= 1.0:
+        raise ValueError("kd_hi_conf_thresh must be < 1.0 (or <0 to reuse kd-conf-thresh).")
     if float(getattr(args, "lambda_kd", 0.0)) <= 0.0 and getattr(args, "teacher_ckpt", None):
         print("[kd] teacher_ckpt provided but lambda_kd <= 0; external KD disabled.")
+    if float(getattr(args, "report_low_snr_lo", -14.0)) > float(getattr(args, "report_low_snr_hi", -6.0)):
+        raise ValueError("report_low_snr_lo must be <= report_low_snr_hi.")
     if float(getattr(args, "noise_rho_min", 1e-4)) <= 0 or float(getattr(args, "noise_rho_max", 1.0 - 1e-4)) >= 1:
         raise ValueError("noise_rho_min/max must satisfy 0 < min < max < 1.")
     if float(getattr(args, "noise_rho_min", 1e-4)) >= float(getattr(args, "noise_rho_max", 1.0 - 1e-4)):
@@ -2446,6 +2560,8 @@ def train(args: argparse.Namespace) -> None:
         epoch_lfeat_active = 0.0
         epoch_loss_kd = 0.0
         epoch_kd_active = 0.0
+        epoch_loss_kd_hi = 0.0
+        epoch_kd_hi_active = 0.0
         epoch_correct = 0
         epoch_total = 0
         start_time = time.time()
@@ -2570,6 +2686,8 @@ def train(args: argparse.Namespace) -> None:
             lfeat_active_frac_batch = torch.tensor(0.0, device=device)
             loss_kd = torch.tensor(0.0, device=device)
             kd_active_frac_batch = torch.tensor(0.0, device=device)
+            loss_kd_hi = torch.tensor(0.0, device=device)
+            kd_hi_active_frac_batch = torch.tensor(0.0, device=device)
             if amp_enabled:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
                     if args.arch == "dit":
@@ -2768,6 +2886,21 @@ def train(args: argparse.Namespace) -> None:
                             snr_hi=float(getattr(args, "kd_snr_hi", 999.0)),
                             conf_thresh=float(getattr(args, "kd_conf_thresh", 0.0)),
                         )
+                        kd_hi_scale = float(getattr(args, "kd_hi_preserve_scale", 0.0))
+                        if kd_hi_scale > 0.0:
+                            kd_hi_conf = float(getattr(args, "kd_hi_conf_thresh", -1.0))
+                            if kd_hi_conf < 0.0:
+                                kd_hi_conf = float(getattr(args, "kd_conf_thresh", 0.0))
+                            loss_kd_hi, kd_hi_active_frac_batch = kd_distillation_loss(
+                                logits_student_kd,
+                                logits_teacher_kd,
+                                temperature=float(getattr(args, "kd_temp", 2.0)),
+                                snr_db=snr_aux,
+                                snr_lo=float(getattr(args, "kd_hi_snr_lo", 10.0)),
+                                snr_hi=float(getattr(args, "kd_hi_snr_hi", 18.0)),
+                                conf_thresh=kd_hi_conf,
+                            )
+                            loss_kd = loss_kd + kd_hi_scale * loss_kd_hi
                         loss = loss + float(lambda_kd_eff) * loss_kd
 
                     # --- Supervised Contrastive Loss (SupCon) ---
@@ -3065,6 +3198,21 @@ def train(args: argparse.Namespace) -> None:
                         snr_hi=float(getattr(args, "kd_snr_hi", 999.0)),
                         conf_thresh=float(getattr(args, "kd_conf_thresh", 0.0)),
                     )
+                    kd_hi_scale = float(getattr(args, "kd_hi_preserve_scale", 0.0))
+                    if kd_hi_scale > 0.0:
+                        kd_hi_conf = float(getattr(args, "kd_hi_conf_thresh", -1.0))
+                        if kd_hi_conf < 0.0:
+                            kd_hi_conf = float(getattr(args, "kd_conf_thresh", 0.0))
+                        loss_kd_hi, kd_hi_active_frac_batch = kd_distillation_loss(
+                            logits_student_kd,
+                            logits_teacher_kd,
+                            temperature=float(getattr(args, "kd_temp", 2.0)),
+                            snr_db=snr_aux,
+                            snr_lo=float(getattr(args, "kd_hi_snr_lo", 10.0)),
+                            snr_hi=float(getattr(args, "kd_hi_snr_hi", 18.0)),
+                            conf_thresh=kd_hi_conf,
+                        )
+                        loss_kd = loss_kd + kd_hi_scale * loss_kd_hi
                     loss = loss + float(lambda_kd_eff) * loss_kd
 
                 # --- Supervised Contrastive Loss (SupCon) ---
@@ -3191,6 +3339,8 @@ def train(args: argparse.Namespace) -> None:
             epoch_lfeat_active += float(lfeat_active_frac_batch.detach().item()) * batch_size
             epoch_loss_kd += float(loss_kd.detach().item()) * batch_size
             epoch_kd_active += float(kd_active_frac_batch.detach().item()) * batch_size
+            epoch_loss_kd_hi += float(loss_kd_hi.detach().item()) * batch_size
+            epoch_kd_hi_active += float(kd_hi_active_frac_batch.detach().item()) * batch_size
             epoch_correct += (logits_for_acc_batch.argmax(dim=1) == y).sum().item()
             epoch_total += batch_size
             if epoch_total > 0:
@@ -3205,6 +3355,8 @@ def train(args: argparse.Namespace) -> None:
         train_lfeat_active_frac = epoch_lfeat_active / max(1, epoch_total)
         train_loss_kd = epoch_loss_kd / max(1, epoch_total)
         train_kd_active_frac = epoch_kd_active / max(1, epoch_total)
+        train_loss_kd_hi = epoch_loss_kd_hi / max(1, epoch_total)
+        train_kd_hi_active_frac = epoch_kd_hi_active / max(1, epoch_total)
         train_acc = epoch_correct / max(1, epoch_total)
         train_acc_clean = None
         if train_eval_loader is not None:
@@ -3227,13 +3379,27 @@ def train(args: argparse.Namespace) -> None:
         if ema is not None:
             ema.store(model)
             ema.copy_to(model)
-            val_acc, _, val_acc_by_snr = evaluate(
-                model, val_loader, device, args.t_eval, args.snr_mode, amp=args.amp
+            val_acc, _, val_acc_by_snr, val_summary = evaluate(
+                model,
+                val_loader,
+                device,
+                args.t_eval,
+                args.snr_mode,
+                amp=args.amp,
+                low_snr_lo=float(getattr(args, "report_low_snr_lo", -14.0)),
+                low_snr_hi=float(getattr(args, "report_low_snr_hi", -6.0)),
             )
             ema.restore(model)
         else:
-            val_acc, _, val_acc_by_snr = evaluate(
-                model, val_loader, device, args.t_eval, args.snr_mode, amp=args.amp
+            val_acc, _, val_acc_by_snr, val_summary = evaluate(
+                model,
+                val_loader,
+                device,
+                args.t_eval,
+                args.snr_mode,
+                amp=args.amp,
+                low_snr_lo=float(getattr(args, "report_low_snr_lo", -14.0)),
+                low_snr_hi=float(getattr(args, "report_low_snr_hi", -6.0)),
             )
 
         noise_calib: Dict[str, object] = {}
@@ -3280,6 +3446,10 @@ def train(args: argparse.Namespace) -> None:
             "train_acc": train_acc,
             "train_acc_clean": train_acc_clean,
             "val_acc": val_acc,
+            "val_macro_acc": float(val_summary.get("macro_acc", 0.0)),
+            "val_macro_f1": float(val_summary.get("macro_f1", 0.0)),
+            "val_low_macro_acc": float(val_summary.get("low_macro_acc", 0.0)),
+            "val_low_macro_f1": float(val_summary.get("low_macro_f1", 0.0)),
             "lr": optimizer.param_groups[0]["lr"],
             "time_sec": time.time() - start_time,
             "lambda_diff": lambda_diff,
@@ -3292,6 +3462,8 @@ def train(args: argparse.Namespace) -> None:
             "train_lfeat_active_frac": float(train_lfeat_active_frac),
             "train_loss_kd": float(train_loss_kd),
             "train_kd_active_frac": float(train_kd_active_frac),
+            "train_loss_kd_hi": float(train_loss_kd_hi),
+            "train_kd_hi_active_frac": float(train_kd_hi_active_frac),
             "cls2dn_scale": float(cls2dn_scale),
             "p_clean": p_clean,
             "t_schedule": args.t_schedule,
@@ -3372,8 +3544,15 @@ def train(args: argparse.Namespace) -> None:
             ema.copy_to(model)
     if hasattr(model, "force_denoiser_bypass"):
         model.force_denoiser_bypass = bool(getattr(args, "cldnn_denoiser_bypass_eval", False))  # type: ignore[attr-defined]
-    test_acc, _, test_acc_by_snr = evaluate(
-        model, test_loader, device, args.t_eval, args.snr_mode, amp=args.amp
+    test_acc, _, test_acc_by_snr, test_summary = evaluate(
+        model,
+        test_loader,
+        device,
+        args.t_eval,
+        args.snr_mode,
+        amp=args.amp,
+        low_snr_lo=float(getattr(args, "report_low_snr_lo", -14.0)),
+        low_snr_hi=float(getattr(args, "report_low_snr_hi", -6.0)),
     )
     dyn = None
     if args.dynamic_k_eval:
@@ -3393,11 +3572,17 @@ def train(args: argparse.Namespace) -> None:
         dyn = {"dynamic_test_acc": dyn_acc, "dynamic_avg_k": avg_k, "dynamic_test_acc_by_snr": dyn_by_snr}
     with open(os.path.join(args.out_dir, "test_acc_by_snr.json"), "w", encoding="utf-8") as f:
         json.dump(test_acc_by_snr, f, indent=2)
+    with open(os.path.join(args.out_dir, "test_macro_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(test_summary, f, indent=2)
     write_jsonl(
         metrics_path,
         {
             "epoch": best_epoch if best_epoch is not None else args.epochs,
             "test_acc": test_acc,
+            "test_macro_acc": float(test_summary.get("macro_acc", 0.0)),
+            "test_macro_f1": float(test_summary.get("macro_f1", 0.0)),
+            "test_low_macro_acc": float(test_summary.get("low_macro_acc", 0.0)),
+            "test_low_macro_f1": float(test_summary.get("low_macro_f1", 0.0)),
             "best_val_acc": best_val,
             **(dyn if dyn is not None else {}),
         },
@@ -3513,11 +3698,27 @@ def run_eval(args: argparse.Namespace) -> None:
     if hasattr(model, "force_denoiser_bypass"):
         model.force_denoiser_bypass = bool(getattr(args, "cldnn_denoiser_bypass_eval", False))  # type: ignore[attr-defined]
 
-    test_acc, _, test_acc_by_snr = evaluate(
-        model, test_loader, device, args.t_eval, args.snr_mode, amp=args.amp
+    test_acc, _, test_acc_by_snr, test_summary = evaluate(
+        model,
+        test_loader,
+        device,
+        args.t_eval,
+        args.snr_mode,
+        amp=args.amp,
+        low_snr_lo=float(getattr(args, "report_low_snr_lo", -14.0)),
+        low_snr_hi=float(getattr(args, "report_low_snr_hi", -6.0)),
     )
     print(f"Test acc: {test_acc:.4f}")
     print("Test acc by SNR:", test_acc_by_snr)
+    print(
+        "Test macro summary:",
+        {
+            "macro_acc": float(test_summary.get("macro_acc", 0.0)),
+            "macro_f1": float(test_summary.get("macro_f1", 0.0)),
+            "low_macro_acc": float(test_summary.get("low_macro_acc", 0.0)),
+            "low_macro_f1": float(test_summary.get("low_macro_f1", 0.0)),
+        },
+    )
 
 
 def _resolve_dataset_defaults(args: argparse.Namespace) -> None:

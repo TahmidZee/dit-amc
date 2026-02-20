@@ -56,11 +56,15 @@ The following capabilities are available in `train.py` + `model.py`:
    - external teacher: `--teacher-ckpt`, `--lambda-kd`, `--kd-temp`
    - schedule: `--kd-warmup`, `--kd-ramp`
    - low-band KD gating: `--kd-snr-lo`, `--kd-snr-hi`
+   - optional high-band preservation KD (two-mask): `--kd-hi-preserve-scale`, `--kd-hi-snr-lo`, `--kd-hi-snr-hi`, `--kd-hi-conf-thresh`
    - confidence gate: `--kd-conf-thresh`
    - teacher conditioning mode: `--kd-teacher-snr-mode` (default `known` for oracle-teacher distillation)
-   - log metrics: `train_loss_kd`, `train_kd_active_frac`
+   - log metrics: `train_loss_kd`, `train_kd_active_frac`, `train_loss_kd_hi`, `train_kd_hi_active_frac`
 
 9. Validation guards were added for invalid ranges and incompatible settings.
+10. Eval reports now include class-macro metrics:
+   - `val_macro_acc`, `val_macro_f1`, `val_low_macro_acc`, `val_low_macro_f1`
+   - test summary file: `test_macro_summary.json`
 
 ## Clarified Technical Position (from last discussion)
 
@@ -211,6 +215,12 @@ Scenario handling:
 - Start with same-arch teacher first for clean attribution.
 - Keep low-band KD gating enabled (`--kd-snr-lo -14 --kd-snr-hi -6`) to focus the distillation budget where it matters.
 
+Wave-4D ablation base (fixed):
+- Use `w3r_noexp_softsched` as the baseline recipe (best low/high balance in W3R without expert branch).
+- Add KD deltas on top of this fixed base to keep attribution clean.
+- Prevent high-SNR leakage in raw attenuation schedule:
+  - set `--cldnn-raw-low-snr-drop-prob-hi 0.0` (or use `--cldnn-raw-low-snr-drop-zero-hi`)
+
 Wave-4D matrix (8 student runs):
 
 | ID | Run name | Delta flags vs promoted W3R baseline | Expected effect |
@@ -220,13 +230,36 @@ Wave-4D matrix (8 student runs):
 | W4D-2 | `w4d_kd_lowband_l02_t2` | W4D-1 + `--kd-snr-lo -14 --kd-snr-hi -6` | focused low-band transfer |
 | W4D-3 | `w4d_kd_lowband_l03_t2` | W4D-2 + `--lambda-kd 0.3` | stronger low-band KD |
 | W4D-4 | `w4d_kd_lowband_l02_t3` | W4D-2 + `--kd-temp 3.0` | softer teacher targets |
-| W4D-5 | `w4d_kd_lowband_conf35` | W4D-2 + `--kd-conf-thresh 0.35` | avoid noisy teacher guidance |
+| W4D-5 | `w4d_kd_twomask_l025_h005` | W4D-2 + `--lambda-kd 0.25 --kd-hi-preserve-scale 0.20 --kd-hi-snr-lo 10 --kd-hi-snr-hi 18` | low-band KD + explicit high-band drift control |
 | W4D-6 | `w4d_kd_lowband_consist` | W4D-2 + low-band consistency block from W3R-2 | KD + invariance |
 | W4D-7 | `w4d_kd_lowband_lfeat` | W4D-2 + targeted L_feat block from W3R-3 | KD + denoiser detail preservation |
 
 Wave-4D exit criterion:
 - Promote if KD run beats W3R best on low-band with non-collapsing high-band.
 - Prefer runs with meaningful KD activity (`train_kd_active_frac`) in target band and stable convergence.
+
+---
+
+## Wave 5M (Queued After W4D): MoE Head Decoupling
+
+Trigger:
+- Run after Wave-4D completion (regardless of KD outcome), with priority if low/high tradeoff remains.
+
+Core mechanism:
+- Replace single classifier output head with two heads (high-SNR expert and low-SNR expert).
+- Blend logits using eta-conditioned router gate.
+- Keep trunk shared; decouple final decision boundaries by SNR regime.
+
+Wave-5M first matrix (planned):
+- `w5m_moe_anchor_noexp` (no expert branch, no KD)
+- `w5m_moe_lowband_lfeat` (add low-band targeted L_feat)
+- `w5m_moe_lowband_consist` (add low-band consistency)
+- `w5m_moe_voltron` (expert-v2 + low-band targeted stack)
+- plus 4 MoE gate sharpness/center ablations.
+
+Acceptance:
+- Must retain high-band near best non-MoE baseline while improving low-band.
+- If MoE beats KD on low-band with smaller high-band tax, promote MoE track.
 
 ---
 
@@ -237,6 +270,8 @@ Primary metrics:
 - low band mean (`-14..-6 dB`)
 - mid band mean (`-4..+6 dB`)
 - high band mean (`+10..+18 dB`)
+- class-macro (overall): macro-accuracy / macro-F1
+- class-macro (low band): low-band macro-accuracy / macro-F1
 
 Promotion gate vs `b3_dn48`:
 - high-band drop no worse than -0.002 absolute
