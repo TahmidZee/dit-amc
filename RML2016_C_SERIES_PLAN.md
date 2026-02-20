@@ -52,7 +52,15 @@ The following capabilities are available in `train.py` + `model.py`:
    - `--snr-consist-low-snr-thresh`
    - `--snr-consist-low-delta-min`, `--snr-consist-low-delta-max`
 
-8. Validation guards were added for invalid ranges and incompatible settings.
+8. **External KD + low-band KD controls (new)**:
+   - external teacher: `--teacher-ckpt`, `--lambda-kd`, `--kd-temp`
+   - schedule: `--kd-warmup`, `--kd-ramp`
+   - low-band KD gating: `--kd-snr-lo`, `--kd-snr-hi`
+   - confidence gate: `--kd-conf-thresh`
+   - teacher conditioning mode: `--kd-teacher-snr-mode` (default `known` for oracle-teacher distillation)
+   - log metrics: `train_loss_kd`, `train_kd_active_frac`
+
+9. Validation guards were added for invalid ranges and incompatible settings.
 
 ## Clarified Technical Position (from last discussion)
 
@@ -155,6 +163,70 @@ Wave-2 signals to exploit:
 Wave-3R exit criterion:
 - Promote top-2 by low-band first, then overall.
 - Require high-band drop no worse than `-0.002` vs `b3_dn48`.
+
+---
+
+## Wave-3R Outcome (2026-02-19 pull)
+
+Observed test metrics (overall / low / mid / high):
+- `w3r_noexp_anchor_consist`: `0.6408 / 0.3108 / 0.8935 / 0.9351` (best overall in W3R)
+- `w3r_noexp_softsched`: `0.6399 / 0.3124 / 0.8885 / 0.9361` (best balanced low/high in W3R)
+- `w3r_expv2_eta_gate_lfeat_consist`: `0.6373 / 0.3172 / 0.8794 / 0.9319` (best low-band, but high-band drops too much)
+- all other W3R runs are below the above fronts on either overall or low-band.
+
+Decision:
+- No run met the promotion gate (`overall +0.006` or `low +0.015` vs `b3_dn48` with high-band guard).
+- Move forward with **KD-first** strategy (Wave-4D), while keeping one non-KD anchor.
+- Expert-v2 remains secondary unless high-band protection is improved.
+
+---
+
+## Wave 4T (Prerequisite): Build Oracle Teachers (2 runs)
+
+Need:
+- There is currently no `snr_mode=known` checkpoint in the run pool, so train at least one oracle teacher first.
+
+| ID | Run name | Delta flags vs best non-expert W3R recipe | Purpose |
+|---|---|---|---|
+| W4T-0 | `w4t_teacher_oracle_anchor` | `--snr-mode known` | primary teacher |
+| W4T-1 | `w4t_teacher_oracle_anchor_seed3407` | `--snr-mode known --seed 3407` | seed-robust teacher backup |
+
+Teacher selection rule:
+- choose teacher with best test overall, tie-break by low-band.
+
+---
+
+## Wave 4D (Activated): Oracle-Teacher Distillation (LUPI)
+
+Trigger condition:
+- Activated (Wave-3R remained in micro-gain territory).
+
+Core idea:
+- Train/keep an **oracle teacher** (`snr_mode=known`) as privileged training information.
+- Train deployment student in **blind mode** (`snr_mode=predict`) with CE + KD (+ optional consistency/L_feat).
+- This is training-time privilege only; inference remains blind.
+
+Scenario handling:
+- If teacher and student architectures differ, KD is allowed but lower priority than same-arch KD.
+- Start with same-arch teacher first for clean attribution.
+- Keep low-band KD gating enabled (`--kd-snr-lo -14 --kd-snr-hi -6`) to focus the distillation budget where it matters.
+
+Wave-4D matrix (8 student runs):
+
+| ID | Run name | Delta flags vs promoted W3R baseline | Expected effect |
+|---|---|---|---|
+| W4D-0 | `w4d_student_anchor` | no KD | baseline for attribution |
+| W4D-1 | `w4d_kd_fullband_l02_t2` | `--teacher-ckpt <oracle_teacher.pt> --lambda-kd 0.2 --kd-temp 2.0 --kd-warmup 20 --kd-ramp 10` | broad KD regularization |
+| W4D-2 | `w4d_kd_lowband_l02_t2` | W4D-1 + `--kd-snr-lo -14 --kd-snr-hi -6` | focused low-band transfer |
+| W4D-3 | `w4d_kd_lowband_l03_t2` | W4D-2 + `--lambda-kd 0.3` | stronger low-band KD |
+| W4D-4 | `w4d_kd_lowband_l02_t3` | W4D-2 + `--kd-temp 3.0` | softer teacher targets |
+| W4D-5 | `w4d_kd_lowband_conf35` | W4D-2 + `--kd-conf-thresh 0.35` | avoid noisy teacher guidance |
+| W4D-6 | `w4d_kd_lowband_consist` | W4D-2 + low-band consistency block from W3R-2 | KD + invariance |
+| W4D-7 | `w4d_kd_lowband_lfeat` | W4D-2 + targeted L_feat block from W3R-3 | KD + denoiser detail preservation |
+
+Wave-4D exit criterion:
+- Promote if KD run beats W3R best on low-band with non-collapsing high-band.
+- Prefer runs with meaningful KD activity (`train_kd_active_frac`) in target band and stable convergence.
 
 ---
 

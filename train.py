@@ -209,6 +209,60 @@ def get_lambda_feat(epoch: int, args: argparse.Namespace) -> float:
     return target * progress
 
 
+def get_lambda_kd(epoch: int, args: argparse.Namespace, teacher_enabled: bool) -> float:
+    """
+    Optional warmup/ramp for external KD weight.
+    """
+    target = float(getattr(args, "lambda_kd", 0.0))
+    if target <= 0.0 or not teacher_enabled:
+        return 0.0
+    warmup = int(max(0, getattr(args, "kd_warmup", 0)))
+    if epoch < warmup:
+        return 0.0
+    ramp_epochs = int(max(0, getattr(args, "kd_ramp", 0)))
+    if ramp_epochs <= 0:
+        return target
+    progress = (epoch - warmup + 1) / float(max(1, ramp_epochs))
+    progress = min(1.0, max(0.0, progress))
+    return target * progress
+
+
+def kd_distillation_loss(
+    logits_student: torch.Tensor,
+    logits_teacher: torch.Tensor,
+    temperature: float = 2.0,
+    snr_db: Optional[torch.Tensor] = None,
+    snr_lo: float = -999.0,
+    snr_hi: float = 999.0,
+    conf_thresh: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    KL distillation loss from teacher logits to student logits, with optional
+    confidence and low-band SNR gating.
+    """
+    if logits_student.shape != logits_teacher.shape:
+        raise ValueError(
+            f"KD logits shape mismatch: student={tuple(logits_student.shape)} teacher={tuple(logits_teacher.shape)}"
+        )
+    t = max(1e-6, float(temperature))
+    p_teacher = F.softmax(logits_teacher.detach() / t, dim=1)
+    log_p_student = F.log_softmax(logits_student / t, dim=1)
+    kl_per_sample = F.kl_div(log_p_student, p_teacher, reduction="none").sum(dim=1)
+
+    weight = torch.ones(logits_student.shape[0], device=logits_student.device, dtype=logits_student.dtype)
+    if conf_thresh > 0.0:
+        conf, _ = p_teacher.max(dim=1)
+        weight = weight * (conf >= float(conf_thresh)).float()
+    if snr_db is not None:
+        snr_f = snr_db.float()
+        weight = weight * ((snr_f >= float(snr_lo)) & (snr_f <= float(snr_hi))).float()
+
+    denom = torch.clamp(weight.sum(), min=1.0)
+    loss = (kl_per_sample * weight).sum() / denom * (t ** 2)
+    active_frac = weight.mean()
+    return loss, active_frac
+
+
 def fit_noise_proxy_calibration(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -962,6 +1016,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snr-consist-snr-new-lo", type=float, default=-999.0, help="Lower bound for degraded-view SNR gating (dB). Default -999 = no lower bound.")
     parser.add_argument("--snr-consist-snr-new-hi", type=float, default=999.0, help="Upper bound for degraded-view SNR gating (dB). Default 999 = no upper bound.")
 
+    # External teacher KD (LUPI-style): oracle teacher at train-time, blind student at inference.
+    parser.add_argument("--teacher-ckpt", type=str, default=None, help="Path to external teacher checkpoint for logit distillation.")
+    parser.add_argument("--lambda-kd", type=float, default=0.0, help="Weight for external KD KL loss.")
+    parser.add_argument("--kd-temp", type=float, default=2.0, help="Temperature for KD soft targets.")
+    parser.add_argument("--kd-warmup", type=int, default=0, help="Epochs to wait before KD starts.")
+    parser.add_argument("--kd-ramp", type=int, default=0, help="Ramp KD weight over this many epochs after warmup (0 = no ramp).")
+    parser.add_argument("--kd-conf-thresh", type=float, default=0.0, help="Minimum teacher confidence to apply KD (0 = disabled).")
+    parser.add_argument("--kd-snr-lo", type=float, default=-999.0, help="Lower SNR bound for KD (low-band KD when set, e.g. -14).")
+    parser.add_argument("--kd-snr-hi", type=float, default=999.0, help="Upper SNR bound for KD (low-band KD when set, e.g. -6).")
+    parser.add_argument(
+        "--kd-teacher-snr-mode",
+        type=str,
+        choices=["known", "predict", "none"],
+        default="known",
+        help="Teacher conditioning mode during KD forward pass. Use 'known' for oracle teacher distillation.",
+    )
+
     # Contrastive pre-training
     parser.add_argument("--contrastive-pretrain-epochs", type=int, default=0, help="Number of epochs for contrastive pre-training (0 = disabled).")
     parser.add_argument("--contrastive-k", type=int, default=4, help="Number of windows per sample for contrastive learning.")
@@ -1165,6 +1236,116 @@ def apply_preset(args: argparse.Namespace) -> None:
     for key, value in preset.items():
         if getattr(args, key, None) is None:
             setattr(args, key, value)
+
+
+def _cfg_get(
+    cfg: Optional[Dict[str, object]],
+    fallback: argparse.Namespace,
+    key: str,
+    default,
+):
+    if cfg is not None and key in cfg:
+        return cfg[key]
+    return getattr(fallback, key, default)
+
+
+def build_model_from_cfg(
+    cfg: Optional[Dict[str, object]],
+    fallback: argparse.Namespace,
+    num_classes: int,
+    seq_len: int,
+    snr_min_db: float,
+    snr_max_db: float,
+    device: torch.device,
+) -> Tuple[torch.nn.Module, str]:
+    arch = str(_cfg_get(cfg, fallback, "arch", "cldnn"))
+    if arch == "dit":
+        model = DiffusionAMC(
+            num_classes=num_classes,
+            seq_len=seq_len,
+            patch_size=int(_cfg_get(cfg, fallback, "patch_size", 8)),
+            dim=int(_cfg_get(cfg, fallback, "dim", 192)),
+            depth=int(_cfg_get(cfg, fallback, "depth", 10)),
+            heads=int(_cfg_get(cfg, fallback, "heads", 6)),
+            mlp_ratio=float(_cfg_get(cfg, fallback, "mlp_ratio", 4.0)),
+            dropout=float(_cfg_get(cfg, fallback, "dropout", 0.1)),
+            snr_scale=float(_cfg_get(cfg, fallback, "snr_scale", 20.0)),
+            stem_channels=int(_cfg_get(cfg, fallback, "stem_channels", 64)),
+            stem_layers=int(_cfg_get(cfg, fallback, "stem_layers", 2)),
+            group_pool=str(_cfg_get(cfg, fallback, "group_pool", "mean")),
+        ).to(device)
+    elif arch == "multiview":
+        model = MultiViewCLDNNAMC(
+            num_classes=num_classes,
+            seq_len=seq_len,
+            conv_channels=int(_cfg_get(cfg, fallback, "cldnn_conv_ch", 50)),
+            merge_channels=int(_cfg_get(cfg, fallback, "cldnn_merge_ch", 100)),
+            lstm_hidden=int(_cfg_get(cfg, fallback, "cldnn_lstm_hidden", 128)),
+            lstm_layers=int(_cfg_get(cfg, fallback, "cldnn_lstm_layers", 2)),
+            bidirectional=bool(_cfg_get(cfg, fallback, "cldnn_bidir", False)),
+            dropout=float(_cfg_get(cfg, fallback, "dropout", 0.1)),
+            pool=str(_cfg_get(cfg, fallback, "cldnn_pool", "attn")),
+            snr_cond=bool(_cfg_get(cfg, fallback, "cldnn_snr_cond", False)),
+            snr_loss_detach_backbone=bool(_cfg_get(cfg, fallback, "snr_loss_detach_backbone", False)),
+            snr_min_db=snr_min_db,
+            snr_max_db=snr_max_db,
+            cls_hidden=int(_cfg_get(cfg, fallback, "cldnn_cls_hidden", 0)),
+            stft_nfft=int(_cfg_get(cfg, fallback, "stft_nfft", 64)),
+            stft_hop=int(_cfg_get(cfg, fallback, "stft_hop", 8)),
+            stft_channels=int(_cfg_get(cfg, fallback, "stft_channels", 64)),
+            cross_view_heads=int(_cfg_get(cfg, fallback, "cross_view_heads", 4)),
+            snr_gate=bool(_cfg_get(cfg, fallback, "snr_gate", False)),
+        ).to(device)
+    else:
+        model = CLDNNAMC(
+            num_classes=num_classes,
+            seq_len=seq_len,
+            conv_channels=int(_cfg_get(cfg, fallback, "cldnn_conv_ch", 50)),
+            merge_channels=int(_cfg_get(cfg, fallback, "cldnn_merge_ch", 100)),
+            lstm_hidden=int(_cfg_get(cfg, fallback, "cldnn_lstm_hidden", 128)),
+            lstm_layers=int(_cfg_get(cfg, fallback, "cldnn_lstm_layers", 2)),
+            bidirectional=bool(_cfg_get(cfg, fallback, "cldnn_bidir", False)),
+            dropout=float(_cfg_get(cfg, fallback, "dropout", 0.1)),
+            pool=str(_cfg_get(cfg, fallback, "cldnn_pool", "attn")),
+            snr_cond=bool(_cfg_get(cfg, fallback, "cldnn_snr_cond", False)),
+            noise_cond=bool(_cfg_get(cfg, fallback, "cldnn_noise_cond", False)),
+            snr_loss_detach_backbone=bool(_cfg_get(cfg, fallback, "snr_loss_detach_backbone", False)),
+            snr_min_db=snr_min_db,
+            snr_max_db=snr_max_db,
+            noise_eta_min=float(_cfg_get(cfg, fallback, "noise_eta_min", -8.0)),
+            noise_eta_max=float(_cfg_get(cfg, fallback, "noise_eta_max", 5.5)),
+            denoiser=bool(_cfg_get(cfg, fallback, "cldnn_denoiser", False)),
+            denoiser_dual_path=bool(_cfg_get(cfg, fallback, "cldnn_denoiser_dual_path", False)),
+            denoiser_base_channels=int(_cfg_get(cfg, fallback, "cldnn_denoiser_base_ch", 32)),
+            denoiser_dropout=float(_cfg_get(cfg, fallback, "cldnn_denoiser_dropout", 0.0)),
+            denoiser_soft_high_snr_blend=bool(_cfg_get(cfg, fallback, "cldnn_denoiser_soft_hi_blend", False)),
+            noise_head_hidden=int(_cfg_get(cfg, fallback, "noise_head_hidden", 32)),
+            expert_features=bool(_cfg_get(cfg, fallback, "cldnn_expert_features", False)),
+            expert_channels=int(_cfg_get(cfg, fallback, "cldnn_expert_ch", 64)),
+            expert_stacf_window=int(_cfg_get(cfg, fallback, "cldnn_expert_stacf_win", 0)),
+            expert_v2=bool(_cfg_get(cfg, fallback, "cldnn_expert_v2", False)),
+            expert_corr_norm_eps=float(_cfg_get(cfg, fallback, "cldnn_expert_corr_eps", 1e-6)),
+            expert_eta_gate=bool(_cfg_get(cfg, fallback, "cldnn_expert_eta_gate", False)),
+            expert_eta_gate_center=float(_cfg_get(cfg, fallback, "cldnn_expert_eta_gate_center", 0.8)),
+            expert_eta_gate_tau=float(_cfg_get(cfg, fallback, "cldnn_expert_eta_gate_tau", 0.7)),
+            expert_eta_gate_min=float(_cfg_get(cfg, fallback, "cldnn_expert_eta_gate_min", 0.0)),
+            expert_eta_gate_max=float(_cfg_get(cfg, fallback, "cldnn_expert_eta_gate_max", 1.0)),
+            expert_use_cyclo_stats=bool(_cfg_get(cfg, fallback, "cldnn_cyclo_stats", True)),
+            raw_low_snr_drop_prob=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_prob", 0.0)),
+            raw_low_snr_drop_gate=str(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_gate", "auto")),
+            raw_low_snr_drop_eta_thresh=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_eta_thresh", 1.0)),
+            raw_low_snr_drop_snr_thresh=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_snr_thresh", -6.0)),
+            raw_low_snr_drop_min_scale=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_min_scale", 0.0)),
+            raw_low_snr_drop_max_scale=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_max_scale", 0.0)),
+            raw_low_snr_drop_prob_lo=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_prob_lo", -1.0)),
+            raw_low_snr_drop_prob_mid=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_prob_mid", -1.0)),
+            raw_low_snr_drop_prob_hi=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_prob_hi", -1.0)),
+            raw_low_snr_drop_snr_lo=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_snr_lo", -10.0)),
+            raw_low_snr_drop_snr_mid=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_snr_mid", -6.0)),
+            cls_hidden=int(_cfg_get(cfg, fallback, "cldnn_cls_hidden", 0)),
+            supcon_proj_dim=int(_cfg_get(cfg, fallback, "supcon_proj_dim", 0)) if bool(_cfg_get(cfg, fallback, "supcon", False)) else 0,
+        ).to(device)
+    return model, arch
 
 
 def set_seed(seed: int) -> None:
@@ -1387,6 +1568,41 @@ def load_checkpoint(path: str, model: torch.nn.Module, optimizer=None, scheduler
         ema.load_state_dict(ckpt["ema"])
         ema.to(next(model.parameters()).device)
     return ckpt
+
+
+def load_state_dict_flexible(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor], prefix: str = "model") -> Dict[str, int]:
+    """
+    Load only matching keys/shapes from a state_dict (useful when optional heads differ).
+    Returns simple load stats and prints compact diagnostics.
+    """
+    model_sd = model.state_dict()
+    filtered_sd: Dict[str, torch.Tensor] = {}
+    skipped_shape = []
+    missing_key = []
+    for k, v in state_dict.items():
+        if k not in model_sd:
+            missing_key.append(k)
+            continue
+        if model_sd[k].shape != v.shape:
+            skipped_shape.append(k)
+            continue
+        filtered_sd[k] = v
+    missing_after, unexpected_after = model.load_state_dict(filtered_sd, strict=False)
+    if missing_after:
+        print(f"[{prefix}] missing keys after flexible load (first 8): {missing_after[:8]}")
+    if unexpected_after:
+        print(f"[{prefix}] unexpected keys after flexible load (first 8): {unexpected_after[:8]}")
+    if skipped_shape:
+        print(f"[{prefix}] shape-mismatch keys skipped (first 8): {skipped_shape[:8]}")
+    if missing_key:
+        print(f"[{prefix}] keys absent in target model (first 8): {missing_key[:8]}")
+    return {
+        "loaded": int(len(filtered_sd)),
+        "skipped_shape": int(len(skipped_shape)),
+        "missing_in_target": int(len(missing_key)),
+        "missing_after": int(len(missing_after)),
+        "unexpected_after": int(len(unexpected_after)),
+    }
 
 
 def write_jsonl(path: str, record: Dict) -> None:
@@ -1749,6 +1965,18 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("feat_ramp_epochs must be >= 0.")
     if float(getattr(args, "lambda_feat", 0.0)) > 0 and not bool(getattr(args, "cldnn_denoiser", False)):
         raise ValueError("lambda_feat > 0 requires --cldnn-denoiser.")
+    if float(getattr(args, "lambda_kd", 0.0)) < 0.0:
+        raise ValueError("lambda_kd must be >= 0.")
+    if float(getattr(args, "lambda_kd", 0.0)) > 0.0 and not getattr(args, "teacher_ckpt", None):
+        raise ValueError("lambda_kd > 0 requires --teacher-ckpt.")
+    if int(getattr(args, "kd_warmup", 0)) < 0 or int(getattr(args, "kd_ramp", 0)) < 0:
+        raise ValueError("kd_warmup and kd_ramp must be >= 0.")
+    if float(getattr(args, "kd_temp", 2.0)) <= 0.0:
+        raise ValueError("kd_temp must be > 0.")
+    if float(getattr(args, "kd_snr_lo", -999.0)) > float(getattr(args, "kd_snr_hi", 999.0)):
+        raise ValueError("kd_snr_lo must be <= kd_snr_hi.")
+    if float(getattr(args, "lambda_kd", 0.0)) <= 0.0 and getattr(args, "teacher_ckpt", None):
+        print("[kd] teacher_ckpt provided but lambda_kd <= 0; external KD disabled.")
     if float(getattr(args, "noise_rho_min", 1e-4)) <= 0 or float(getattr(args, "noise_rho_max", 1.0 - 1e-4)) >= 1:
         raise ValueError("noise_rho_min/max must satisfy 0 < min < max < 1.")
     if float(getattr(args, "noise_rho_min", 1e-4)) >= float(getattr(args, "noise_rho_max", 1.0 - 1e-4)):
@@ -1889,6 +2117,40 @@ def train(args: argparse.Namespace) -> None:
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
         schedule = None
+
+    teacher_model: Optional[torch.nn.Module] = None
+    if float(getattr(args, "lambda_kd", 0.0)) > 0.0:
+        teacher_ckpt = str(getattr(args, "teacher_ckpt"))
+        if not os.path.exists(teacher_ckpt):
+            raise FileNotFoundError(f"teacher_ckpt not found: {teacher_ckpt}")
+        try:
+            t_ckpt = torch.load(teacher_ckpt, map_location="cpu", weights_only=False)
+        except TypeError:
+            t_ckpt = torch.load(teacher_ckpt, map_location="cpu")
+        t_cfg = t_ckpt.get("args", {}) if isinstance(t_ckpt, dict) else {}
+        teacher_model, teacher_arch = build_model_from_cfg(
+            t_cfg if isinstance(t_cfg, dict) else None,
+            args,
+            num_classes=len(mods),
+            seq_len=seq_len,
+            snr_min_db=snr_min_db,
+            snr_max_db=snr_max_db,
+            device=device,
+        )
+        if teacher_arch != args.arch:
+            print(
+                f"[kd] teacher arch ({teacher_arch}) differs from student arch ({args.arch}). "
+                "This is allowed but can reduce KD effectiveness."
+            )
+        t_state = t_ckpt.get("model", t_ckpt) if isinstance(t_ckpt, dict) else t_ckpt
+        load_stats = load_state_dict_flexible(teacher_model, t_state, prefix="kd-teacher")
+        teacher_model.eval()
+        for p in teacher_model.parameters():
+            p.requires_grad_(False)
+        print(
+            f"[kd] loaded teacher from {teacher_ckpt} "
+            f"(loaded={load_stats.get('loaded', 0)}, skipped_shape={load_stats.get('skipped_shape', 0)})."
+        )
 
     proxy_fit_info: Dict[str, float] = {}
     if (
@@ -2164,6 +2426,11 @@ def train(args: argparse.Namespace) -> None:
             print(f"[l_feat] built feature encoder snapshot at epoch {epoch}.")
         if args.arch == "cldnn" and bool(getattr(model, "has_feat_encoder", False)):
             lambda_feat = get_lambda_feat(epoch, args)
+        lambda_kd_eff = get_lambda_kd(
+            epoch,
+            args,
+            teacher_enabled=(teacher_model is not None),
+        )
 
         # Curriculum learning: compute minimum SNR for this epoch
         curriculum_snr_min = get_curriculum_snr_min(
@@ -2177,6 +2444,8 @@ def train(args: argparse.Namespace) -> None:
         epoch_loss = 0.0
         epoch_loss_feat = 0.0
         epoch_lfeat_active = 0.0
+        epoch_loss_kd = 0.0
+        epoch_kd_active = 0.0
         epoch_correct = 0
         epoch_total = 0
         start_time = time.time()
@@ -2299,6 +2568,8 @@ def train(args: argparse.Namespace) -> None:
             eta_pred_for_noise = None
             loss_feat = torch.tensor(0.0, device=device)
             lfeat_active_frac_batch = torch.tensor(0.0, device=device)
+            loss_kd = torch.tensor(0.0, device=device)
+            kd_active_frac_batch = torch.tensor(0.0, device=device)
             if amp_enabled:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
                     if args.arch == "dit":
@@ -2474,6 +2745,30 @@ def train(args: argparse.Namespace) -> None:
                             + float(getattr(args, "lambda_id", 0.0)) * loss_id
                             + float(lambda_feat) * loss_feat
                         )
+
+                    # --- External teacher KD (oracle teacher -> blind student) ---
+                    if teacher_model is not None and float(lambda_kd_eff) > 0.0:
+                        teacher_snr_mode = str(getattr(args, "kd_teacher_snr_mode", "known"))
+                        teacher_snr_in = snr_aux if teacher_snr_mode == "known" else None
+                        with torch.no_grad():
+                            logits_teacher_kd, _, _ = teacher_model(
+                                x_aux,
+                                t,
+                                snr=teacher_snr_in,
+                                snr_mode=teacher_snr_mode,
+                                group_mask=mask,
+                            )
+                        logits_student_kd = logits_teacher_base if logits_teacher_base is not None else logits
+                        loss_kd, kd_active_frac_batch = kd_distillation_loss(
+                            logits_student_kd,
+                            logits_teacher_kd,
+                            temperature=float(getattr(args, "kd_temp", 2.0)),
+                            snr_db=snr_aux,
+                            snr_lo=float(getattr(args, "kd_snr_lo", -999.0)),
+                            snr_hi=float(getattr(args, "kd_snr_hi", 999.0)),
+                            conf_thresh=float(getattr(args, "kd_conf_thresh", 0.0)),
+                        )
+                        loss = loss + float(lambda_kd_eff) * loss_kd
 
                     # --- Supervised Contrastive Loss (SupCon) ---
                     # Skip on mixup batches — labels are ambiguous after interpolation.
@@ -2748,6 +3043,30 @@ def train(args: argparse.Namespace) -> None:
                         + float(lambda_feat) * loss_feat
                     )
 
+                # --- External teacher KD (oracle teacher -> blind student) ---
+                if teacher_model is not None and float(lambda_kd_eff) > 0.0:
+                    teacher_snr_mode = str(getattr(args, "kd_teacher_snr_mode", "known"))
+                    teacher_snr_in = snr_aux if teacher_snr_mode == "known" else None
+                    with torch.no_grad():
+                        logits_teacher_kd, _, _ = teacher_model(
+                            x_aux,
+                            t,
+                            snr=teacher_snr_in,
+                            snr_mode=teacher_snr_mode,
+                            group_mask=mask,
+                        )
+                    logits_student_kd = logits_teacher_base if logits_teacher_base is not None else logits
+                    loss_kd, kd_active_frac_batch = kd_distillation_loss(
+                        logits_student_kd,
+                        logits_teacher_kd,
+                        temperature=float(getattr(args, "kd_temp", 2.0)),
+                        snr_db=snr_aux,
+                        snr_lo=float(getattr(args, "kd_snr_lo", -999.0)),
+                        snr_hi=float(getattr(args, "kd_snr_hi", 999.0)),
+                        conf_thresh=float(getattr(args, "kd_conf_thresh", 0.0)),
+                    )
+                    loss = loss + float(lambda_kd_eff) * loss_kd
+
                 # --- Supervised Contrastive Loss (SupCon) ---
                 # Skip on mixup batches — labels are ambiguous after interpolation.
                 if (
@@ -2870,6 +3189,8 @@ def train(args: argparse.Namespace) -> None:
             epoch_loss += loss.item() * batch_size
             epoch_loss_feat += float(loss_feat.detach().item()) * batch_size
             epoch_lfeat_active += float(lfeat_active_frac_batch.detach().item()) * batch_size
+            epoch_loss_kd += float(loss_kd.detach().item()) * batch_size
+            epoch_kd_active += float(kd_active_frac_batch.detach().item()) * batch_size
             epoch_correct += (logits_for_acc_batch.argmax(dim=1) == y).sum().item()
             epoch_total += batch_size
             if epoch_total > 0:
@@ -2882,6 +3203,8 @@ def train(args: argparse.Namespace) -> None:
         train_loss = epoch_loss / max(1, epoch_total)
         train_loss_feat = epoch_loss_feat / max(1, epoch_total)
         train_lfeat_active_frac = epoch_lfeat_active / max(1, epoch_total)
+        train_loss_kd = epoch_loss_kd / max(1, epoch_total)
+        train_kd_active_frac = epoch_kd_active / max(1, epoch_total)
         train_acc = epoch_correct / max(1, epoch_total)
         train_acc_clean = None
         if train_eval_loader is not None:
@@ -2964,8 +3287,11 @@ def train(args: argparse.Namespace) -> None:
             "lambda_dn": float(getattr(args, "lambda_dn", 0.0)),
             "lambda_id": float(getattr(args, "lambda_id", 0.0)),
             "lambda_feat": float(lambda_feat),
+            "lambda_kd": float(lambda_kd_eff),
             "train_loss_feat": float(train_loss_feat),
             "train_lfeat_active_frac": float(train_lfeat_active_frac),
+            "train_loss_kd": float(train_loss_kd),
+            "train_kd_active_frac": float(train_kd_active_frac),
             "cls2dn_scale": float(cls2dn_scale),
             "p_clean": p_clean,
             "t_schedule": args.t_schedule,
