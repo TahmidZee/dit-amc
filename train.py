@@ -209,14 +209,31 @@ def get_lambda_feat(epoch: int, args: argparse.Namespace) -> float:
     return target * progress
 
 
-def get_lambda_kd(epoch: int, args: argparse.Namespace, teacher_enabled: bool) -> float:
+def get_kd_warmup_epoch(args: argparse.Namespace) -> int:
+    """
+    Effective KD warmup epoch, with optional stage-aware clamping.
+    """
+    warmup = int(max(0, getattr(args, "kd_warmup", 0)))
+    if bool(getattr(args, "kd_warmup_after_stages", False)):
+        stage_total = int(max(0, getattr(args, "stage_a_epochs", 0))) + int(max(0, getattr(args, "stage_b_epochs", 0)))
+        post_delay = int(max(0, getattr(args, "kd_post_stage_delay", 0)))
+        warmup = max(warmup, stage_total + post_delay)
+    return warmup
+
+
+def get_lambda_kd(
+    epoch: int,
+    args: argparse.Namespace,
+    teacher_enabled: bool,
+    target_attr: str = "lambda_kd",
+) -> float:
     """
     Optional warmup/ramp for external KD weight.
     """
-    target = float(getattr(args, "lambda_kd", 0.0))
+    target = float(getattr(args, target_attr, 0.0))
     if target <= 0.0 or not teacher_enabled:
         return 0.0
-    warmup = int(max(0, getattr(args, "kd_warmup", 0)))
+    warmup = get_kd_warmup_epoch(args)
     if epoch < warmup:
         return 0.0
     ramp_epochs = int(max(0, getattr(args, "kd_ramp", 0)))
@@ -235,10 +252,17 @@ def kd_distillation_loss(
     snr_lo: float = -999.0,
     snr_hi: float = 999.0,
     conf_thresh: float = 0.0,
+    labels: Optional[torch.Tensor] = None,
+    correctness_filter: bool = False,
+    normalize_by_active: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     KL distillation loss from teacher logits to student logits, with optional
-    confidence and low-band SNR gating.
+    confidence, correctness, and SNR gating.
+
+    By default this uses batch-mean scaling (`mean` over all samples after
+    weighting), which avoids over-amplifying per-sample KD gradients when the
+    KD mask is sparse (e.g., low-band-only KD).
     """
     if logits_student.shape != logits_teacher.shape:
         raise ValueError(
@@ -256,9 +280,17 @@ def kd_distillation_loss(
     if snr_db is not None:
         snr_f = snr_db.float()
         weight = weight * ((snr_f >= float(snr_lo)) & (snr_f <= float(snr_hi))).float()
+    if correctness_filter and labels is not None:
+        labels_f = labels.reshape(-1).to(device=logits_teacher.device, dtype=torch.long)
+        if labels_f.shape[0] == logits_teacher.shape[0]:
+            teacher_pred = logits_teacher.detach().argmax(dim=1)
+            weight = weight * (teacher_pred == labels_f).float()
 
-    denom = torch.clamp(weight.sum(), min=1.0)
-    loss = (kl_per_sample * weight).sum() / denom * (t ** 2)
+    if normalize_by_active:
+        denom = torch.clamp(weight.sum(), min=1.0)
+        loss = (kl_per_sample * weight).sum() / denom * (t ** 2)
+    else:
+        loss = (kl_per_sample * weight).mean() * (t ** 2)
     active_frac = weight.mean()
     return loss, active_frac
 
@@ -1026,8 +1058,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-kd", type=float, default=0.0, help="Weight for external KD KL loss.")
     parser.add_argument("--kd-temp", type=float, default=2.0, help="Temperature for KD soft targets.")
     parser.add_argument("--kd-warmup", type=int, default=0, help="Epochs to wait before KD starts.")
+    parser.add_argument(
+        "--kd-warmup-after-stages",
+        dest="kd_warmup_after_stages",
+        action="store_true",
+        help="Clamp KD warmup to start after Stage-A/B plus --kd-post-stage-delay.",
+    )
+    parser.add_argument(
+        "--no-kd-warmup-after-stages",
+        dest="kd_warmup_after_stages",
+        action="store_false",
+        help="Disable stage-aware KD warmup clamp; use --kd-warmup as-is.",
+    )
+    parser.set_defaults(kd_warmup_after_stages=True)
+    parser.add_argument(
+        "--kd-post-stage-delay",
+        type=int,
+        default=8,
+        help="Extra epochs to wait after Stage-A/B before enabling KD when --kd-warmup-after-stages is enabled.",
+    )
     parser.add_argument("--kd-ramp", type=int, default=0, help="Ramp KD weight over this many epochs after warmup (0 = no ramp).")
     parser.add_argument("--kd-conf-thresh", type=float, default=0.0, help="Minimum teacher confidence to apply KD (0 = disabled).")
+    parser.add_argument(
+        "--kd-correctness-filter",
+        dest="kd_correctness_filter",
+        action="store_true",
+        help="Apply KD only when teacher argmax matches ground-truth label (recommended for noisy low-SNR distillation).",
+    )
+    parser.add_argument(
+        "--no-kd-correctness-filter",
+        dest="kd_correctness_filter",
+        action="store_false",
+        help="Disable teacher correctness filtering for KD.",
+    )
+    parser.set_defaults(kd_correctness_filter=True)
+    parser.add_argument(
+        "--kd-normalize-by-active",
+        action="store_true",
+        help="Legacy KD scaling: normalize by active mask count instead of batch mean.",
+    )
     parser.add_argument("--kd-snr-lo", type=float, default=-999.0, help="Lower SNR bound for KD (low-band KD when set, e.g. -14).")
     parser.add_argument("--kd-snr-hi", type=float, default=999.0, help="Upper SNR bound for KD (low-band KD when set, e.g. -6).")
     parser.add_argument(
@@ -1060,6 +1129,47 @@ def parse_args() -> argparse.Namespace:
         choices=["known", "predict", "none"],
         default="known",
         help="Teacher conditioning mode during KD forward pass. Use 'known' for oracle teacher distillation.",
+    )
+    parser.add_argument(
+        "--kd-disable-mixup",
+        action="store_true",
+        help="Disable mixup whenever any KD objective is enabled (sanity mode to reduce gradient conflict).",
+    )
+    parser.add_argument(
+        "--lambda-kd-denoise",
+        type=float,
+        default=0.0,
+        help="Weight for teacher->student denoiser-output distillation (L1).",
+    )
+    parser.add_argument(
+        "--kd-denoise-snr-lo",
+        type=float,
+        default=-14.0,
+        help="Lower SNR bound for denoiser KD.",
+    )
+    parser.add_argument(
+        "--kd-denoise-snr-hi",
+        type=float,
+        default=-6.0,
+        help="Upper SNR bound for denoiser KD.",
+    )
+    parser.add_argument(
+        "--lambda-kd-feat",
+        type=float,
+        default=0.0,
+        help="Weight for pre-FiLM pooled feature KD (teacher->student).",
+    )
+    parser.add_argument(
+        "--kd-feat-snr-lo",
+        type=float,
+        default=-14.0,
+        help="Lower SNR bound for pre-FiLM feature KD.",
+    )
+    parser.add_argument(
+        "--kd-feat-snr-hi",
+        type=float,
+        default=-6.0,
+        help="Upper SNR bound for pre-FiLM feature KD.",
     )
 
     # Contrastive pre-training
@@ -2069,16 +2179,30 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("feat_ramp_epochs must be >= 0.")
     if float(getattr(args, "lambda_feat", 0.0)) > 0 and not bool(getattr(args, "cldnn_denoiser", False)):
         raise ValueError("lambda_feat > 0 requires --cldnn-denoiser.")
-    if float(getattr(args, "lambda_kd", 0.0)) < 0.0:
+    lambda_kd = float(getattr(args, "lambda_kd", 0.0))
+    lambda_kd_denoise = float(getattr(args, "lambda_kd_denoise", 0.0))
+    lambda_kd_feat = float(getattr(args, "lambda_kd_feat", 0.0))
+    if lambda_kd < 0.0:
         raise ValueError("lambda_kd must be >= 0.")
-    if float(getattr(args, "lambda_kd", 0.0)) > 0.0 and not getattr(args, "teacher_ckpt", None):
-        raise ValueError("lambda_kd > 0 requires --teacher-ckpt.")
+    if lambda_kd_denoise < 0.0:
+        raise ValueError("lambda_kd_denoise must be >= 0.")
+    if lambda_kd_feat < 0.0:
+        raise ValueError("lambda_kd_feat must be >= 0.")
+    kd_any_target = (lambda_kd > 0.0) or (lambda_kd_denoise > 0.0) or (lambda_kd_feat > 0.0)
+    if kd_any_target and not getattr(args, "teacher_ckpt", None):
+        raise ValueError("Any KD objective requires --teacher-ckpt.")
     if int(getattr(args, "kd_warmup", 0)) < 0 or int(getattr(args, "kd_ramp", 0)) < 0:
         raise ValueError("kd_warmup and kd_ramp must be >= 0.")
+    if int(getattr(args, "kd_post_stage_delay", 0)) < 0:
+        raise ValueError("kd_post_stage_delay must be >= 0.")
     if float(getattr(args, "kd_temp", 2.0)) <= 0.0:
         raise ValueError("kd_temp must be > 0.")
     if float(getattr(args, "kd_snr_lo", -999.0)) > float(getattr(args, "kd_snr_hi", 999.0)):
         raise ValueError("kd_snr_lo must be <= kd_snr_hi.")
+    if float(getattr(args, "kd_denoise_snr_lo", -14.0)) > float(getattr(args, "kd_denoise_snr_hi", -6.0)):
+        raise ValueError("kd_denoise_snr_lo must be <= kd_denoise_snr_hi.")
+    if float(getattr(args, "kd_feat_snr_lo", -14.0)) > float(getattr(args, "kd_feat_snr_hi", -6.0)):
+        raise ValueError("kd_feat_snr_lo must be <= kd_feat_snr_hi.")
     if float(getattr(args, "kd_hi_preserve_scale", 0.0)) < 0.0:
         raise ValueError("kd_hi_preserve_scale must be >= 0.")
     if float(getattr(args, "kd_hi_snr_lo", 10.0)) > float(getattr(args, "kd_hi_snr_hi", 18.0)):
@@ -2087,8 +2211,15 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("kd_hi_preserve_scale > 0 requires lambda_kd > 0.")
     if float(getattr(args, "kd_hi_conf_thresh", -1.0)) >= 1.0:
         raise ValueError("kd_hi_conf_thresh must be < 1.0 (or <0 to reuse kd-conf-thresh).")
-    if float(getattr(args, "lambda_kd", 0.0)) <= 0.0 and getattr(args, "teacher_ckpt", None):
-        print("[kd] teacher_ckpt provided but lambda_kd <= 0; external KD disabled.")
+    if float(getattr(args, "lambda_kd_denoise", 0.0)) > 0.0:
+        if args.arch != "cldnn":
+            raise ValueError("lambda_kd_denoise > 0 currently requires --arch cldnn.")
+        if not bool(getattr(args, "cldnn_denoiser", False)):
+            raise ValueError("lambda_kd_denoise > 0 requires --cldnn-denoiser.")
+    if float(getattr(args, "lambda_kd_feat", 0.0)) > 0.0 and args.arch != "cldnn":
+        raise ValueError("lambda_kd_feat > 0 currently requires --arch cldnn.")
+    if not kd_any_target and getattr(args, "teacher_ckpt", None):
+        print("[kd] teacher_ckpt provided but all KD lambdas <= 0; external KD objectives disabled.")
     if float(getattr(args, "report_low_snr_lo", -14.0)) > float(getattr(args, "report_low_snr_hi", -6.0)):
         raise ValueError("report_low_snr_lo must be <= report_low_snr_hi.")
     if float(getattr(args, "noise_rho_min", 1e-4)) <= 0 or float(getattr(args, "noise_rho_max", 1.0 - 1e-4)) >= 1:
@@ -2233,7 +2364,12 @@ def train(args: argparse.Namespace) -> None:
         schedule = None
 
     teacher_model: Optional[torch.nn.Module] = None
-    if float(getattr(args, "lambda_kd", 0.0)) > 0.0:
+    kd_teacher_needed = (
+        float(getattr(args, "lambda_kd", 0.0)) > 0.0
+        or float(getattr(args, "lambda_kd_denoise", 0.0)) > 0.0
+        or float(getattr(args, "lambda_kd_feat", 0.0)) > 0.0
+    )
+    if kd_teacher_needed:
         teacher_ckpt = str(getattr(args, "teacher_ckpt"))
         if not os.path.exists(teacher_ckpt):
             raise FileNotFoundError(f"teacher_ckpt not found: {teacher_ckpt}")
@@ -2261,6 +2397,8 @@ def train(args: argparse.Namespace) -> None:
         teacher_model.eval()
         for p in teacher_model.parameters():
             p.requires_grad_(False)
+        if float(getattr(args, "lambda_kd_denoise", 0.0)) > 0.0 and not hasattr(teacher_model, "denoise_only"):
+            raise ValueError("lambda_kd_denoise > 0 requires a teacher checkpoint/model with denoise_only().")
         print(
             f"[kd] loaded teacher from {teacher_ckpt} "
             f"(loaded={load_stats.get('loaded', 0)}, skipped_shape={load_stats.get('skipped_shape', 0)})."
@@ -2544,6 +2682,19 @@ def train(args: argparse.Namespace) -> None:
             epoch,
             args,
             teacher_enabled=(teacher_model is not None),
+            target_attr="lambda_kd",
+        )
+        lambda_kd_denoise_eff = get_lambda_kd(
+            epoch,
+            args,
+            teacher_enabled=(teacher_model is not None),
+            target_attr="lambda_kd_denoise",
+        )
+        lambda_kd_feat_eff = get_lambda_kd(
+            epoch,
+            args,
+            teacher_enabled=(teacher_model is not None),
+            target_attr="lambda_kd_feat",
         )
 
         # Curriculum learning: compute minimum SNR for this epoch
@@ -2562,6 +2713,10 @@ def train(args: argparse.Namespace) -> None:
         epoch_kd_active = 0.0
         epoch_loss_kd_hi = 0.0
         epoch_kd_hi_active = 0.0
+        epoch_loss_kd_denoise = 0.0
+        epoch_kd_denoise_active = 0.0
+        epoch_loss_kd_feat = 0.0
+        epoch_kd_feat_active = 0.0
         epoch_correct = 0
         epoch_total = 0
         start_time = time.time()
@@ -2652,7 +2807,16 @@ def train(args: argparse.Namespace) -> None:
             use_mixup = False
             mixup_cls_only = bool(getattr(args, "mixup_cls_only", True))
             y_a, y_b, lam = y, y, 1.0
-            if args.arch != "dit" and args.mixup_alpha > 0 and random.random() < args.mixup_prob:
+            kd_objectives_configured = (
+                teacher_model is not None
+                and (
+                    float(getattr(args, "lambda_kd", 0.0)) > 0.0
+                    or float(getattr(args, "lambda_kd_denoise", 0.0)) > 0.0
+                    or float(getattr(args, "lambda_kd_feat", 0.0)) > 0.0
+                )
+            )
+            allow_mixup = not (bool(getattr(args, "kd_disable_mixup", False)) and kd_objectives_configured)
+            if allow_mixup and args.arch != "dit" and args.mixup_alpha > 0 and random.random() < args.mixup_prob:
                 use_mixup = True
                 x_cls, y_a, y_b, lam, snr_cls = mixup_data(
                     x_clean,
@@ -2688,6 +2852,11 @@ def train(args: argparse.Namespace) -> None:
             kd_active_frac_batch = torch.tensor(0.0, device=device)
             loss_kd_hi = torch.tensor(0.0, device=device)
             kd_hi_active_frac_batch = torch.tensor(0.0, device=device)
+            loss_kd_denoise = torch.tensor(0.0, device=device)
+            kd_denoise_active_frac_batch = torch.tensor(0.0, device=device)
+            loss_kd_feat = torch.tensor(0.0, device=device)
+            kd_feat_active_frac_batch = torch.tensor(0.0, device=device)
+            student_prefilm_kd: Optional[torch.Tensor] = None
             if amp_enabled:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
                     if args.arch == "dit":
@@ -2712,6 +2881,7 @@ def train(args: argparse.Namespace) -> None:
                                 group_mask=mask,
                                 **extra_cls2dn,
                             )
+                            student_prefilm_kd = getattr(model, "_pooled_pre_film", None)
                             eta_pred_for_noise = getattr(model, "_eta_pred", None)
                             logits, _x0_pred_mix, _snr_pred_mix = model(
                                 x_cls,
@@ -2732,6 +2902,7 @@ def train(args: argparse.Namespace) -> None:
                                 group_mask=mask,
                                 **extra_cls2dn,
                             )
+                            student_prefilm_kd = getattr(model, "_pooled_pre_film", None)
                             eta_pred_for_noise = getattr(model, "_eta_pred", None)
                             logits_for_acc = logits
                             logits_teacher_base = logits
@@ -2865,43 +3036,116 @@ def train(args: argparse.Namespace) -> None:
                         )
 
                     # --- External teacher KD (oracle teacher -> blind student) ---
-                    if teacher_model is not None and float(lambda_kd_eff) > 0.0:
+                    if (
+                        teacher_model is not None
+                        and (
+                            float(lambda_kd_eff) > 0.0
+                            or float(lambda_kd_denoise_eff) > 0.0
+                            or float(lambda_kd_feat_eff) > 0.0
+                        )
+                    ):
                         teacher_snr_mode = str(getattr(args, "kd_teacher_snr_mode", "known"))
                         teacher_snr_in = snr_aux if teacher_snr_mode == "known" else None
-                        with torch.no_grad():
-                            logits_teacher_kd, _, _ = teacher_model(
-                                x_aux,
-                                t,
-                                snr=teacher_snr_in,
-                                snr_mode=teacher_snr_mode,
-                                group_mask=mask,
-                            )
-                        logits_student_kd = logits_teacher_base if logits_teacher_base is not None else logits
-                        loss_kd, kd_active_frac_batch = kd_distillation_loss(
-                            logits_student_kd,
-                            logits_teacher_kd,
-                            temperature=float(getattr(args, "kd_temp", 2.0)),
-                            snr_db=snr_aux,
-                            snr_lo=float(getattr(args, "kd_snr_lo", -999.0)),
-                            snr_hi=float(getattr(args, "kd_snr_hi", 999.0)),
-                            conf_thresh=float(getattr(args, "kd_conf_thresh", 0.0)),
-                        )
-                        kd_hi_scale = float(getattr(args, "kd_hi_preserve_scale", 0.0))
-                        if kd_hi_scale > 0.0:
-                            kd_hi_conf = float(getattr(args, "kd_hi_conf_thresh", -1.0))
-                            if kd_hi_conf < 0.0:
-                                kd_hi_conf = float(getattr(args, "kd_conf_thresh", 0.0))
-                            loss_kd_hi, kd_hi_active_frac_batch = kd_distillation_loss(
+                        labels_kd = y if (not use_mixup or mixup_cls_only) else None
+                        logits_teacher_kd: Optional[torch.Tensor] = None
+                        teacher_prefilm_kd: Optional[torch.Tensor] = None
+
+                        if float(lambda_kd_eff) > 0.0 or float(lambda_kd_feat_eff) > 0.0:
+                            with torch.no_grad():
+                                logits_teacher_kd, _, _ = teacher_model(
+                                    x_aux,
+                                    t,
+                                    snr=teacher_snr_in,
+                                    snr_mode=teacher_snr_mode,
+                                    group_mask=mask,
+                                )
+                                teacher_prefilm_kd = getattr(teacher_model, "_pooled_pre_film", None)
+
+                        if float(lambda_kd_eff) > 0.0 and logits_teacher_kd is not None:
+                            logits_student_kd = logits_teacher_base if logits_teacher_base is not None else logits
+                            loss_kd, kd_active_frac_batch = kd_distillation_loss(
                                 logits_student_kd,
                                 logits_teacher_kd,
                                 temperature=float(getattr(args, "kd_temp", 2.0)),
                                 snr_db=snr_aux,
-                                snr_lo=float(getattr(args, "kd_hi_snr_lo", 10.0)),
-                                snr_hi=float(getattr(args, "kd_hi_snr_hi", 18.0)),
-                                conf_thresh=kd_hi_conf,
+                                snr_lo=float(getattr(args, "kd_snr_lo", -999.0)),
+                                snr_hi=float(getattr(args, "kd_snr_hi", 999.0)),
+                                conf_thresh=float(getattr(args, "kd_conf_thresh", 0.0)),
+                                labels=labels_kd,
+                                correctness_filter=bool(getattr(args, "kd_correctness_filter", True)),
+                                normalize_by_active=bool(getattr(args, "kd_normalize_by_active", False)),
                             )
-                            loss_kd = loss_kd + kd_hi_scale * loss_kd_hi
-                        loss = loss + float(lambda_kd_eff) * loss_kd
+                            kd_hi_scale = float(getattr(args, "kd_hi_preserve_scale", 0.0))
+                            if kd_hi_scale > 0.0:
+                                kd_hi_conf = float(getattr(args, "kd_hi_conf_thresh", -1.0))
+                                if kd_hi_conf < 0.0:
+                                    kd_hi_conf = float(getattr(args, "kd_conf_thresh", 0.0))
+                                loss_kd_hi, kd_hi_active_frac_batch = kd_distillation_loss(
+                                    logits_student_kd,
+                                    logits_teacher_kd,
+                                    temperature=float(getattr(args, "kd_temp", 2.0)),
+                                    snr_db=snr_aux,
+                                    snr_lo=float(getattr(args, "kd_hi_snr_lo", 10.0)),
+                                    snr_hi=float(getattr(args, "kd_hi_snr_hi", 18.0)),
+                                    conf_thresh=kd_hi_conf,
+                                    labels=labels_kd,
+                                    correctness_filter=bool(getattr(args, "kd_correctness_filter", True)),
+                                    normalize_by_active=bool(getattr(args, "kd_normalize_by_active", False)),
+                                )
+                                loss_kd = loss_kd + kd_hi_scale * loss_kd_hi
+                            loss = loss + float(lambda_kd_eff) * loss_kd
+
+                        if (
+                            float(lambda_kd_denoise_eff) > 0.0
+                            and args.arch == "cldnn"
+                            and hasattr(model, "denoise_only")
+                            and hasattr(teacher_model, "denoise_only")
+                        ):
+                            if x_aux.ndim == 4:
+                                g_kd = x_aux.shape[1]
+                                x_dn_kd = x_aux.reshape(-1, x_aux.shape[2], x_aux.shape[3])
+                                snr_dn_kd = snr_aux.repeat_interleave(g_kd)
+                            else:
+                                x_dn_kd = x_aux
+                                snr_dn_kd = snr_aux
+                            snr_teacher_dn = snr_dn_kd if teacher_snr_mode == "known" else None
+                            snr_student_dn = snr_dn_kd if args.snr_mode == "known" else None
+                            with torch.no_grad():
+                                x_dn_teacher, _, _ = teacher_model.denoise_only(
+                                    x_dn_kd, snr=snr_teacher_dn, snr_mode=teacher_snr_mode
+                                )
+                            x_dn_student, _, _ = model.denoise_only(
+                                x_dn_kd, snr=snr_student_dn, snr_mode=args.snr_mode
+                            )
+                            dn_vec = torch.mean(torch.abs(x_dn_student.float() - x_dn_teacher.float()), dim=(1, 2))
+                            dn_mask = (
+                                (snr_dn_kd.float() >= float(getattr(args, "kd_denoise_snr_lo", -14.0)))
+                                & (snr_dn_kd.float() <= float(getattr(args, "kd_denoise_snr_hi", -6.0)))
+                            ).float()
+                            loss_kd_denoise = (dn_vec * dn_mask).mean()
+                            kd_denoise_active_frac_batch = dn_mask.mean()
+                            loss = loss + float(lambda_kd_denoise_eff) * loss_kd_denoise
+
+                        if (
+                            float(lambda_kd_feat_eff) > 0.0
+                            and student_prefilm_kd is not None
+                            and teacher_prefilm_kd is not None
+                            and student_prefilm_kd.shape == teacher_prefilm_kd.shape
+                        ):
+                            feat_student = F.normalize(student_prefilm_kd.float(), dim=1)
+                            feat_teacher = F.normalize(teacher_prefilm_kd.detach().float(), dim=1)
+                            feat_vec = torch.sum((feat_student - feat_teacher) ** 2, dim=1)
+                            snr_feat_kd = snr_aux
+                            if snr_feat_kd.shape[0] != feat_vec.shape[0] and x_aux.ndim == 4:
+                                snr_feat_kd = snr_aux.repeat_interleave(x_aux.shape[1])
+                            if snr_feat_kd.shape[0] == feat_vec.shape[0]:
+                                feat_mask = (
+                                    (snr_feat_kd.float() >= float(getattr(args, "kd_feat_snr_lo", -14.0)))
+                                    & (snr_feat_kd.float() <= float(getattr(args, "kd_feat_snr_hi", -6.0)))
+                                ).float()
+                                loss_kd_feat = (feat_vec * feat_mask).mean()
+                                kd_feat_active_frac_batch = feat_mask.mean()
+                                loss = loss + float(lambda_kd_feat_eff) * loss_kd_feat
 
                     # --- Supervised Contrastive Loss (SupCon) ---
                     # Skip on mixup batches — labels are ambiguous after interpolation.
@@ -3025,6 +3269,7 @@ def train(args: argparse.Namespace) -> None:
                             group_mask=mask,
                             **extra_cls2dn,
                         )
+                        student_prefilm_kd = getattr(model, "_pooled_pre_film", None)
                         eta_pred_for_noise = getattr(model, "_eta_pred", None)
                         logits, _x0_pred_mix, _snr_pred_mix = model(
                             x_cls,
@@ -3045,6 +3290,7 @@ def train(args: argparse.Namespace) -> None:
                             group_mask=mask,
                             **extra_cls2dn,
                         )
+                        student_prefilm_kd = getattr(model, "_pooled_pre_film", None)
                         eta_pred_for_noise = getattr(model, "_eta_pred", None)
                         logits_for_acc = logits
                         logits_teacher_base = logits
@@ -3177,43 +3423,116 @@ def train(args: argparse.Namespace) -> None:
                     )
 
                 # --- External teacher KD (oracle teacher -> blind student) ---
-                if teacher_model is not None and float(lambda_kd_eff) > 0.0:
+                if (
+                    teacher_model is not None
+                    and (
+                        float(lambda_kd_eff) > 0.0
+                        or float(lambda_kd_denoise_eff) > 0.0
+                        or float(lambda_kd_feat_eff) > 0.0
+                    )
+                ):
                     teacher_snr_mode = str(getattr(args, "kd_teacher_snr_mode", "known"))
                     teacher_snr_in = snr_aux if teacher_snr_mode == "known" else None
-                    with torch.no_grad():
-                        logits_teacher_kd, _, _ = teacher_model(
-                            x_aux,
-                            t,
-                            snr=teacher_snr_in,
-                            snr_mode=teacher_snr_mode,
-                            group_mask=mask,
-                        )
-                    logits_student_kd = logits_teacher_base if logits_teacher_base is not None else logits
-                    loss_kd, kd_active_frac_batch = kd_distillation_loss(
-                        logits_student_kd,
-                        logits_teacher_kd,
-                        temperature=float(getattr(args, "kd_temp", 2.0)),
-                        snr_db=snr_aux,
-                        snr_lo=float(getattr(args, "kd_snr_lo", -999.0)),
-                        snr_hi=float(getattr(args, "kd_snr_hi", 999.0)),
-                        conf_thresh=float(getattr(args, "kd_conf_thresh", 0.0)),
-                    )
-                    kd_hi_scale = float(getattr(args, "kd_hi_preserve_scale", 0.0))
-                    if kd_hi_scale > 0.0:
-                        kd_hi_conf = float(getattr(args, "kd_hi_conf_thresh", -1.0))
-                        if kd_hi_conf < 0.0:
-                            kd_hi_conf = float(getattr(args, "kd_conf_thresh", 0.0))
-                        loss_kd_hi, kd_hi_active_frac_batch = kd_distillation_loss(
+                    labels_kd = y if (not use_mixup or mixup_cls_only) else None
+                    logits_teacher_kd: Optional[torch.Tensor] = None
+                    teacher_prefilm_kd: Optional[torch.Tensor] = None
+
+                    if float(lambda_kd_eff) > 0.0 or float(lambda_kd_feat_eff) > 0.0:
+                        with torch.no_grad():
+                            logits_teacher_kd, _, _ = teacher_model(
+                                x_aux,
+                                t,
+                                snr=teacher_snr_in,
+                                snr_mode=teacher_snr_mode,
+                                group_mask=mask,
+                            )
+                            teacher_prefilm_kd = getattr(teacher_model, "_pooled_pre_film", None)
+
+                    if float(lambda_kd_eff) > 0.0 and logits_teacher_kd is not None:
+                        logits_student_kd = logits_teacher_base if logits_teacher_base is not None else logits
+                        loss_kd, kd_active_frac_batch = kd_distillation_loss(
                             logits_student_kd,
                             logits_teacher_kd,
                             temperature=float(getattr(args, "kd_temp", 2.0)),
                             snr_db=snr_aux,
-                            snr_lo=float(getattr(args, "kd_hi_snr_lo", 10.0)),
-                            snr_hi=float(getattr(args, "kd_hi_snr_hi", 18.0)),
-                            conf_thresh=kd_hi_conf,
+                            snr_lo=float(getattr(args, "kd_snr_lo", -999.0)),
+                            snr_hi=float(getattr(args, "kd_snr_hi", 999.0)),
+                            conf_thresh=float(getattr(args, "kd_conf_thresh", 0.0)),
+                            labels=labels_kd,
+                            correctness_filter=bool(getattr(args, "kd_correctness_filter", True)),
+                            normalize_by_active=bool(getattr(args, "kd_normalize_by_active", False)),
                         )
-                        loss_kd = loss_kd + kd_hi_scale * loss_kd_hi
-                    loss = loss + float(lambda_kd_eff) * loss_kd
+                        kd_hi_scale = float(getattr(args, "kd_hi_preserve_scale", 0.0))
+                        if kd_hi_scale > 0.0:
+                            kd_hi_conf = float(getattr(args, "kd_hi_conf_thresh", -1.0))
+                            if kd_hi_conf < 0.0:
+                                kd_hi_conf = float(getattr(args, "kd_conf_thresh", 0.0))
+                            loss_kd_hi, kd_hi_active_frac_batch = kd_distillation_loss(
+                                logits_student_kd,
+                                logits_teacher_kd,
+                                temperature=float(getattr(args, "kd_temp", 2.0)),
+                                snr_db=snr_aux,
+                                snr_lo=float(getattr(args, "kd_hi_snr_lo", 10.0)),
+                                snr_hi=float(getattr(args, "kd_hi_snr_hi", 18.0)),
+                                conf_thresh=kd_hi_conf,
+                                labels=labels_kd,
+                                correctness_filter=bool(getattr(args, "kd_correctness_filter", True)),
+                                normalize_by_active=bool(getattr(args, "kd_normalize_by_active", False)),
+                            )
+                            loss_kd = loss_kd + kd_hi_scale * loss_kd_hi
+                        loss = loss + float(lambda_kd_eff) * loss_kd
+
+                    if (
+                        float(lambda_kd_denoise_eff) > 0.0
+                        and args.arch == "cldnn"
+                        and hasattr(model, "denoise_only")
+                        and hasattr(teacher_model, "denoise_only")
+                    ):
+                        if x_aux.ndim == 4:
+                            g_kd = x_aux.shape[1]
+                            x_dn_kd = x_aux.reshape(-1, x_aux.shape[2], x_aux.shape[3])
+                            snr_dn_kd = snr_aux.repeat_interleave(g_kd)
+                        else:
+                            x_dn_kd = x_aux
+                            snr_dn_kd = snr_aux
+                        snr_teacher_dn = snr_dn_kd if teacher_snr_mode == "known" else None
+                        snr_student_dn = snr_dn_kd if args.snr_mode == "known" else None
+                        with torch.no_grad():
+                            x_dn_teacher, _, _ = teacher_model.denoise_only(
+                                x_dn_kd, snr=snr_teacher_dn, snr_mode=teacher_snr_mode
+                            )
+                        x_dn_student, _, _ = model.denoise_only(
+                            x_dn_kd, snr=snr_student_dn, snr_mode=args.snr_mode
+                        )
+                        dn_vec = torch.mean(torch.abs(x_dn_student.float() - x_dn_teacher.float()), dim=(1, 2))
+                        dn_mask = (
+                            (snr_dn_kd.float() >= float(getattr(args, "kd_denoise_snr_lo", -14.0)))
+                            & (snr_dn_kd.float() <= float(getattr(args, "kd_denoise_snr_hi", -6.0)))
+                        ).float()
+                        loss_kd_denoise = (dn_vec * dn_mask).mean()
+                        kd_denoise_active_frac_batch = dn_mask.mean()
+                        loss = loss + float(lambda_kd_denoise_eff) * loss_kd_denoise
+
+                    if (
+                        float(lambda_kd_feat_eff) > 0.0
+                        and student_prefilm_kd is not None
+                        and teacher_prefilm_kd is not None
+                        and student_prefilm_kd.shape == teacher_prefilm_kd.shape
+                    ):
+                        feat_student = F.normalize(student_prefilm_kd.float(), dim=1)
+                        feat_teacher = F.normalize(teacher_prefilm_kd.detach().float(), dim=1)
+                        feat_vec = torch.sum((feat_student - feat_teacher) ** 2, dim=1)
+                        snr_feat_kd = snr_aux
+                        if snr_feat_kd.shape[0] != feat_vec.shape[0] and x_aux.ndim == 4:
+                            snr_feat_kd = snr_aux.repeat_interleave(x_aux.shape[1])
+                        if snr_feat_kd.shape[0] == feat_vec.shape[0]:
+                            feat_mask = (
+                                (snr_feat_kd.float() >= float(getattr(args, "kd_feat_snr_lo", -14.0)))
+                                & (snr_feat_kd.float() <= float(getattr(args, "kd_feat_snr_hi", -6.0)))
+                            ).float()
+                            loss_kd_feat = (feat_vec * feat_mask).mean()
+                            kd_feat_active_frac_batch = feat_mask.mean()
+                            loss = loss + float(lambda_kd_feat_eff) * loss_kd_feat
 
                 # --- Supervised Contrastive Loss (SupCon) ---
                 # Skip on mixup batches — labels are ambiguous after interpolation.
@@ -3341,6 +3660,10 @@ def train(args: argparse.Namespace) -> None:
             epoch_kd_active += float(kd_active_frac_batch.detach().item()) * batch_size
             epoch_loss_kd_hi += float(loss_kd_hi.detach().item()) * batch_size
             epoch_kd_hi_active += float(kd_hi_active_frac_batch.detach().item()) * batch_size
+            epoch_loss_kd_denoise += float(loss_kd_denoise.detach().item()) * batch_size
+            epoch_kd_denoise_active += float(kd_denoise_active_frac_batch.detach().item()) * batch_size
+            epoch_loss_kd_feat += float(loss_kd_feat.detach().item()) * batch_size
+            epoch_kd_feat_active += float(kd_feat_active_frac_batch.detach().item()) * batch_size
             epoch_correct += (logits_for_acc_batch.argmax(dim=1) == y).sum().item()
             epoch_total += batch_size
             if epoch_total > 0:
@@ -3357,6 +3680,10 @@ def train(args: argparse.Namespace) -> None:
         train_kd_active_frac = epoch_kd_active / max(1, epoch_total)
         train_loss_kd_hi = epoch_loss_kd_hi / max(1, epoch_total)
         train_kd_hi_active_frac = epoch_kd_hi_active / max(1, epoch_total)
+        train_loss_kd_denoise = epoch_loss_kd_denoise / max(1, epoch_total)
+        train_kd_denoise_active_frac = epoch_kd_denoise_active / max(1, epoch_total)
+        train_loss_kd_feat = epoch_loss_kd_feat / max(1, epoch_total)
+        train_kd_feat_active_frac = epoch_kd_feat_active / max(1, epoch_total)
         train_acc = epoch_correct / max(1, epoch_total)
         train_acc_clean = None
         if train_eval_loader is not None:
@@ -3458,12 +3785,18 @@ def train(args: argparse.Namespace) -> None:
             "lambda_id": float(getattr(args, "lambda_id", 0.0)),
             "lambda_feat": float(lambda_feat),
             "lambda_kd": float(lambda_kd_eff),
+            "lambda_kd_denoise": float(lambda_kd_denoise_eff),
+            "lambda_kd_feat": float(lambda_kd_feat_eff),
             "train_loss_feat": float(train_loss_feat),
             "train_lfeat_active_frac": float(train_lfeat_active_frac),
             "train_loss_kd": float(train_loss_kd),
             "train_kd_active_frac": float(train_kd_active_frac),
             "train_loss_kd_hi": float(train_loss_kd_hi),
             "train_kd_hi_active_frac": float(train_kd_hi_active_frac),
+            "train_loss_kd_denoise": float(train_loss_kd_denoise),
+            "train_kd_denoise_active_frac": float(train_kd_denoise_active_frac),
+            "train_loss_kd_feat": float(train_loss_kd_feat),
+            "train_kd_feat_active_frac": float(train_kd_feat_active_frac),
             "cls2dn_scale": float(cls2dn_scale),
             "p_clean": p_clean,
             "t_schedule": args.t_schedule,

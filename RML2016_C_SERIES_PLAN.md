@@ -240,10 +240,47 @@ Wave-4D exit criterion:
 
 ---
 
-## Wave 5M (Queued After W4D): MoE Head Decoupling
+## Wave 4D-Fix (Activated Next): KD Stabilization + Privileged Transfer
+
+Reason:
+- Wave-4D kept the same Pareto shape (low-band up, mid/high down), which is consistent with KD over-steering a shared trunk.
+- Feedback-2 fixes were implemented in `train.py` before moving to MoE.
+
+Implemented KD fixes in code:
+- KD scaling now defaults to **batch-mean** (not active-count mean) to avoid low-band over-amplification.
+- **Correctness-filtered KD** added (`--kd-correctness-filter`, default on).
+- Stage-aware KD start added:
+  - `--kd-warmup-after-stages` (default on)
+  - `--kd-post-stage-delay 8` (default), so KD starts after Stage-A/B + delay.
+- Mixup conflict control:
+  - `--kd-disable-mixup` to run KD without mixup as a clean sanity condition.
+- New optional privileged-transfer channels:
+  - **Denoiser KD**: `--lambda-kd-denoise`, low-band gated by `--kd-denoise-snr-lo/hi`
+  - **Pre-FiLM feature KD**: `--lambda-kd-feat`, low-band gated by `--kd-feat-snr-lo/hi`
+
+Wave-4D-Fix matrix (8 runs):
+
+| ID | Run name | Delta flags vs `w3r_noexp_softsched` base | Expected effect |
+|---|---|---|---|
+| W4DF-0 | `w4df_kd_low_l020_stable` | low-band KD + `--kd-disable-mixup --kd-correctness-filter --kd-warmup-after-stages --kd-post-stage-delay 8` | sanity-stable baseline |
+| W4DF-1 | `w4df_kd_low_l020_twomask_stable` | W4DF-0 + high-band preserve KD (`--kd-hi-preserve-scale 0.20`) | test high-band retention after scaling fix |
+| W4DF-2 | `w4df_kd_low_l025_twomask` | W4DF-1 + `--lambda-kd 0.25` | stronger KD under stabilized scaling |
+| W4DF-3 | `w4df_kd_low_l020_t30` | W4DF-0 + `--kd-temp 3.0` | softer teacher targets |
+| W4DF-4 | `w4df_kd_low_l020_dnkd_l010` | W4DF-0 + `--lambda-kd-denoise 0.10` | direct oracle->blind denoiser transfer |
+| W4DF-5 | `w4df_kd_low_l020_featkd_l010` | W4DF-0 + `--lambda-kd-feat 0.10` | transfer representation geometry (pre-FiLM) |
+| W4DF-6 | `w4df_kd_low_l020_dnfeat` | W4DF-0 + both denoiser KD + feature KD (`0.08/0.08`) | combined privileged transfer |
+| W4DF-7 | `w4df_kd_low_l020_dnfeat_twomask` | W4DF-6 + `--kd-hi-preserve-scale 0.20` | full stabilized KD stack + high guard |
+
+Wave-4D-Fix decision gate:
+- Must beat W3R low-band while keeping high-band drop <= `0.002` absolute.
+- If two-mask still cannot remove mid/high tax, promote MoE immediately.
+
+---
+
+## Wave 5M (Queued After W4D-Fix): MoE Head Decoupling
 
 Trigger:
-- Run after Wave-4D completion (regardless of KD outcome), with priority if low/high tradeoff remains.
+- Run after Wave-4D-Fix completion (regardless of KD outcome), with priority if low/high tradeoff remains.
 
 Core mechanism:
 - Replace single classifier output head with two heads (high-SNR expert and low-SNR expert).
