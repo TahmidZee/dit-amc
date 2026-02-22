@@ -564,6 +564,124 @@ class TemporalAttentionPool(nn.Module):
         return pooled, w
 
 
+class MoEClassifierHead(nn.Module):
+    """
+    Mixture-of-Experts classifier head for CLDNN features.
+
+    - Experts: parallel MLP classifier heads.
+    - Router: eta-based (interpretable) or learned MLP.
+    - Hard routing: top-1 expert one-hot selection (inference-style sparsity).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float,
+        n_experts: int = 2,
+        gate_type: str = "eta-sigmoid",
+        gate_center: float = 0.5,
+        gate_tau: float = 0.3,
+        gate_use_feat: bool = False,
+    ) -> None:
+        super().__init__()
+        self.n_experts = int(n_experts)
+        self.gate_type = str(gate_type).strip().lower()
+        self.gate_center = float(gate_center)
+        self.gate_tau = float(gate_tau)
+        self.gate_use_feat = bool(gate_use_feat)
+        if self.n_experts < 2:
+            raise ValueError("MoEClassifierHead requires n_experts >= 2.")
+        if self.gate_tau <= 0.0:
+            raise ValueError("MoE gate_tau must be > 0.")
+        if self.gate_type not in {"eta-sigmoid", "learned", "hard"}:
+            raise ValueError("MoE gate_type must be one of: eta-sigmoid|learned|hard.")
+
+        in_dim = int(input_dim)
+        hid = int(hidden_dim)
+        cls = int(num_classes)
+        self.fc1 = nn.ModuleList([nn.Linear(in_dim, hid) for _ in range(self.n_experts)])
+        self.fc2 = nn.ModuleList([nn.Linear(hid, hid) for _ in range(self.n_experts)])
+        self.fc_out = nn.ModuleList([nn.Linear(hid, cls) for _ in range(self.n_experts)])
+        self.act = nn.SELU()
+        self.drop = nn.Dropout(float(dropout))
+
+        if self.gate_type == "learned":
+            router_in = 1 + (in_dim if self.gate_use_feat else 0)
+            router_hidden = max(32, min(256, router_in // 2))
+            self.router_mlp = nn.Sequential(
+                nn.Linear(router_in, router_hidden),
+                nn.GELU(),
+                nn.Linear(router_hidden, self.n_experts),
+            )
+            self.register_buffer("eta_centers", torch.zeros(1), persistent=False)
+        else:
+            self.router_mlp = None
+            if self.n_experts > 2:
+                centers = torch.linspace(-1.0, 1.0, self.n_experts, dtype=torch.float32)
+                self.register_buffer("eta_centers", centers, persistent=False)
+            else:
+                self.register_buffer("eta_centers", torch.zeros(1), persistent=False)
+
+    def _eta_gate_probs(self, feat: torch.Tensor, eta_pred: Optional[torch.Tensor]) -> torch.Tensor:
+        b = int(feat.shape[0])
+        if eta_pred is None:
+            eta = torch.zeros((b,), device=feat.device, dtype=feat.dtype)
+        else:
+            eta_flat = eta_pred.float().view(-1)
+            if eta_flat.numel() != b:
+                eta = torch.zeros((b,), device=feat.device, dtype=feat.dtype)
+            else:
+                eta = eta_flat.to(device=feat.device, dtype=feat.dtype)
+        z = (eta - float(self.gate_center)) / max(1e-6, float(self.gate_tau))
+
+        if self.n_experts == 2:
+            g_low = torch.sigmoid(z)
+            gate = torch.stack([g_low, 1.0 - g_low], dim=1)
+            return gate
+
+        # For >2 experts, use soft assignment over evenly-spaced eta anchors.
+        logits = -(z.unsqueeze(1) - self.eta_centers.unsqueeze(0).to(z.dtype)) ** 2
+        return torch.softmax(logits, dim=1)
+
+    def _learned_gate_probs(self, feat: torch.Tensor, eta_pred: Optional[torch.Tensor]) -> torch.Tensor:
+        b = int(feat.shape[0])
+        eta_in = torch.zeros((b, 1), device=feat.device, dtype=feat.dtype)
+        if eta_pred is not None:
+            eta_flat = eta_pred.detach().float().view(-1)
+            if eta_flat.numel() == b:
+                eta_in = eta_flat.view(-1, 1).to(device=feat.device, dtype=feat.dtype)
+        if self.gate_use_feat:
+            # Prevent router objectives from perturbing trunk/noise calibration.
+            router_in = torch.cat([eta_in, feat.detach()], dim=1)
+        else:
+            router_in = eta_in
+        gate_logits = self.router_mlp(router_in)
+        return torch.softmax(gate_logits, dim=1)
+
+    def forward(self, feat: torch.Tensor, eta_pred: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.gate_type == "learned":
+            gate = self._learned_gate_probs(feat, eta_pred)
+        else:
+            gate = self._eta_gate_probs(feat, eta_pred)
+
+        if self.gate_type == "hard":
+            top_idx = torch.argmax(gate, dim=1)
+            gate = F.one_hot(top_idx, num_classes=self.n_experts).to(dtype=feat.dtype)
+
+        expert_logits = []
+        for i in range(self.n_experts):
+            z = self.act(self.fc1[i](feat))
+            z = self.drop(z)
+            z = self.act(self.fc2[i](z))
+            z = self.drop(z)
+            expert_logits.append(self.fc_out[i](z))
+        logits_e = torch.stack(expert_logits, dim=1)  # (B, E, C)
+        logits = torch.sum(gate.unsqueeze(-1) * logits_e, dim=1)  # (B, C)
+        return logits, gate
+
+
 class ExpertFeatureExtractor(nn.Module):
     """
     Computes domain-specific features from raw I/Q signals for improved low-SNR classification.
@@ -864,6 +982,11 @@ class CLDNNAMC(nn.Module):
         raw_low_snr_drop_snr_lo: float = -10.0,  # lower SNR split for schedule
         raw_low_snr_drop_snr_mid: float = -6.0,  # middle SNR split for schedule
         cls_hidden: int = 0,  # Classifier hidden dim (0 = auto: max(128, num_classes*8))
+        moe_n_experts: int = 1,
+        moe_gate_type: str = "eta-sigmoid",
+        moe_gate_center: float = 0.5,
+        moe_gate_tau: float = 0.3,
+        moe_gate_use_feat: bool = False,
         supcon_proj_dim: int = 0,  # >0 enables a SupCon MLP projection head
     ) -> None:
         super().__init__()
@@ -953,6 +1076,20 @@ class CLDNNAMC(nn.Module):
                     raise ValueError("raw_low_snr_drop_prob_lo/mid/hi must be in [0,1] when schedule is enabled.")
             if self.raw_low_snr_drop_snr_lo > self.raw_low_snr_drop_snr_mid:
                 raise ValueError("raw_low_snr_drop_snr_lo must be <= raw_low_snr_drop_snr_mid.")
+        self.moe_n_experts = int(moe_n_experts)
+        self.moe_gate_type = str(moe_gate_type).strip().lower()
+        self.moe_gate_center = float(moe_gate_center)
+        self.moe_gate_tau = float(moe_gate_tau)
+        self.moe_gate_use_feat = bool(moe_gate_use_feat)
+        if self.moe_n_experts < 1:
+            raise ValueError("moe_n_experts must be >= 1.")
+        if self.moe_gate_tau <= 0.0:
+            raise ValueError("moe_gate_tau must be > 0.")
+        if self.moe_gate_type not in {"eta-sigmoid", "learned", "hard"}:
+            raise ValueError("moe_gate_type must be one of: eta-sigmoid|learned|hard.")
+        if self.moe_n_experts == 1:
+            # Keep compatibility: MoE disabled in single-expert mode regardless of gate settings.
+            self.moe_gate_type = "eta-sigmoid"
 
         # Branch 1: IQ joint Conv2D over (2 x L) per path.
         self.conv_iq = nn.Conv2d(
@@ -1130,6 +1267,19 @@ class CLDNNAMC(nn.Module):
         self.fc2 = nn.Linear(_cls_h, _cls_h)
         self.fc_out = nn.Linear(_cls_h, num_classes)
         self.fc_act = nn.SELU()
+        self.moe_head: Optional[MoEClassifierHead] = None
+        if self.moe_n_experts > 1:
+            self.moe_head = MoEClassifierHead(
+                input_dim=cls_input_dim,
+                hidden_dim=_cls_h,
+                num_classes=num_classes,
+                dropout=float(dropout),
+                n_experts=self.moe_n_experts,
+                gate_type=self.moe_gate_type,
+                gate_center=self.moe_gate_center,
+                gate_tau=self.moe_gate_tau,
+                gate_use_feat=self.moe_gate_use_feat,
+            )
 
         # SNR head for auxiliary supervision and predict-mode FiLM
         self.snr_head = nn.Linear(lstm_out_dim, 1)
@@ -1158,6 +1308,8 @@ class CLDNNAMC(nn.Module):
         self._expert_gate: Optional[torch.Tensor] = None
         self._x_dn_flat: Optional[torch.Tensor] = None
         self._x_dn: Optional[torch.Tensor] = None
+        self._moe_gate: Optional[torch.Tensor] = None
+        self._moe_expert_load: Optional[torch.Tensor] = None
         # Frozen early-feature encoder used by perceptual/feature-preservation loss.
         # Stored outside nn.Module registration to keep checkpoint compatibility.
         self.__dict__["_feat_encoder"] = None
@@ -1640,11 +1792,27 @@ class CLDNNAMC(nn.Module):
             self._x_dn = self._x_dn_flat
 
         # Classifier head
-        z = self.fc_act(self.fc1(feat))
-        z = self.drop(z)
-        z = self.fc_act(self.fc2(z))
-        z = self.drop(z)
-        logits = self.fc_out(z)
+        self._moe_gate = None
+        self._moe_expert_load = None
+        if self.moe_head is not None:
+            eta_router = self._eta_pred
+            if eta_router is None and snr is not None and snr_mode == "known":
+                eta_router = self._eta_from_snr(snr)
+            if eta_router is None:
+                eta_router = snr_db_to_eta(
+                    snr_pred.detach(),
+                    eta_min=self.noise_eta_min,
+                    eta_max=self.noise_eta_max,
+                )
+            logits, gate = self.moe_head(feat, eta_router)
+            self._moe_gate = gate
+            self._moe_expert_load = gate.mean(dim=0)
+        else:
+            z = self.fc_act(self.fc1(feat))
+            z = self.drop(z)
+            z = self.fc_act(self.fc2(z))
+            z = self.drop(z)
+            logits = self.fc_out(z)
 
         # Return (logits, x0_pred_dummy, snr_pred) to match evaluate() expectations.
         return logits, None, snr_pred

@@ -466,6 +466,58 @@ def focal_cross_entropy(
     return loss
 
 
+def snr_weighted_ce_weights(
+    snr_db: torch.Tensor,
+    snr_min_db: float,
+    snr_max_db: float,
+    scale: float,
+    max_weight: float,
+) -> torch.Tensor:
+    """
+    Build capped, normalized per-sample CE weights from SNR.
+
+    - Lower SNR => larger weight.
+    - Weights are capped for stability.
+    - Batch mean is normalized to ~1.0 to avoid implicit LR changes.
+    """
+    snr_f = snr_db.float()
+    s_min = float(min(snr_min_db, snr_max_db))
+    s_max = float(max(snr_min_db, snr_max_db))
+    denom = max(1e-6, s_max - s_min)
+    snr_clamped = torch.clamp(snr_f, min=s_min, max=s_max)
+    low_frac = torch.clamp((s_max - snr_clamped) / denom, min=0.0, max=1.0)
+    w = 1.0 + float(scale) * low_frac
+    w = torch.clamp(w, min=0.0, max=float(max_weight))
+    w_mean = torch.clamp(w.mean(), min=1e-6)
+    return w / w_mean
+
+
+def compute_moe_regularizers(
+    gate: Optional[torch.Tensor],
+    balance_lambda: float,
+    specialize_lambda: float,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """
+    MoE regularizers from gate probabilities:
+      - balance: variance of per-expert average load (minimize for balanced usage)
+      - specialize: entropy of per-sample gate distribution (minimize for peaked routing)
+    """
+    if gate is None or gate.ndim != 2:
+        z = torch.tensor(0.0)
+        return z, z, None
+    g = gate.float()
+    load = g.mean(dim=0)  # (E,)
+    loss_bal = torch.tensor(0.0, device=g.device, dtype=g.dtype)
+    loss_spec = torch.tensor(0.0, device=g.device, dtype=g.dtype)
+    if float(balance_lambda) > 0.0:
+        loss_bal = float(balance_lambda) * torch.var(load, unbiased=False)
+    if float(specialize_lambda) > 0.0:
+        # Minimize entropy => more peaked routing.
+        ent = -(torch.clamp(g, min=1e-8) * torch.log(torch.clamp(g, min=1e-8))).sum(dim=1).mean()
+        loss_spec = float(specialize_lambda) * ent
+    return loss_bal, loss_spec, load.detach()
+
+
 # =============================================================================
 # Mixup augmentation helper
 # =============================================================================
@@ -954,6 +1006,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(cldnn_cyclo_stats=True)
     parser.add_argument("--cldnn-cls-hidden", type=int, default=0, help="Classifier head hidden dim (0=auto: max(128, num_classes*8)).")
+    parser.add_argument("--moe-n-experts", type=int, default=1, help="Number of classifier experts (1 disables MoE).")
+    parser.add_argument(
+        "--moe-gate-type",
+        type=str,
+        choices=["eta-sigmoid", "learned", "hard"],
+        default="eta-sigmoid",
+        help="MoE router type: eta-sigmoid (interpretable), learned (MLP), or hard (top-1).",
+    )
+    parser.add_argument("--moe-gate-center", type=float, default=0.5, help="Eta center for MoE eta-sigmoid gating.")
+    parser.add_argument("--moe-gate-tau", type=float, default=0.3, help="Temperature for MoE eta-sigmoid gating.")
+    parser.add_argument(
+        "--moe-gate-use-feat",
+        action="store_true",
+        help="For learned MoE router, use detached pooled features in addition to detached eta input.",
+    )
+    parser.add_argument(
+        "--moe-balance-lambda",
+        type=float,
+        default=0.01,
+        help="Weight for MoE load-balancing regularizer (variance of per-expert load).",
+    )
+    parser.add_argument(
+        "--moe-specialize-lambda",
+        type=float,
+        default=0.0,
+        help="Weight for MoE specialization regularizer (entropy minimization of gate distribution).",
+    )
 
     # Multi-view architecture options (used when --arch multiview)
     parser.add_argument("--stft-nfft", type=int, default=64, help="STFT FFT size for spectral branch.")
@@ -1249,6 +1328,23 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Optional multiplier to upweight CE loss for low-SNR samples (training-time only).",
     )
+    parser.add_argument(
+        "--snr-weight-ce",
+        action="store_true",
+        help="Enable SNR-weighted CE (upweight low-SNR samples with capped, normalized per-batch weights).",
+    )
+    parser.add_argument(
+        "--snr-weight-ce-scale",
+        type=float,
+        default=2.0,
+        help="Scale factor for SNR-weighted CE: w=1+scale*normalized_low_snr.",
+    )
+    parser.add_argument(
+        "--snr-weight-ce-max",
+        type=float,
+        default=3.0,
+        help="Maximum per-sample CE weight for SNR-weighted CE.",
+    )
 
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--t-schedule", type=str, choices=["uniform", "snr"], default="uniform")
@@ -1484,6 +1580,11 @@ def build_model_from_cfg(
             raw_low_snr_drop_snr_lo=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_snr_lo", -10.0)),
             raw_low_snr_drop_snr_mid=float(_cfg_get(cfg, fallback, "cldnn_raw_low_snr_drop_snr_mid", -6.0)),
             cls_hidden=int(_cfg_get(cfg, fallback, "cldnn_cls_hidden", 0)),
+            moe_n_experts=int(cfg.get("moe_n_experts", 1) if isinstance(cfg, dict) else getattr(fallback, "moe_n_experts", 1)),
+            moe_gate_type=str(cfg.get("moe_gate_type", "eta-sigmoid") if isinstance(cfg, dict) else getattr(fallback, "moe_gate_type", "eta-sigmoid")),
+            moe_gate_center=float(cfg.get("moe_gate_center", 0.5) if isinstance(cfg, dict) else getattr(fallback, "moe_gate_center", 0.5)),
+            moe_gate_tau=float(cfg.get("moe_gate_tau", 0.3) if isinstance(cfg, dict) else getattr(fallback, "moe_gate_tau", 0.3)),
+            moe_gate_use_feat=bool(cfg.get("moe_gate_use_feat", False) if isinstance(cfg, dict) else getattr(fallback, "moe_gate_use_feat", False)),
             supcon_proj_dim=int(_cfg_get(cfg, fallback, "supcon_proj_dim", 0)) if bool(_cfg_get(cfg, fallback, "supcon", False)) else 0,
         ).to(device)
     return model, arch
@@ -2242,6 +2343,24 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("snr_consist_low_delta_min/max must be >= 0.")
     if float(getattr(args, "snr_consist_low_delta_max", 4.0)) < float(getattr(args, "snr_consist_low_delta_min", 2.0)):
         raise ValueError("snr_consist_low_delta_max must be >= snr_consist_low_delta_min.")
+    if float(getattr(args, "snr_weight_ce_scale", 2.0)) < 0.0:
+        raise ValueError("snr_weight_ce_scale must be >= 0.")
+    if float(getattr(args, "snr_weight_ce_max", 3.0)) <= 0.0:
+        raise ValueError("snr_weight_ce_max must be > 0.")
+    if int(getattr(args, "moe_n_experts", 1)) < 1:
+        raise ValueError("moe_n_experts must be >= 1.")
+    if float(getattr(args, "moe_gate_tau", 0.3)) <= 0.0:
+        raise ValueError("moe_gate_tau must be > 0.")
+    if float(getattr(args, "moe_balance_lambda", 0.01)) < 0.0:
+        raise ValueError("moe_balance_lambda must be >= 0.")
+    if float(getattr(args, "moe_specialize_lambda", 0.0)) < 0.0:
+        raise ValueError("moe_specialize_lambda must be >= 0.")
+    if int(getattr(args, "moe_n_experts", 1)) > 1 and args.arch != "cldnn":
+        raise ValueError("moe_n_experts > 1 is currently supported only for --arch cldnn.")
+    if float(getattr(args, "focal_gamma", 0.0)) > 0.0 and float(getattr(args, "label_smoothing", 0.0)) > 0.0:
+        print("[warn] focal_gamma > 0 with label_smoothing > 0 can conflict; consider label_smoothing=0.0 for focal runs.")
+    if bool(getattr(args, "snr_weight_ce", False)) and float(getattr(args, "low_snr_boost", 0.0)) > 0.0:
+        print("[warn] Both --snr-weight-ce and --low-snr-boost are enabled; weights will multiply.")
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2359,6 +2478,11 @@ def train(args: argparse.Namespace) -> None:
             raw_low_snr_drop_snr_lo=float(getattr(args, "cldnn_raw_low_snr_drop_snr_lo", -10.0)),
             raw_low_snr_drop_snr_mid=float(getattr(args, "cldnn_raw_low_snr_drop_snr_mid", -6.0)),
             cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
+            moe_n_experts=int(getattr(args, "moe_n_experts", 1)),
+            moe_gate_type=str(getattr(args, "moe_gate_type", "eta-sigmoid")),
+            moe_gate_center=float(getattr(args, "moe_gate_center", 0.5)),
+            moe_gate_tau=float(getattr(args, "moe_gate_tau", 0.3)),
+            moe_gate_use_feat=bool(getattr(args, "moe_gate_use_feat", False)),
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
         schedule = None
@@ -2506,6 +2630,11 @@ def train(args: argparse.Namespace) -> None:
                 raw_low_snr_drop_snr_lo=float(getattr(args, "cldnn_raw_low_snr_drop_snr_lo", -10.0)),
                 raw_low_snr_drop_snr_mid=float(getattr(args, "cldnn_raw_low_snr_drop_snr_mid", -6.0)),
                 cls_hidden=int(getattr(args, "cldnn_cls_hidden", 0)),
+                moe_n_experts=int(getattr(args, "moe_n_experts", 1)),
+                moe_gate_type=str(getattr(args, "moe_gate_type", "eta-sigmoid")),
+                moe_gate_center=float(getattr(args, "moe_gate_center", 0.5)),
+                moe_gate_tau=float(getattr(args, "moe_gate_tau", 0.3)),
+                moe_gate_use_feat=bool(getattr(args, "moe_gate_use_feat", False)),
                 supcon_proj_dim=int(getattr(args, "supcon_proj_dim", 0)) if getattr(args, "supcon", False) else 0,
             ).to(device)
             try:
@@ -2717,6 +2846,10 @@ def train(args: argparse.Namespace) -> None:
         epoch_kd_denoise_active = 0.0
         epoch_loss_kd_feat = 0.0
         epoch_kd_feat_active = 0.0
+        epoch_loss_moe_balance = 0.0
+        epoch_loss_moe_specialize = 0.0
+        moe_n_experts_cfg = int(getattr(args, "moe_n_experts", 1))
+        epoch_moe_expert_load = [0.0 for _ in range(moe_n_experts_cfg)] if moe_n_experts_cfg > 1 else []
         epoch_correct = 0
         epoch_total = 0
         start_time = time.time()
@@ -2856,6 +2989,9 @@ def train(args: argparse.Namespace) -> None:
             kd_denoise_active_frac_batch = torch.tensor(0.0, device=device)
             loss_kd_feat = torch.tensor(0.0, device=device)
             kd_feat_active_frac_batch = torch.tensor(0.0, device=device)
+            loss_moe_balance = torch.tensor(0.0, device=device)
+            loss_moe_specialize = torch.tensor(0.0, device=device)
+            moe_load_batch: Optional[torch.Tensor] = None
             student_prefilm_kd: Optional[torch.Tensor] = None
             if amp_enabled:
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
@@ -2926,6 +3062,14 @@ def train(args: argparse.Namespace) -> None:
                         frac = (snr_clamped - snr_floor) / denom
                         weights = 1.0 + float(args.low_snr_boost) * (1.0 - frac)
                         ce = ce * weights
+                    if bool(getattr(args, "snr_weight_ce", False)):
+                        ce = ce * snr_weighted_ce_weights(
+                            snr_cls,
+                            snr_min_db=snr_min_db,
+                            snr_max_db=snr_max_db,
+                            scale=float(getattr(args, "snr_weight_ce_scale", 2.0)),
+                            max_weight=float(getattr(args, "snr_weight_ce_max", 3.0)),
+                        )
 
                     # Apply curriculum mask (zero out samples below SNR threshold)
                     ce = ce * curriculum_mask_cls
@@ -3314,6 +3458,14 @@ def train(args: argparse.Namespace) -> None:
                     frac = (snr_clamped - snr_floor) / denom
                     weights = 1.0 + float(args.low_snr_boost) * (1.0 - frac)
                     ce = ce * weights
+                if bool(getattr(args, "snr_weight_ce", False)):
+                    ce = ce * snr_weighted_ce_weights(
+                        snr_cls,
+                        snr_min_db=snr_min_db,
+                        snr_max_db=snr_max_db,
+                        scale=float(getattr(args, "snr_weight_ce_scale", 2.0)),
+                        max_weight=float(getattr(args, "snr_weight_ce_max", 3.0)),
+                    )
 
                 # Apply curriculum mask (zero out samples below SNR threshold)
                 ce = ce * curriculum_mask_cls
@@ -3633,6 +3785,16 @@ def train(args: argparse.Namespace) -> None:
                         ramp = 1.0
                     loss = loss + consist_lambda * ramp * loss_consist
 
+            if args.arch == "cldnn" and int(getattr(args, "moe_n_experts", 1)) > 1:
+                gate_batch = getattr(model, "_moe_gate", None)
+                loss_moe_balance, loss_moe_specialize, moe_load_batch = compute_moe_regularizers(
+                    gate_batch,
+                    balance_lambda=float(getattr(args, "moe_balance_lambda", 0.01)),
+                    specialize_lambda=float(getattr(args, "moe_specialize_lambda", 0.0)),
+                )
+                if gate_batch is not None:
+                    loss = loss + loss_moe_balance + loss_moe_specialize
+
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -3664,6 +3826,11 @@ def train(args: argparse.Namespace) -> None:
             epoch_kd_denoise_active += float(kd_denoise_active_frac_batch.detach().item()) * batch_size
             epoch_loss_kd_feat += float(loss_kd_feat.detach().item()) * batch_size
             epoch_kd_feat_active += float(kd_feat_active_frac_batch.detach().item()) * batch_size
+            epoch_loss_moe_balance += float(loss_moe_balance.detach().item()) * batch_size
+            epoch_loss_moe_specialize += float(loss_moe_specialize.detach().item()) * batch_size
+            if moe_load_batch is not None and len(epoch_moe_expert_load) == int(moe_load_batch.numel()):
+                for i in range(len(epoch_moe_expert_load)):
+                    epoch_moe_expert_load[i] += float(moe_load_batch[i].detach().item()) * batch_size
             epoch_correct += (logits_for_acc_batch.argmax(dim=1) == y).sum().item()
             epoch_total += batch_size
             if epoch_total > 0:
@@ -3684,6 +3851,9 @@ def train(args: argparse.Namespace) -> None:
         train_kd_denoise_active_frac = epoch_kd_denoise_active / max(1, epoch_total)
         train_loss_kd_feat = epoch_loss_kd_feat / max(1, epoch_total)
         train_kd_feat_active_frac = epoch_kd_feat_active / max(1, epoch_total)
+        train_loss_moe_balance = epoch_loss_moe_balance / max(1, epoch_total)
+        train_loss_moe_specialize = epoch_loss_moe_specialize / max(1, epoch_total)
+        train_moe_expert_load = [v / max(1, epoch_total) for v in epoch_moe_expert_load]
         train_acc = epoch_correct / max(1, epoch_total)
         train_acc_clean = None
         if train_eval_loader is not None:
@@ -3797,12 +3967,21 @@ def train(args: argparse.Namespace) -> None:
             "train_kd_denoise_active_frac": float(train_kd_denoise_active_frac),
             "train_loss_kd_feat": float(train_loss_kd_feat),
             "train_kd_feat_active_frac": float(train_kd_feat_active_frac),
+            "train_loss_moe_balance": float(train_loss_moe_balance),
+            "train_loss_moe_specialize": float(train_loss_moe_specialize),
             "cls2dn_scale": float(cls2dn_scale),
             "p_clean": p_clean,
             "t_schedule": args.t_schedule,
             "snr_floor_db": args.snr_floor_db,
             "snr_cap_max_db": args.snr_cap_max_db,
             "low_snr_boost": args.low_snr_boost,
+            "snr_weight_ce": bool(getattr(args, "snr_weight_ce", False)),
+            "snr_weight_ce_scale": float(getattr(args, "snr_weight_ce_scale", 2.0)),
+            "snr_weight_ce_max": float(getattr(args, "snr_weight_ce_max", 3.0)),
+            "moe_n_experts": int(getattr(args, "moe_n_experts", 1)),
+            "moe_gate_type": str(getattr(args, "moe_gate_type", "eta-sigmoid")),
+            "moe_balance_lambda": float(getattr(args, "moe_balance_lambda", 0.01)),
+            "moe_specialize_lambda": float(getattr(args, "moe_specialize_lambda", 0.0)),
             "lr_decay_start_epoch": getattr(args, "lr_decay_start_epoch", 0),
             "curriculum_soft": bool(getattr(args, "curriculum_soft", False)),
             "curriculum_soft_low_weight": float(getattr(args, "curriculum_soft_low_weight", 0.1)),
@@ -3811,6 +3990,8 @@ def train(args: argparse.Namespace) -> None:
             "cldnn_noise_cond": bool(getattr(args, "cldnn_noise_cond", False)),
             "cldnn_denoiser": bool(getattr(args, "cldnn_denoiser", False)),
         }
+        for i, load_i in enumerate(train_moe_expert_load):
+            record[f"train_moe_expert_{i}_load"] = float(load_i)
         if proxy_fit_info:
             record.update(proxy_fit_info)
         if noise_calib:
@@ -4019,6 +4200,11 @@ def run_eval(args: argparse.Namespace) -> None:
             raw_low_snr_drop_snr_lo=float(getattr(args, "cldnn_raw_low_snr_drop_snr_lo", -10.0)),
             raw_low_snr_drop_snr_mid=float(getattr(args, "cldnn_raw_low_snr_drop_snr_mid", -6.0)),
             cls_hidden=int(getattr(args, 'cldnn_cls_hidden', 0)),
+            moe_n_experts=int(getattr(args, "moe_n_experts", 1)),
+            moe_gate_type=str(getattr(args, "moe_gate_type", "eta-sigmoid")),
+            moe_gate_center=float(getattr(args, "moe_gate_center", 0.5)),
+            moe_gate_tau=float(getattr(args, "moe_gate_tau", 0.3)),
+            moe_gate_use_feat=bool(getattr(args, "moe_gate_use_feat", False)),
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
         ).to(device)
 
