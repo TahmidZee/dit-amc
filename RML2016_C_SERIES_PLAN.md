@@ -277,48 +277,317 @@ Wave-4D-Fix decision gate:
 
 ---
 
-## Wave 5M (Queued After W4D-Fix): MoE Head Decoupling
+## Wave 4D-Fix Outcome (2026-02-22 pull)
 
-Trigger:
-- Run after Wave-4D-Fix completion (regardless of KD outcome), with priority if low/high tradeoff remains.
+Observed validation-only metrics (test not yet finalized; runs at 62–96 epochs):
 
-Core mechanism:
-- Replace single classifier output head with two heads (high-SNR expert and low-SNR expert).
-- Blend logits using eta-conditioned router gate.
-- Keep trunk shared; decouple final decision boundaries by SNR regime.
+| Run | Val overall | Val low | Val mid | Val high | Δ low vs softsched |
+|---|---|---|---|---|---|
+| `w4df2_stable_lowkd` | 0.6386 | 0.3070 | 0.8898 | 0.9343 | +0.0013 |
+| `w4df2_stable_lowkd_highpres` | 0.6389 | 0.3112 | 0.8878 | 0.9339 | +0.0055 |
+| `w4df2_stable_lowkd_midpres` | 0.6391 | 0.3101 | 0.8891 | 0.9339 | +0.0044 |
+| `w4df2_stable_lowkd_dnkd` | 0.6370 | 0.3067 | 0.8873 | 0.9323 | +0.0010 |
+| `w4df2_stable_lowkd_featkd` | 0.6376 | 0.3046 | 0.8902 | 0.9335 | −0.0011 |
+| `w4df2_stable_lowkd_dnfeat` | 0.6367 | 0.3049 | 0.8886 | 0.9326 | −0.0008 |
+| `w4df2_stable_lowkd_dnfeat_midpres` | — | — | — | — | (0 epochs) |
 
-Wave-5M first matrix (planned):
-- `w5m_moe_anchor_noexp` (no expert branch, no KD)
-- `w5m_moe_lowband_lfeat` (add low-band targeted L_feat)
-- `w5m_moe_lowband_consist` (add low-band consistency)
-- `w5m_moe_voltron` (expert-v2 + low-band targeted stack)
-- plus 4 MoE gate sharpness/center ablations.
-
-Acceptance:
-- Must retain high-band near best non-MoE baseline while improving low-band.
-- If MoE beats KD on low-band with smaller high-band tax, promote MoE track.
+Decision:
+- KD closed: the low/high Pareto tradeoff persists. Best KD runs gain +0.005 low-band but lose −0.004 mid-band.
+- Oracle ceiling audit revealed the **architecture itself** caps performance at 0.6855 (even with perfect SNR). The single-head 128-dim unidirectional LSTM cannot reach 0.70.
+- **Architecture scaling is mandatory.** Proceed to expanded Wave 5.
 
 ---
 
-## Metrics and Decision Gates
+## Architecture Ceiling Analysis (justifies Wave 5 redesign)
 
-Primary metrics:
-- overall test mean over all SNRs
-- low band mean (`-14..-6 dB`)
-- mid band mean (`-4..+6 dB`)
-- high band mean (`+10..+18 dB`)
-- class-macro (overall): macro-accuracy / macro-F1
-- class-macro (low band): low-band macro-accuracy / macro-F1
+| Model | Overall | Low (−20…−6) | Mid (−4…+6) | High (+8…+18) |
+|---|---|---|---|---|
+| Best blind (`w3r_anchor_consist`) | 0.6408 | 0.2303 | 0.8935 | 0.9355 |
+| Best KD blind (`w4d2_twomask`) | 0.6386 | 0.3220 | 0.8793 | 0.9335 |
+| Oracle teacher (true SNR, same arch) | **0.6855** | 0.3239 | 0.9111 | 0.9419 |
+| **Target** | **0.7000** | ≥0.35 | ≥0.93 | ≥0.95 |
 
-Promotion gate vs `b3_dn48`:
-- high-band drop no worse than -0.002 absolute
-- and **at least one** of:
-  - overall >= +0.006 absolute
-  - low-band >= +0.015 absolute
+Current architecture bottlenecks:
+1. LSTM: **unidirectional**, 128 hidden → only 128-dim temporal features
+2. Classifier head: `fc1(128→128) → fc2(128→128) → fc_out(128→11)` = **34K params** for 11 classes
+3. Denoiser = 789K (65% of model) but classifier = 34K (2.8%) — capacity mismatch
+4. No mechanism to decouple low-SNR vs high-SNR decision boundaries
 
-Aggressive gate for 70% trajectory:
-- by end of Wave 3R, low-band should be >= 0.340 and overall >= 0.650
-- if not achieved, consider architecture changes (sequence length, stronger denoiser depth, or pretext training), not just regularization tweaks.
+The 0.70 target requires **low ≥ 0.35, mid ≥ 0.93, high ≥ 0.95** (all three must improve).
+
+---
+
+## Wave 5A (8 runs): Architecture Scaling Foundation
+
+Purpose: raise the architecture ceiling while **keeping the CNN+LSTM family** (no backbone swap yet); establish strong scaled baselines before adding MoE.
+
+Key changes (already supported):
+- `--cldnn-bidir`: bidirectional temporal modeling (doubles LSTM output width)
+- `--cldnn-lstm-layers 3`: deeper temporal stack (baseline uses 2 layers)
+- `--cldnn-cls-hidden 384/512`: wider classifier head
+- targeted dropout ablations (`--dropout 0.30`) on deeper/wider variants to guard against high-SNR overfit
+
+Base recipe: `w3r_noexp_softsched` recipe (best low/high balance) with same denoiser, staging, and augmentation.
+
+| ID | Run name | Delta flags vs softsched base | Expected effect |
+|---|---|---|---|
+| W5A-0 | `w5a_bidir2_cls256` | `--cldnn-bidir --cldnn-lstm-layers 2 --cldnn-cls-hidden 256` | scaled control |
+| W5A-1 | `w5a_bidir2_cls384` | `--cldnn-bidir --cldnn-lstm-layers 2 --cldnn-cls-hidden 384` | width scaling (2-layer) |
+| W5A-2 | `w5a_bidir2_cls512` | `--cldnn-bidir --cldnn-lstm-layers 2 --cldnn-cls-hidden 512` | stronger width scaling (2-layer) |
+| W5A-3 | `w5a_bidir3_cls384` | `--cldnn-bidir --cldnn-lstm-layers 3 --cldnn-cls-hidden 384` | deeper temporal modeling + wider head |
+| W5A-4 | `w5a_bidir3_cls512` | `--cldnn-bidir --cldnn-lstm-layers 3 --cldnn-cls-hidden 512` | max blind-capacity candidate |
+| W5A-5 | `w5a_bidir3_cls384_do30` | W5A-3 + `--dropout 0.30` | overfit guard for deeper model |
+| W5A-6 | `w5a_bidir3_cls512_do30` | W5A-4 + `--dropout 0.30` | overfit guard for max blind-capacity model |
+| W5A-7 | `w5a_oracle_bidir3_cls512` | W5A-4 + `--snr-mode known` | **oracle ceiling** on max-capacity CNN+LSTM |
+
+Wave-5A exit criterion:
+- W5A-7 oracle must improve by **≥ +0.015** over previous oracle (~0.6855) **OR** exceed 0.70.
+  - Rationale: a hard 0.70 gate is brittle; if oracle reaches 0.695, it still proves scaling helps and MoE/TTA/ensemble can push it over.
+- Pick best blind run from W5A-0 through W5A-6 as new anchor.
+- **If W5A-7 oracle fails both conditions**: stay in CNN+LSTM and scale further (`--cldnn-lstm-layers 4`, `--cldnn-lstm-hidden 160/192`, and/or `--cldnn-merge-ch 128/160`) before considering a backbone swap.
+
+---
+
+## Wave 5A Outcome (Goose + Athena pull, 2026-02-22)
+
+Observed best test metrics by run family (overall / low `-20..-6` / mid / high):
+- `w5a_bidir2_cls512`: `0.6409 / 0.2311 / 0.8917 / 0.9365` (**best blind**)
+- `w5a_bidir3_cls512`: `0.6390 / 0.2269 / 0.8907 / 0.9370`
+- `w5a_bidir3_cls512_do30`: `0.6408 / 0.2296 / 0.8921 / 0.9377` (best deep variant, still flat vs 2-layer)
+- `w5a_oracle_bidir3_cls512` (`snr_mode=known`): `0.6829 / 0.3201 / 0.9073 / 0.9423`
+
+Key read:
+- Deeper LSTM did **not** move the frontier in a meaningful way (mostly micro-tradeoffs).
+- Width helped slightly (`cls512` > `cls256/384`), but gains remain sub-pp.
+- Oracle did not raise the ceiling enough to justify more depth-first scaling.
+
+Metric-definition note (important):
+- Low-band mismatch was a reporting artifact in prior discussion:
+  - `-20..-6` low-band is ~0.23 in both W3R and W5A.
+  - `-14..-6` low-band is ~0.31 in both W3R and W5A.
+
+Decision:
+- Promote `w5a_bidir2_cls512` as Wave-5B anchor.
+- Move to **MoE head decoupling** as primary next lever.
+
+---
+
+## Wave 5B (8 runs): Specialized MoE Heads + Oracle-Gate Diagnostic
+
+Purpose: fix the observed low/high frontier by forcing expert specialization explicitly, not just via blended-logits CE.
+
+Status:
+- Prior W5B (blended CE + gate regularizers only) was flat/slightly down despite good gate behavior.
+- New W5B adds head-specific supervision, gate anneal, anti-collapse warmup, and a one-shot oracle-gate diagnostic.
+- This wave is **not** teacher-student distillation; it is purely MoE-head training.
+
+Key new flags:
+- `--moe-head-low-lambda`, `--moe-head-high-lambda`: auxiliary CE on low/high experts
+- `--moe-head-low-snr-lo/hi`, `--moe-head-high-snr-lo/hi`: SNR masks for head-specific CE
+- `--moe-gate-tau-start`, `--moe-gate-tau-anneal-epochs`: soft-to-sharp gate schedule
+- `--moe-entropy-warmup-lambda`, `--moe-entropy-warmup-epochs`: early anti-collapse entropy max
+- `--moe-specialize-start-epoch`: delay entropy-min specialization until gate is stable
+- `--moe-diversity-lambda`: tiny anti-copy penalty between expert logits
+- `--moe-oracle-gate-train`: diagnostic mode that routes with true SNR (training-time only)
+
+Base recipe: `w5a_bidir2_cls512` (best blind from W5A).
+
+Specialization masks (overlap by design):
+- Low-head CE mask: `-14..+2 dB`
+- High-head CE mask: `-6..+18 dB`
+
+| ID | Run name | Delta flags vs W5A best | Expected effect |
+|---|---|---|---|
+| W5B2-0 | `w5b2_spec_a020_h020` | `--moe-n-experts 2 --moe-gate-type eta-sigmoid --moe-gate-center 1.55 --moe-gate-tau 0.30 --moe-balance-lambda 0.01 --moe-head-low-lambda 0.20 --moe-head-high-lambda 0.20 --moe-head-low-snr-lo -14 --moe-head-low-snr-hi 2 --moe-head-high-snr-lo -6 --moe-head-high-snr-hi 18` | specialization anchor |
+| W5B2-1 | `w5b2_spec_a020_h020_tauanneal` | W5B2-0 + `--moe-gate-tau-start 0.70 --moe-gate-tau-anneal-epochs 40` | soft early routing, sharper late |
+| W5B2-2 | `w5b2_spec_a030_h020_tauanneal` | W5B2-1 + `--moe-head-low-lambda 0.30` | stronger low-head pressure |
+| W5B2-3 | `w5b2_spec_a020_h030_tauanneal` | W5B2-1 + `--moe-head-high-lambda 0.30` | stronger high-head protection |
+| W5B2-4 | `w5b2_spec_a020_h020_entwarm` | W5B2-1 + `--moe-entropy-warmup-lambda 0.01 --moe-entropy-warmup-epochs 20` | anti-collapse guard during early epochs |
+| W5B2-5 | `w5b2_spec_a020_h020_div001` | W5B2-1 + `--moe-diversity-lambda 0.001` | prevent near-identical heads |
+| W5B2-6 | `w5b2_oraclegate_a020_h020` | W5B2-1 + `--moe-oracle-gate-train` | diagnostic: isolate gate-vs-trunk bottleneck |
+| W5B2-7 | `w5b2_oraclegate_a020_h020_entwarm` | W5B2-6 + `--moe-entropy-warmup-lambda 0.01 --moe-entropy-warmup-epochs 20` | oracle diagnostic with anti-collapse warmup |
+
+Wave-5B exit criterion:
+- Eta-gated run must beat W5A best on overall by ≥ +0.005 and low-band by ≥ +0.010, with high-band drop no worse than −0.003.
+- Oracle-gated diagnostic interpretation:
+  - If oracle-gated MoE does not beat W5A by at least +0.005 overall, trunk bottleneck is likely dominant.
+  - If oracle-gated beats W5A but eta-gated does not, routing/training (not trunk capacity) is the blocker.
+
+---
+
+## Wave 5C (8 runs): Training Optimization + Combined Stack
+
+Purpose: extract remaining gains through training strategy and combine best components.
+
+Key new flags:
+- `--curriculum-snr` (NEW): start training on easier (high-SNR) samples, progressively add harder bins
+- `--curriculum-warmup-epochs N`: epochs before introducing lowest-SNR bins
+- `--snr-oversample-low` (NEW): 2x oversample low-SNR training samples
+- `--snr-consist-v2` (NEW): improved consistency with adaptive temperature per SNR bin
+
+Base recipe: best from Wave 5A/5B.
+
+| ID | Run name | Delta flags | Expected effect |
+|---|---|---|---|
+| W5C-0 | `w5c_best_anchor` | none (reproduce best W5A/5B) | anchor |
+| W5C-1 | `w5c_curriculum` | `--curriculum-snr --curriculum-warmup-epochs 30` | easy-to-hard curriculum |
+| W5C-2 | `w5c_oversample_low` | `--snr-oversample-low` | 2x low-SNR sample frequency |
+| W5C-3 | `w5c_consist_v2` | `--snr-consist --snr-consist-lambda 0.5 --snr-consist-warmup 30 ...` | consistency on scaled arch |
+| W5C-4 | `w5c_kd_oracle_scaled` | `--teacher-ckpt <W5A-7_oracle.pt> --lambda-kd 0.2 --kd-temp 2.0 --kd-snr-lo -14 --kd-snr-hi -6` | KD from scaled oracle (may finally transfer) |
+| W5C-5 | `w5c_kd_plus_moe` | W5C-4 + best MoE flags from W5B | KD + MoE combined |
+| W5C-6 | `w5c_voltron_no_tta` | all best flags combined | full single-model stack |
+| W5C-7 | `w5c_voltron_seed42` | W5C-6 + `--seed 42` | seed robustness check |
+
+Wave-5C exit criterion:
+- Best single-model must reach ≥ 0.66 overall to be on trajectory for 0.70 with TTA/ensemble.
+- If below 0.66, consider further temporal scaling (4-layer and/or larger hidden size) or a Transformer pilot.
+
+---
+
+## Wave 5D (inference-time): Test-Time Augmentation + Ensemble
+
+Purpose: squeeze final accuracy without retraining. These are **inference-only** changes.
+
+Key new flags (eval mode only):
+- `--tta-views N` (NEW): number of augmented views to average at test time
+- `--tta-phase` (NEW): apply random phase rotation per view
+- `--tta-shift` (NEW): apply circular time shift per view
+- `--ensemble-ckpts PATH1,PATH2,...` (NEW): average logits from multiple checkpoints
+
+Expected gains (conservative — plan for lower bound):
+- TTA (5 views, phase + shift): **+0.005 to +0.015** overall (free at inference, just slower)
+- Ensemble (top-3 seeds): **+0.005 to +0.015** on top of TTA
+- Combined realistic range: single-model 0.66 → TTA ~0.67–0.675 → Ensemble ~0.68–0.69
+- ⚠️ Treat Wave 5D as a "squeeze" stage, not a guaranteed +0.04. Validate each technique's marginal gain before stacking.
+
+Evaluation runs (no training):
+1. `w5d_tta5_phase_shift` — best W5C model with `--tta-views 5 --tta-phase --tta-shift`
+2. `w5d_tta10_phase_shift` — 10-view TTA for upper bound
+3. `w5d_ensemble_top3` — top-3 models from W5C (logit averaging)
+4. `w5d_ensemble_top3_tta5` — ensemble + TTA combined
+
+---
+
+## Code Implementation Checklist (before Wave 5A)
+
+### Already supported (no code change needed):
+- `--cldnn-bidir` → bidirectional LSTM
+- `--cldnn-lstm-layers N` → LSTM depth (baseline currently 2)
+- `--cldnn-lstm-hidden N` → LSTM hidden size
+- `--cldnn-cls-hidden N` → wider classifier head
+- `--label-smoothing FLOAT` → label smoothing
+- `--focal-gamma FLOAT` → focal loss strength (`0` = standard CE)
+
+### Must implement for Wave 5A:
+- None. Wave-5A architecture sweep uses existing CNN+LSTM scaling knobs only.
+
+### Optional (defer to Wave 5C if architecture scaling stalls):
+1. **Focal loss** (`--focal-gamma`):
+   - `FL(p_t) = -(1-p_t)^gamma * log(p_t)`, with `gamma=0` equivalent to CE
+   - ⚠️ **Do NOT stack with label smoothing initially.** Run focal with `--label-smoothing 0.0` first; if needed, reintroduce small smoothing (0.01–0.02) after validating focal alone.
+
+2. **SNR-weighted CE** (`--snr-weight-ce`, `--snr-weight-ce-scale`, `--snr-weight-ce-max`):
+   - Per-sample weight: `w_i = 1 + scale * max(0, (snr_max - snr_i) / (snr_max - snr_min))`
+   - Low-SNR samples get higher CE weight
+   - ⚠️ **Cap max weight** (default 3x): `w_i = min(w_i, snr_weight_ce_max)` to avoid destabilization
+   - ⚠️ **Normalize weights** to keep batch mean weight ~= 1.0: `w_i = w_i / mean(w_batch)` so effective LR does not drift
+   - Without cap + normalization, this can recreate the same "low up, mid/high down" tradeoff seen in KD
+
+### Must implement for Wave 5B:
+3. **MoE classifier head** (`--moe-n-experts`, `--moe-gate-type`, etc.):
+   - `MoEClassifierHead` module: N parallel (fc1→fc2→fc_out) expert stacks
+   - Router takes `eta_pred` (and optionally features) to produce blend weights
+   - Gate types: `eta-sigmoid` (no learned params), `learned` (MLP), `hard` (argmax)
+   - Output: weighted sum of expert logits **plus per-expert logits** for auxiliary specialization losses
+   - Load-balancing loss: `L_bal = lambda * Var(expert_load)` where load = mean gate weight per expert
+   - Specialization loss: `L_spec = lambda_spec * H(gate_distribution)` — **minimizing H drives routing to be peaked** (low entropy = expert specialization). Previous version had wrong sign.
+   - Add **head-specific CE supervision** (core W5B.2 fix):
+     - `L_low = α_low * CE(logits_low_head, y)` on mask `snr in [low_lo, low_hi]`
+     - `L_high = α_high * CE(logits_high_head, y)` on mask `snr in [high_lo, high_hi]`
+     - Use overlapping masks (`low: -14..+2`, `high: -6..+18`) and normalize each masked loss by active-mask count.
+   - Add **gate tau annealing**:
+     - start with softer gate (`--moe-gate-tau-start`) and anneal to base `--moe-gate-tau` over `--moe-gate-tau-anneal-epochs`
+   - Add **early anti-collapse entropy warmup**:
+     - maximize gate entropy early via `--moe-entropy-warmup-lambda`, then decay over `--moe-entropy-warmup-epochs`
+   - Add delayed specialization start:
+     - apply `--moe-specialize-lambda` only after `--moe-specialize-start-epoch`
+   - Add optional tiny diversity penalty:
+     - `--moe-diversity-lambda` on cosine similarity between expert logits
+   - Add oracle-gate diagnostic mode:
+     - `--moe-oracle-gate-train` routes using true SNR during training to isolate gate-vs-trunk failure mode.
+   - ⚠️ **Do NOT enable large specialization/diversity weights early.** Keep regularizers tiny until per-expert load is stable.
+   - ⚠️ **CRITICAL — Router Gradient Leakage Trap**: If `--moe-gate-type learned`, the router's `L_bal` and `L_spec` losses generate gradients. If those flow backward through `eta_pred` or the CNN trunk, they will **destroy NoiseFractionNet calibration and feature extraction.** Must enforce `.detach()` on all router inputs:
+     ```
+     # Inside MoEClassifierHead.forward()
+     router_input_eta = eta_pred.detach()
+     router_input_feat = feat.detach() if use_feat_routing else None
+     gate_logits = self.router_mlp(router_input_eta, router_input_feat)
+     ```
+   - Log per-expert load fractions every epoch: `train_moe_expert_{k}_load` for collapse monitoring.
+
+### Must implement for Wave 5C:
+4. **Curriculum training** (`--curriculum-snr`, `--curriculum-warmup-epochs`):
+   - First N epochs: sample only from SNR ≥ −6 dB
+   - Linearly introduce lower SNR bins over warmup period
+   - By epoch N: full dataset
+   - ⚠️ **PyTorch DataLoader Trap**: DataLoader workers lock in dataset state when the iterator is created. You **cannot** just change `dataset.snr_min` inside the training loop and expect the DataLoader to yield new samples. **Must rebuild the DataLoader at the start of every epoch during warmup**:
+     ```
+     for epoch in range(epochs):
+         if args.curriculum_snr and epoch < args.curriculum_warmup_epochs:
+             current_snr_min = compute_curriculum_snr(epoch, ...)
+             train_dataset.set_snr_filter(min_snr=current_snr_min)
+             train_loader = DataLoader(train_dataset, batch_size=..., sampler=...)
+         # ... proceed with training loop ...
+     ```
+
+5. **Low-SNR oversampling** (`--snr-oversample-low`):
+   - Duplicate low-SNR (< −6 dB) training samples 2x in the dataloader
+
+### Must implement for Wave 5D:
+6. **TTA evaluation** (`--tta-views`, `--tta-phase`, `--tta-shift`):
+   - At inference: generate N augmented copies of each sample
+   - Average logits across views before argmax
+   - Augmentations: random phase rotation, circular time shift
+
+7. **Ensemble evaluation** (`--ensemble-ckpts`):
+   - Load multiple checkpoints, run inference on each
+   - Average logits across models before argmax
+
+---
+
+## Revised Metrics and Decision Gates
+
+Primary metrics (unchanged):
+- overall test mean over all 20 SNR bins
+- low band mean (`-20..−6 dB`, 8 bins)
+- mid band mean (`-4..+6 dB`, 6 bins)
+- high band mean (`+8..+18 dB`, 6 bins)
+- class-macro (overall/low band): macro-accuracy / macro-F1
+
+Updated promotion gates:
+
+**Wave 5A gate** (architecture scaling):
+- New oracle (W5A-7) must improve by **≥ +0.015** over previous oracle (~0.6855) **OR** exceed 0.7000 overall.
+- Best blind must beat previous best (0.6408) by ≥ +0.010
+
+**Wave 5B gate** (MoE):
+- Eta-gated MoE best must beat W5A best blind by ≥ +0.005 overall with low-band gain ≥ +0.010 and high-band drop no worse than −0.003
+- Oracle-gated diagnostic run:
+  - if oracle-gated MoE does not beat W5A by ≥ +0.005 overall, trunk bottleneck is likely dominant
+  - if oracle-gated improves but eta-gated does not, continue router/training refinements (not trunk swap yet)
+
+**Wave 5C gate** (combined stack):
+- Single-model best must reach ≥ 0.6600 overall
+- ⚠️ Conservative TTA/ensemble budget: plan for +0.005 to +0.015 per technique, so 0.66 single-model → ~0.68–0.69 realistic range (not 0.70 guaranteed)
+
+**Wave 5D gate** (final):
+- TTA or ensemble result must reach ≥ 0.7000 overall
+
+Aggressive fallback:
+- If W5A oracle fails gate but W5B MoE improves low/high Pareto: continue MoE track (head decoupling can still recover ceiling gap).
+- If W5A oracle fails gate **and** W5B fails to improve: scale architecture further (4-layer LSTM, wider merge conv, or Transformer encoder).
+- If single-model plateau at ~0.66 after Wave 5C: explore self-supervised pretraining or larger backbone
+- If TTA/ensemble gain < +0.005 per technique: investigate model diversity (different seeds alone may not be enough; try different architectures in the ensemble)
 
 ---
 
@@ -349,9 +618,10 @@ Machine path reminder:
 
 ## Why This Plan Is Comprehensive
 
-- It directly addresses the two core concerns from the last message:
-  - local expectation in expert branch via ST-ACF
-  - forcing denoiser-path usage via low-SNR raw-path attenuation
-- It keeps strict ablation structure (single mechanism -> interactions -> full stack).
-- It includes invariance-focused augmentation and conditioning head comparisons.
-- It explicitly scales beyond 8 experiments while respecting 8-concurrent capacity.
+- Waves 1–4 addressed **training-side** levers (regularization, KD, consistency) but exhausted their returns.
+- The architecture ceiling audit proves that **architecture scaling is now the primary bottleneck**.
+- Wave 5A directly breaks the ceiling (bidirectional LSTM, wider classifier, new oracle).
+- Wave 5B adds MoE to decouple SNR-regime decision boundaries (the original Wave 5M idea, but on a scaled architecture).
+- Wave 5C combines the best of all prior techniques on the new architecture.
+- Wave 5D provides a clean inference-time path (TTA + ensemble) for the final push to 0.70.
+- The plan has explicit go/no-go gates at each wave, with fallback strategies if milestones are missed.

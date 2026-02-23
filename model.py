@@ -624,7 +624,12 @@ class MoEClassifierHead(nn.Module):
             else:
                 self.register_buffer("eta_centers", torch.zeros(1), persistent=False)
 
-    def _eta_gate_probs(self, feat: torch.Tensor, eta_pred: Optional[torch.Tensor]) -> torch.Tensor:
+    def _eta_gate_probs(
+        self,
+        feat: torch.Tensor,
+        eta_pred: Optional[torch.Tensor],
+        tau_scale: float = 1.0,
+    ) -> torch.Tensor:
         b = int(feat.shape[0])
         if eta_pred is None:
             eta = torch.zeros((b,), device=feat.device, dtype=feat.dtype)
@@ -634,7 +639,8 @@ class MoEClassifierHead(nn.Module):
                 eta = torch.zeros((b,), device=feat.device, dtype=feat.dtype)
             else:
                 eta = eta_flat.to(device=feat.device, dtype=feat.dtype)
-        z = (eta - float(self.gate_center)) / max(1e-6, float(self.gate_tau))
+        tau_eff = max(1e-6, float(self.gate_tau) * max(1e-6, float(tau_scale)))
+        z = (eta - float(self.gate_center)) / tau_eff
 
         if self.n_experts == 2:
             g_low = torch.sigmoid(z)
@@ -660,11 +666,19 @@ class MoEClassifierHead(nn.Module):
         gate_logits = self.router_mlp(router_in)
         return torch.softmax(gate_logits, dim=1)
 
-    def forward(self, feat: torch.Tensor, eta_pred: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self.gate_type == "learned":
+    def forward(
+        self,
+        feat: torch.Tensor,
+        eta_pred: Optional[torch.Tensor],
+        tau_scale: float = 1.0,
+        gate_override: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if gate_override is not None:
+            gate = gate_override.to(device=feat.device, dtype=feat.dtype).detach()
+        elif self.gate_type == "learned":
             gate = self._learned_gate_probs(feat, eta_pred)
         else:
-            gate = self._eta_gate_probs(feat, eta_pred)
+            gate = self._eta_gate_probs(feat, eta_pred, tau_scale=tau_scale)
 
         if self.gate_type == "hard":
             top_idx = torch.argmax(gate, dim=1)
@@ -679,7 +693,7 @@ class MoEClassifierHead(nn.Module):
             expert_logits.append(self.fc_out[i](z))
         logits_e = torch.stack(expert_logits, dim=1)  # (B, E, C)
         logits = torch.sum(gate.unsqueeze(-1) * logits_e, dim=1)  # (B, C)
-        return logits, gate
+        return logits, gate, logits_e
 
 
 class ExpertFeatureExtractor(nn.Module):
@@ -1310,6 +1324,7 @@ class CLDNNAMC(nn.Module):
         self._x_dn: Optional[torch.Tensor] = None
         self._moe_gate: Optional[torch.Tensor] = None
         self._moe_expert_load: Optional[torch.Tensor] = None
+        self._moe_logits_experts: Optional[torch.Tensor] = None
         # Frozen early-feature encoder used by perceptual/feature-preservation loss.
         # Stored outside nn.Module registration to keep checkpoint compatibility.
         self.__dict__["_feat_encoder"] = None
@@ -1707,6 +1722,9 @@ class CLDNNAMC(nn.Module):
         group_mask: Optional[torch.Tensor] = None,
         cls_to_denoiser_scale: float = 1.0,
         denoiser_bypass: bool = False,
+        moe_gate_tau_scale: float = 1.0,
+        moe_use_oracle_gate: bool = False,
+        moe_oracle_snr: Optional[torch.Tensor] = None,
     ):
         # Accept (B,2,L) or (B,K,2,L)
         group_size = None
@@ -1794,8 +1812,14 @@ class CLDNNAMC(nn.Module):
         # Classifier head
         self._moe_gate = None
         self._moe_expert_load = None
+        self._moe_logits_experts = None
         if self.moe_head is not None:
-            eta_router = self._eta_pred
+            eta_router = None
+            if bool(moe_use_oracle_gate):
+                snr_for_gate = moe_oracle_snr if moe_oracle_snr is not None else snr
+                eta_router = self._eta_from_snr(snr_for_gate)
+            if eta_router is None:
+                eta_router = self._eta_pred
             if eta_router is None and snr is not None and snr_mode == "known":
                 eta_router = self._eta_from_snr(snr)
             if eta_router is None:
@@ -1804,9 +1828,14 @@ class CLDNNAMC(nn.Module):
                     eta_min=self.noise_eta_min,
                     eta_max=self.noise_eta_max,
                 )
-            logits, gate = self.moe_head(feat, eta_router)
+            logits, gate, logits_e = self.moe_head(
+                feat,
+                eta_router,
+                tau_scale=float(moe_gate_tau_scale),
+            )
             self._moe_gate = gate
             self._moe_expert_load = gate.mean(dim=0)
+            self._moe_logits_experts = logits_e
         else:
             z = self.fc_act(self.fc1(feat))
             z = self.drop(z)
