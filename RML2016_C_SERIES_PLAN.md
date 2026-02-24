@@ -436,32 +436,58 @@ W5B.3 diagnostic gates (low-band first):
 
 ---
 
-## Wave 5C (8 runs): Training Optimization + Combined Stack
+## Wave 5B.4 (2 runs): MoE Nondetach Confirmation
 
-Purpose: extract remaining gains through training strategy and combine best components.
+Purpose: close the remaining ambiguity from W5B.3 (detach vs nondetach) with a minimal, same-host confirmation before committing to pivot.
 
-Key new flags:
-- `--curriculum-snr` (NEW): start training on easier (high-SNR) samples, progressively add harder bins
-- `--curriculum-warmup-epochs N`: epochs before introducing lowest-SNR bins
-- `--snr-oversample-low` (NEW): 2x oversample low-SNR training samples
-- `--snr-consist-v2` (NEW): improved consistency with adaptive temperature per SNR bin
+Status from completed W5B.3 + Goose companion:
+- `D2 vs D1` (oracle eval routing) passed strongly.
+- `D3 vs D2` (head-only detached CE under oracle routing) failed.
+- Deployable eta-gated head-CE runs failed gate vs `D0`.
+- Goose nondetach companion improved over detached (`+0.0185` overall, `+0.0448` low on peak val), but still remained below `D2`.
 
-Base recipe: best from Wave 5A/5B.
+Runs:
+
+| ID | Run name | Delta flags | Purpose |
+|---|---|---|---|
+| C0 | `w5b4_oratraineval_headonly_a005_nodetach_athena` | W5B.3 oracle-head run with `a=0.05`, **without** `--moe-head-ce-detach-trunk`, with `--moe-oracle-gate-train --moe-oracle-gate-eval`, plus `--epochs 80 --early-stop-patience 12 --early-stop-min-delta 0.0005` | same-host nodetach oracle confirmation |
+| C1 | `w5b4_eta_headonly_a005_nodetach_athena` | eta-gated counterpart of C0 (no oracle flags), same early-stop settings | deployable nodetach check |
+
+Decision gates:
+- `C0 vs D2`: pass if `overall >= +0.003` **or** `low(-14..-6) >= +0.010`.
+- `C1 vs D0`: pass if `overall >= +0.003` and `low(-14..-6) >= +0.010` with `high(+6..+18) drop <= 0.003`.
+- If `C1` fails: stop MoE specialization tuning and pivot to SSL/trunk-level work.
+
+---
+
+## Wave 5C (6 runs): SSL Pivot On Non-MoE Anchor
+
+Purpose: raise representation quality directly once deployable MoE specialization fails gate.
+
+Implementation note:
+- Use only existing supported flags (`contrastive-pretrain`, `supcon`).
+- Keep the W5A/W5B anchor training family unchanged (split, augment, denoiser/noise settings).
+- Disable MoE specialization path (`--moe-n-experts 1`).
+
+Runs:
 
 | ID | Run name | Delta flags | Expected effect |
 |---|---|---|---|
-| W5C-0 | `w5c_best_anchor` | none (reproduce best W5A/5B) | anchor |
-| W5C-1 | `w5c_curriculum` | `--curriculum-snr --curriculum-warmup-epochs 30` | easy-to-hard curriculum |
-| W5C-2 | `w5c_oversample_low` | `--snr-oversample-low` | 2x low-SNR sample frequency |
-| W5C-3 | `w5c_consist_v2` | `--snr-consist --snr-consist-lambda 0.5 --snr-consist-warmup 30 ...` | consistency on scaled arch |
-| W5C-4 | `w5c_kd_oracle_scaled` | `--teacher-ckpt <W5A-7_oracle.pt> --lambda-kd 0.2 --kd-temp 2.0 --kd-snr-lo -14 --kd-snr-hi -6` | KD from scaled oracle (may finally transfer) |
-| W5C-5 | `w5c_kd_plus_moe` | W5C-4 + best MoE flags from W5B | KD + MoE combined |
-| W5C-6 | `w5c_voltron_no_tta` | all best flags combined | full single-model stack |
-| W5C-7 | `w5c_voltron_seed42` | W5C-6 + `--seed 42` | seed robustness check |
+| S0 | `w5c_ssl_anchor_nomoe` | non-MoE anchor (`--moe-n-experts 1`) | SSL baseline reference |
+| S1 | `w5c_ssl_ntxent20` | S0 + `--contrastive-pretrain-epochs 20 --contrastive-k 4 --contrastive-temp 0.10` | NT-Xent pilot |
+| S2 | `w5c_ssl_ntxent30_t007` | S0 + `--contrastive-pretrain-epochs 30 --contrastive-k 4 --contrastive-temp 0.07` | stronger NT-Xent pretrain |
+| S3 | `w5c_ssl_supcon_l010` | S0 + `--supcon --supcon-lambda 0.10 --supcon-warmup 10 --supcon-proj-dim 128 --supcon-temp 0.07` | SupCon baseline |
+| S4 | `w5c_ssl_supcon_l015` | S3 + `--supcon-lambda 0.15` | SupCon dose response |
+| S5 | `w5c_ssl_ntxent20_supcon_l010` | S1 + S3 flags | combined SSL objective |
 
-Wave-5C exit criterion:
-- Best single-model must reach ≥ 0.66 overall to be on trajectory for 0.70 with TTA/ensemble.
-- If below 0.66, consider further temporal scaling (4-layer and/or larger hidden size) or a Transformer pilot.
+Wave-5C promotion gate:
+- Best SSL run must satisfy all:
+  - `test_acc >= max(S0, 0.6409) + 0.008`
+  - low-band (`-20..-6`) gain `>= +0.015` vs `S0`
+  - high-band (`+6..+18`) drop `<= 0.003` vs `S0`
+
+If Wave-5C fails gate:
+- Start trunk-swap implementation wave (TCN/dilated temporal trunk) as next coding milestone.
 
 ---
 
