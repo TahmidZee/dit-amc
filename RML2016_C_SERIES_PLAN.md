@@ -413,6 +413,27 @@ Wave-5B exit criterion:
   - If oracle-gated MoE does not beat W5A by at least +0.005 overall, trunk bottleneck is likely dominant.
   - If oracle-gated beats W5A but eta-gated does not, routing/training (not trunk capacity) is the blocker.
 
+### Wave 5B.3 Recovery Mini-Wave (deconfounded diagnostics)
+
+Status update: W5B.2 showed strong overfit and did not isolate the root cause cleanly.  
+W5B.3 adds deconfounded diagnostics with minimal API changes:
+
+- `--moe-oracle-gate-eval`: allow true oracle routing during eval for clean D1 vs D2 interpretation.
+- `--moe-head-ce-detach-trunk`: force head-specific CE to update expert heads only.
+- `--moe-head-ce-source clean|cls`: choose whether aux CE uses clean forward logits or class-forward logits.
+- `--moe-head-ce-warmup`, `--moe-head-ce-ramp`: stabilize specialization CE onset.
+- Validation diagnostics now include:
+  - per-expert standalone accuracy (overall + low band),
+  - gate entropy,
+  - gate loads overall and in transition band (`--moe-transition-snr-lo/hi`, default `-8..-2 dB`).
+
+W5B.3 diagnostic gates (low-band first):
+
+- D2 vs D1 (oracle eval routing): pass if low-band improves by ≥ +0.010 **or** overall by ≥ +0.003.
+- D3 vs D2 (oracle + head-only CE): require no collapse and low-band gain ≥ +0.010 (overall gain may be smaller).
+- Deployable gate (eta-routed): require overall ≥ +0.003 with low-band ≥ +0.010 and high-band drop ≤ 0.003.
+- Pivot trigger: if all head-only candidates fail both low-band ≥ +0.010 and overall ≥ +0.003 under the high-band constraint, pivot to SSL/trunk-level changes.
+
 ---
 
 ## Wave 5C (8 runs): Training Optimization + Combined Stack

@@ -1185,6 +1185,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Train-time diagnostic: route MoE gate using true SNR (oracle) while keeping the student path unchanged.",
     )
+    parser.add_argument(
+        "--moe-oracle-gate-eval",
+        action="store_true",
+        help="Eval-time diagnostic: route MoE gate using true SNR (oracle).",
+    )
     parser.add_argument("--moe-low-head-idx", type=int, default=0, help="Expert index used as low-SNR head for head-specific CE.")
     parser.add_argument("--moe-high-head-idx", type=int, default=1, help="Expert index used as high-SNR head for head-specific CE.")
     parser.add_argument("--moe-head-low-lambda", type=float, default=0.0, help="Auxiliary CE weight for low-SNR head specialization.")
@@ -1193,6 +1198,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--moe-head-low-snr-hi", type=float, default=2.0, help="Low-head CE mask upper SNR bound (dB).")
     parser.add_argument("--moe-head-high-snr-lo", type=float, default=-6.0, help="High-head CE mask lower SNR bound (dB).")
     parser.add_argument("--moe-head-high-snr-hi", type=float, default=18.0, help="High-head CE mask upper SNR bound (dB).")
+    parser.add_argument(
+        "--moe-head-ce-warmup",
+        type=int,
+        default=0,
+        help="Epochs to keep head-specific CE disabled before ramping it in.",
+    )
+    parser.add_argument(
+        "--moe-head-ce-ramp",
+        type=int,
+        default=0,
+        help="Linear ramp epochs for head-specific CE after warmup.",
+    )
+    parser.add_argument(
+        "--moe-head-ce-detach-trunk",
+        action="store_true",
+        help="Compute MoE head-specific CE on detached classifier features (head-only gradients).",
+    )
+    parser.add_argument(
+        "--moe-head-ce-source",
+        type=str,
+        default="clean",
+        choices=["clean", "cls"],
+        help="Source forward path for head-specific CE logits: clean aux forward or cls forward.",
+    )
+    parser.add_argument(
+        "--moe-transition-snr-lo",
+        type=float,
+        default=-8.0,
+        help="Lower SNR bound (dB) for transition-band gate diagnostics.",
+    )
+    parser.add_argument(
+        "--moe-transition-snr-hi",
+        type=float,
+        default=-2.0,
+        help="Upper SNR bound (dB) for transition-band gate diagnostics.",
+    )
     parser.add_argument(
         "--moe-diversity-lambda",
         type=float,
@@ -2053,6 +2094,9 @@ def evaluate(
     amp: bool = False,
     low_snr_lo: float = -14.0,
     low_snr_hi: float = -6.0,
+    moe_oracle_gate_eval: bool = False,
+    moe_transition_snr_lo: float = -8.0,
+    moe_transition_snr_hi: float = -2.0,
 ) -> Tuple[float, float, Dict[int, float], Dict[str, float]]:
     model.eval()
     total_correct = 0
@@ -2061,6 +2105,15 @@ def evaluate(
     snr_total: Dict[int, int] = {}
     conf_all: Optional[np.ndarray] = None
     conf_low: Optional[np.ndarray] = None
+    moe_expert_correct: Optional[np.ndarray] = None
+    moe_expert_low_correct: Optional[np.ndarray] = None
+    moe_expert_total = 0
+    moe_expert_low_total = 0
+    moe_gate_load_sum: Optional[np.ndarray] = None
+    moe_gate_transition_load_sum: Optional[np.ndarray] = None
+    moe_gate_count = 0
+    moe_gate_transition_count = 0
+    moe_gate_entropy_sum = 0.0
 
     with torch.no_grad():
         for batch in loader:
@@ -2074,16 +2127,36 @@ def evaluate(
             snr = snr.to(device)
             t = torch.full((x.shape[0],), t_eval, device=device, dtype=torch.long)
             snr_in = snr if snr_mode == "known" else None
+            moe_kwargs_eval: Dict[str, object] = {}
+            if bool(moe_oracle_gate_eval) and getattr(model, "moe_head", None) is not None:
+                moe_kwargs_eval["moe_use_oracle_gate"] = True
+                moe_kwargs_eval["moe_oracle_snr"] = snr
             if amp and device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=_cuda_amp_dtype(), enabled=True):
-                    logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
+                    logits, _, _ = model(
+                        x,
+                        t,
+                        snr=snr_in,
+                        snr_mode=snr_mode,
+                        group_mask=mask,
+                        **moe_kwargs_eval,
+                    )
             else:
-                logits, _, _ = model(x, t, snr=snr_in, snr_mode=snr_mode, group_mask=mask)
+                logits, _, _ = model(
+                    x,
+                    t,
+                    snr=snr_in,
+                    snr_mode=snr_mode,
+                    group_mask=mask,
+                    **moe_kwargs_eval,
+                )
 
             preds = logits.argmax(dim=1)
             correct = (preds == y).sum().item()
             total_correct += correct
             total += y.shape[0]
+            low_mask_dev = (snr.float() >= float(low_snr_lo)) & (snr.float() <= float(low_snr_hi))
+            trans_mask_dev = (snr.float() >= float(moe_transition_snr_lo)) & (snr.float() <= float(moe_transition_snr_hi))
 
             # Class-macro metrics (overall + low-band).
             ncls = int(logits.shape[1])
@@ -2098,7 +2171,7 @@ def evaluate(
             conf_all += binc.numpy()
 
             snr_cpu_t = snr.detach().cpu().float()
-            low_mask_t = (snr_cpu_t >= float(low_snr_lo)) & (snr_cpu_t <= float(low_snr_hi))
+            low_mask_t = low_mask_dev.detach().cpu()
             if bool(torch.any(low_mask_t)):
                 if conf_low is None:
                     conf_low = np.zeros((ncls, ncls), dtype=np.int64)
@@ -2109,6 +2182,37 @@ def evaluate(
                     minlength=ncls * ncls,
                 ).view(ncls, ncls)
                 conf_low += binc_low.numpy()
+
+            logits_experts = getattr(model, "_moe_logits_experts", None)
+            if logits_experts is not None and isinstance(logits_experts, torch.Tensor) and logits_experts.ndim == 3:
+                n_exp = int(logits_experts.shape[1])
+                if moe_expert_correct is None or moe_expert_correct.shape[0] != n_exp:
+                    moe_expert_correct = np.zeros((n_exp,), dtype=np.float64)
+                    moe_expert_low_correct = np.zeros((n_exp,), dtype=np.float64)
+                preds_experts = logits_experts.argmax(dim=2)  # (B,E)
+                corr_experts = (preds_experts == y.unsqueeze(1))
+                moe_expert_correct += corr_experts.sum(dim=0).detach().cpu().numpy()
+                moe_expert_total += int(y.shape[0])
+                if bool(torch.any(low_mask_dev)):
+                    corr_low = corr_experts[low_mask_dev]
+                    moe_expert_low_correct += corr_low.sum(dim=0).detach().cpu().numpy()
+                    moe_expert_low_total += int(corr_low.shape[0])
+
+            gate = getattr(model, "_moe_gate", None)
+            if gate is not None and isinstance(gate, torch.Tensor) and gate.ndim == 2:
+                g = gate.float()
+                n_exp_gate = int(g.shape[1])
+                if moe_gate_load_sum is None or moe_gate_load_sum.shape[0] != n_exp_gate:
+                    moe_gate_load_sum = np.zeros((n_exp_gate,), dtype=np.float64)
+                    moe_gate_transition_load_sum = np.zeros((n_exp_gate,), dtype=np.float64)
+                moe_gate_load_sum += g.sum(dim=0).detach().cpu().numpy()
+                moe_gate_count += int(g.shape[0])
+                ent = -(torch.clamp(g, min=1e-8) * torch.log(torch.clamp(g, min=1e-8))).sum(dim=1)
+                moe_gate_entropy_sum += float(ent.sum().item())
+                if bool(torch.any(trans_mask_dev)):
+                    g_trans = g[trans_mask_dev]
+                    moe_gate_transition_load_sum += g_trans.sum(dim=0).detach().cpu().numpy()
+                    moe_gate_transition_count += int(g_trans.shape[0])
 
             snr_cpu = snr.detach().cpu().numpy().astype(np.int32)
             preds_cpu = preds.detach().cpu().numpy()
@@ -2130,6 +2234,25 @@ def evaluate(
         "low_snr_lo": float(low_snr_lo),
         "low_snr_hi": float(low_snr_hi),
     }
+    if moe_expert_correct is not None and moe_expert_total > 0:
+        for i in range(int(moe_expert_correct.shape[0])):
+            summary[f"moe_expert_{i}_acc"] = float(moe_expert_correct[i] / float(moe_expert_total))
+            if moe_expert_low_correct is not None and moe_expert_low_total > 0:
+                summary[f"moe_expert_{i}_low_acc"] = float(moe_expert_low_correct[i] / float(moe_expert_low_total))
+            else:
+                summary[f"moe_expert_{i}_low_acc"] = 0.0
+    if moe_gate_load_sum is not None and moe_gate_count > 0:
+        summary["moe_gate_entropy"] = float(moe_gate_entropy_sum / float(moe_gate_count))
+        summary["moe_transition_snr_lo"] = float(moe_transition_snr_lo)
+        summary["moe_transition_snr_hi"] = float(moe_transition_snr_hi)
+        for i in range(int(moe_gate_load_sum.shape[0])):
+            summary[f"moe_gate_expert_{i}_load"] = float(moe_gate_load_sum[i] / float(moe_gate_count))
+            if moe_gate_transition_load_sum is not None and moe_gate_transition_count > 0:
+                summary[f"moe_gate_expert_{i}_load_transition"] = float(
+                    moe_gate_transition_load_sum[i] / float(moe_gate_transition_count)
+                )
+            else:
+                summary[f"moe_gate_expert_{i}_load_transition"] = 0.0
     return acc, total, acc_by_snr, summary
 
 
@@ -2536,12 +2659,18 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("moe_head_low_lambda must be >= 0.")
     if float(getattr(args, "moe_head_high_lambda", 0.0)) < 0.0:
         raise ValueError("moe_head_high_lambda must be >= 0.")
+    if int(getattr(args, "moe_head_ce_warmup", 0)) < 0:
+        raise ValueError("moe_head_ce_warmup must be >= 0.")
+    if int(getattr(args, "moe_head_ce_ramp", 0)) < 0:
+        raise ValueError("moe_head_ce_ramp must be >= 0.")
     if float(getattr(args, "moe_diversity_lambda", 0.0)) < 0.0:
         raise ValueError("moe_diversity_lambda must be >= 0.")
     if float(getattr(args, "moe_head_low_snr_lo", -14.0)) > float(getattr(args, "moe_head_low_snr_hi", 2.0)):
         raise ValueError("moe_head_low_snr_lo must be <= moe_head_low_snr_hi.")
     if float(getattr(args, "moe_head_high_snr_lo", -6.0)) > float(getattr(args, "moe_head_high_snr_hi", 18.0)):
         raise ValueError("moe_head_high_snr_lo must be <= moe_head_high_snr_hi.")
+    if float(getattr(args, "moe_transition_snr_lo", -8.0)) > float(getattr(args, "moe_transition_snr_hi", -2.0)):
+        raise ValueError("moe_transition_snr_lo must be <= moe_transition_snr_hi.")
     if int(getattr(args, "moe_low_head_idx", 0)) == int(getattr(args, "moe_high_head_idx", 1)):
         raise ValueError("moe_low_head_idx and moe_high_head_idx must be different.")
     if int(getattr(args, "moe_n_experts", 1)) > 1 and args.arch != "cldnn":
@@ -2553,6 +2682,8 @@ def train(args: argparse.Namespace) -> None:
             or float(getattr(args, "moe_head_high_lambda", 0.0)) > 0.0
             or float(getattr(args, "moe_diversity_lambda", 0.0)) > 0.0
             or bool(getattr(args, "moe_oracle_gate_train", False))
+            or bool(getattr(args, "moe_oracle_gate_eval", False))
+            or bool(getattr(args, "moe_head_ce_detach_trunk", False))
         )
     ):
         raise ValueError("MoE-specific training knobs require --moe-n-experts > 1.")
@@ -2566,6 +2697,8 @@ def train(args: argparse.Namespace) -> None:
         or float(getattr(args, "moe_head_high_lambda", 0.0)) > 0.0
     ) and int(getattr(args, "moe_n_experts", 1)) < 2:
         raise ValueError("Head-specific MoE CE requires at least 2 experts.")
+    if str(getattr(args, "moe_head_ce_source", "clean")).strip().lower() not in {"clean", "cls"}:
+        raise ValueError("moe_head_ce_source must be one of: clean | cls.")
     if float(getattr(args, "focal_gamma", 0.0)) > 0.0 and float(getattr(args, "label_smoothing", 0.0)) > 0.0:
         print("[warn] focal_gamma > 0 with label_smoothing > 0 can conflict; consider label_smoothing=0.0 for focal runs.")
     if bool(getattr(args, "snr_weight_ce", False)) and float(getattr(args, "low_snr_boost", 0.0)) > 0.0:
@@ -3079,6 +3212,19 @@ def train(args: argparse.Namespace) -> None:
             moe_gate_tau_curr = moe_gate_tau_start + tau_prog * (moe_gate_tau_base - moe_gate_tau_start)
         moe_gate_tau_scale = moe_gate_tau_curr / max(1e-6, moe_gate_tau_base)
         moe_oracle_gate_train = bool(getattr(args, "moe_oracle_gate_train", False))
+        moe_head_ce_detach_trunk = bool(getattr(args, "moe_head_ce_detach_trunk", False))
+        moe_head_ce_source = str(getattr(args, "moe_head_ce_source", "clean")).strip().lower()
+        moe_head_ce_warmup = int(getattr(args, "moe_head_ce_warmup", 0))
+        moe_head_ce_ramp = int(getattr(args, "moe_head_ce_ramp", 0))
+        if epoch < moe_head_ce_warmup:
+            moe_head_ce_scale = 0.0
+        elif moe_head_ce_ramp > 0:
+            ramp_prog = float(epoch - moe_head_ce_warmup + 1) / float(max(1, moe_head_ce_ramp))
+            moe_head_ce_scale = max(0.0, min(1.0, ramp_prog))
+        else:
+            moe_head_ce_scale = 1.0
+        moe_head_low_lambda_eff = float(getattr(args, "moe_head_low_lambda", 0.0)) * moe_head_ce_scale
+        moe_head_high_lambda_eff = float(getattr(args, "moe_head_high_lambda", 0.0)) * moe_head_ce_scale
         epoch_correct = 0
         epoch_total = 0
         start_time = time.time()
@@ -3214,12 +3360,23 @@ def train(args: argparse.Namespace) -> None:
                 if moe_oracle_gate_train:
                     kw["moe_use_oracle_gate"] = True
                     kw["moe_oracle_snr"] = snr_for_gate
+                if moe_head_ce_detach_trunk:
+                    kw["moe_head_ce_detach_trunk"] = True
                 return kw
+
+            def _moe_logits_for_aux(model_obj: torch.nn.Module) -> Optional[torch.Tensor]:
+                if moe_head_ce_detach_trunk:
+                    logits_aux = getattr(model_obj, "_moe_logits_experts_aux", None)
+                    if logits_aux is not None:
+                        return logits_aux
+                return getattr(model_obj, "_moe_logits_experts", None)
 
             moe_kwargs_aux = _moe_kwargs(snr_aux)
             moe_kwargs_cls = _moe_kwargs(snr_cls)
             logits_for_acc = None
             logits_teacher_base = None
+            moe_logits_experts_clean: Optional[torch.Tensor] = None
+            moe_logits_experts_cls: Optional[torch.Tensor] = None
             eta_pred_for_noise = None
             loss_feat = torch.tensor(0.0, device=device)
             lfeat_active_frac_batch = torch.tensor(0.0, device=device)
@@ -3266,6 +3423,7 @@ def train(args: argparse.Namespace) -> None:
                                 **extra_cls2dn,
                                 **moe_kwargs_aux,
                             )
+                            moe_logits_experts_clean = _moe_logits_for_aux(model)
                             student_prefilm_kd = getattr(model, "_pooled_pre_film", None)
                             eta_pred_for_noise = getattr(model, "_eta_pred", None)
                             logits, _x0_pred_mix, _snr_pred_mix = model(
@@ -3277,6 +3435,7 @@ def train(args: argparse.Namespace) -> None:
                                 **extra_cls2dn,
                                 **moe_kwargs_cls,
                             )
+                            moe_logits_experts_cls = _moe_logits_for_aux(model)
                             logits_for_acc = logits_clean
                             logits_teacher_base = logits_clean
                         else:
@@ -3289,6 +3448,8 @@ def train(args: argparse.Namespace) -> None:
                                 **extra_cls2dn,
                                 **moe_kwargs_cls,
                             )
+                            moe_logits_experts_cls = _moe_logits_for_aux(model)
+                            moe_logits_experts_clean = moe_logits_experts_cls
                             student_prefilm_kd = getattr(model, "_pooled_pre_film", None)
                             eta_pred_for_noise = getattr(model, "_eta_pred", None)
                             logits_for_acc = logits
@@ -3347,7 +3508,13 @@ def train(args: argparse.Namespace) -> None:
                         + float(getattr(args, "lambda_noise", 0.0)) * loss_noise
                     )
                     if args.arch == "cldnn" and moe_n_experts_cfg > 1:
-                        moe_logits_experts_batch = getattr(model, "_moe_logits_experts", None)
+                        moe_logits_experts_batch = (
+                            moe_logits_experts_clean if moe_head_ce_source == "clean" else moe_logits_experts_cls
+                        )
+                        if moe_logits_experts_batch is None:
+                            moe_logits_experts_batch = (
+                                moe_logits_experts_cls if moe_head_ce_source == "clean" else moe_logits_experts_clean
+                            )
                         (
                             loss_moe_head_low,
                             loss_moe_head_high,
@@ -3364,8 +3531,8 @@ def train(args: argparse.Namespace) -> None:
                             lam=lam,
                             low_head_idx=int(getattr(args, "moe_low_head_idx", 0)),
                             high_head_idx=int(getattr(args, "moe_high_head_idx", 1)),
-                            low_lambda=float(getattr(args, "moe_head_low_lambda", 0.0)),
-                            high_lambda=float(getattr(args, "moe_head_high_lambda", 0.0)),
+                            low_lambda=float(moe_head_low_lambda_eff),
+                            high_lambda=float(moe_head_high_lambda_eff),
                             low_snr_lo=float(getattr(args, "moe_head_low_snr_lo", -14.0)),
                             low_snr_hi=float(getattr(args, "moe_head_low_snr_hi", 2.0)),
                             high_snr_lo=float(getattr(args, "moe_head_high_snr_lo", -6.0)),
@@ -3699,6 +3866,7 @@ def train(args: argparse.Namespace) -> None:
                             **extra_cls2dn,
                             **moe_kwargs_aux,
                         )
+                        moe_logits_experts_clean = _moe_logits_for_aux(model)
                         student_prefilm_kd = getattr(model, "_pooled_pre_film", None)
                         eta_pred_for_noise = getattr(model, "_eta_pred", None)
                         logits, _x0_pred_mix, _snr_pred_mix = model(
@@ -3710,6 +3878,7 @@ def train(args: argparse.Namespace) -> None:
                             **extra_cls2dn,
                             **moe_kwargs_cls,
                         )
+                        moe_logits_experts_cls = _moe_logits_for_aux(model)
                         logits_for_acc = logits_clean
                         logits_teacher_base = logits_clean
                     else:
@@ -3722,6 +3891,8 @@ def train(args: argparse.Namespace) -> None:
                             **extra_cls2dn,
                             **moe_kwargs_cls,
                         )
+                        moe_logits_experts_cls = _moe_logits_for_aux(model)
+                        moe_logits_experts_clean = moe_logits_experts_cls
                         student_prefilm_kd = getattr(model, "_pooled_pre_film", None)
                         eta_pred_for_noise = getattr(model, "_eta_pred", None)
                         logits_for_acc = logits
@@ -3780,7 +3951,13 @@ def train(args: argparse.Namespace) -> None:
                     + float(getattr(args, "lambda_noise", 0.0)) * loss_noise
                 )
                 if args.arch == "cldnn" and moe_n_experts_cfg > 1:
-                    moe_logits_experts_batch = getattr(model, "_moe_logits_experts", None)
+                    moe_logits_experts_batch = (
+                        moe_logits_experts_clean if moe_head_ce_source == "clean" else moe_logits_experts_cls
+                    )
+                    if moe_logits_experts_batch is None:
+                        moe_logits_experts_batch = (
+                            moe_logits_experts_cls if moe_head_ce_source == "clean" else moe_logits_experts_clean
+                        )
                     (
                         loss_moe_head_low,
                         loss_moe_head_high,
@@ -3797,8 +3974,8 @@ def train(args: argparse.Namespace) -> None:
                         lam=lam,
                         low_head_idx=int(getattr(args, "moe_low_head_idx", 0)),
                         high_head_idx=int(getattr(args, "moe_high_head_idx", 1)),
-                        low_lambda=float(getattr(args, "moe_head_low_lambda", 0.0)),
-                        high_lambda=float(getattr(args, "moe_head_high_lambda", 0.0)),
+                        low_lambda=float(moe_head_low_lambda_eff),
+                        high_lambda=float(moe_head_high_lambda_eff),
                         low_snr_lo=float(getattr(args, "moe_head_low_snr_lo", -14.0)),
                         low_snr_hi=float(getattr(args, "moe_head_low_snr_hi", 2.0)),
                         high_snr_lo=float(getattr(args, "moe_head_high_snr_lo", -6.0)),
@@ -4238,6 +4415,9 @@ def train(args: argparse.Namespace) -> None:
                 amp=args.amp,
                 low_snr_lo=float(getattr(args, "report_low_snr_lo", -14.0)),
                 low_snr_hi=float(getattr(args, "report_low_snr_hi", -6.0)),
+                moe_oracle_gate_eval=bool(getattr(args, "moe_oracle_gate_eval", False)),
+                moe_transition_snr_lo=float(getattr(args, "moe_transition_snr_lo", -8.0)),
+                moe_transition_snr_hi=float(getattr(args, "moe_transition_snr_hi", -2.0)),
             )
             ema.restore(model)
         else:
@@ -4250,6 +4430,9 @@ def train(args: argparse.Namespace) -> None:
                 amp=args.amp,
                 low_snr_lo=float(getattr(args, "report_low_snr_lo", -14.0)),
                 low_snr_hi=float(getattr(args, "report_low_snr_hi", -6.0)),
+                moe_oracle_gate_eval=bool(getattr(args, "moe_oracle_gate_eval", False)),
+                moe_transition_snr_lo=float(getattr(args, "moe_transition_snr_lo", -8.0)),
+                moe_transition_snr_hi=float(getattr(args, "moe_transition_snr_hi", -2.0)),
             )
 
         noise_calib: Dict[str, object] = {}
@@ -4348,14 +4531,24 @@ def train(args: argparse.Namespace) -> None:
             "moe_gate_tau_start": float(getattr(args, "moe_gate_tau_start", -1.0)),
             "moe_gate_tau_anneal_epochs": int(getattr(args, "moe_gate_tau_anneal_epochs", 0)),
             "moe_oracle_gate_train": bool(getattr(args, "moe_oracle_gate_train", False)),
+            "moe_oracle_gate_eval": bool(getattr(args, "moe_oracle_gate_eval", False)),
             "moe_low_head_idx": int(getattr(args, "moe_low_head_idx", 0)),
             "moe_high_head_idx": int(getattr(args, "moe_high_head_idx", 1)),
             "moe_head_low_lambda": float(getattr(args, "moe_head_low_lambda", 0.0)),
             "moe_head_high_lambda": float(getattr(args, "moe_head_high_lambda", 0.0)),
+            "moe_head_low_lambda_eff": float(moe_head_low_lambda_eff),
+            "moe_head_high_lambda_eff": float(moe_head_high_lambda_eff),
+            "moe_head_ce_scale": float(moe_head_ce_scale),
+            "moe_head_ce_warmup": int(getattr(args, "moe_head_ce_warmup", 0)),
+            "moe_head_ce_ramp": int(getattr(args, "moe_head_ce_ramp", 0)),
             "moe_head_low_snr_lo": float(getattr(args, "moe_head_low_snr_lo", -14.0)),
             "moe_head_low_snr_hi": float(getattr(args, "moe_head_low_snr_hi", 2.0)),
             "moe_head_high_snr_lo": float(getattr(args, "moe_head_high_snr_lo", -6.0)),
             "moe_head_high_snr_hi": float(getattr(args, "moe_head_high_snr_hi", 18.0)),
+            "moe_head_ce_detach_trunk": bool(getattr(args, "moe_head_ce_detach_trunk", False)),
+            "moe_head_ce_source": str(getattr(args, "moe_head_ce_source", "clean")),
+            "moe_transition_snr_lo": float(getattr(args, "moe_transition_snr_lo", -8.0)),
+            "moe_transition_snr_hi": float(getattr(args, "moe_transition_snr_hi", -2.0)),
             "moe_diversity_lambda": float(getattr(args, "moe_diversity_lambda", 0.0)),
             "lr_decay_start_epoch": getattr(args, "lr_decay_start_epoch", 0),
             "curriculum_soft": bool(getattr(args, "curriculum_soft", False)),
@@ -4372,6 +4565,9 @@ def train(args: argparse.Namespace) -> None:
         if noise_calib:
             record["eta_pearson"] = float(noise_calib.get("eta_pearson", 0.0))
             record["eta_spearman"] = float(noise_calib.get("eta_spearman", 0.0))
+        for k, v in val_summary.items():
+            if k.startswith("moe_"):
+                record[f"val_{k}"] = float(v)
         write_jsonl(metrics_path, record)
 
         improved = val_acc > (best_val + float(args.early_stop_min_delta))
@@ -4442,6 +4638,9 @@ def train(args: argparse.Namespace) -> None:
         amp=args.amp,
         low_snr_lo=float(getattr(args, "report_low_snr_lo", -14.0)),
         low_snr_hi=float(getattr(args, "report_low_snr_hi", -6.0)),
+        moe_oracle_gate_eval=bool(getattr(args, "moe_oracle_gate_eval", False)),
+        moe_transition_snr_lo=float(getattr(args, "moe_transition_snr_lo", -8.0)),
+        moe_transition_snr_hi=float(getattr(args, "moe_transition_snr_hi", -2.0)),
     )
     dyn = None
     if args.dynamic_k_eval:
@@ -4601,6 +4800,9 @@ def run_eval(args: argparse.Namespace) -> None:
         amp=args.amp,
         low_snr_lo=float(getattr(args, "report_low_snr_lo", -14.0)),
         low_snr_hi=float(getattr(args, "report_low_snr_hi", -6.0)),
+        moe_oracle_gate_eval=bool(getattr(args, "moe_oracle_gate_eval", False)),
+        moe_transition_snr_lo=float(getattr(args, "moe_transition_snr_lo", -8.0)),
+        moe_transition_snr_hi=float(getattr(args, "moe_transition_snr_hi", -2.0)),
     )
     print(f"Test acc: {test_acc:.4f}")
     print("Test acc by SNR:", test_acc_by_snr)

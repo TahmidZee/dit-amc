@@ -684,6 +684,11 @@ class MoEClassifierHead(nn.Module):
             top_idx = torch.argmax(gate, dim=1)
             gate = F.one_hot(top_idx, num_classes=self.n_experts).to(dtype=feat.dtype)
 
+        logits_e = self.expert_logits(feat)  # (B, E, C)
+        logits = torch.sum(gate.unsqueeze(-1) * logits_e, dim=1)  # (B, C)
+        return logits, gate, logits_e
+
+    def expert_logits(self, feat: torch.Tensor) -> torch.Tensor:
         expert_logits = []
         for i in range(self.n_experts):
             z = self.act(self.fc1[i](feat))
@@ -691,9 +696,7 @@ class MoEClassifierHead(nn.Module):
             z = self.act(self.fc2[i](z))
             z = self.drop(z)
             expert_logits.append(self.fc_out[i](z))
-        logits_e = torch.stack(expert_logits, dim=1)  # (B, E, C)
-        logits = torch.sum(gate.unsqueeze(-1) * logits_e, dim=1)  # (B, C)
-        return logits, gate, logits_e
+        return torch.stack(expert_logits, dim=1)  # (B, E, C)
 
 
 class ExpertFeatureExtractor(nn.Module):
@@ -1325,6 +1328,7 @@ class CLDNNAMC(nn.Module):
         self._moe_gate: Optional[torch.Tensor] = None
         self._moe_expert_load: Optional[torch.Tensor] = None
         self._moe_logits_experts: Optional[torch.Tensor] = None
+        self._moe_logits_experts_aux: Optional[torch.Tensor] = None
         # Frozen early-feature encoder used by perceptual/feature-preservation loss.
         # Stored outside nn.Module registration to keep checkpoint compatibility.
         self.__dict__["_feat_encoder"] = None
@@ -1725,6 +1729,7 @@ class CLDNNAMC(nn.Module):
         moe_gate_tau_scale: float = 1.0,
         moe_use_oracle_gate: bool = False,
         moe_oracle_snr: Optional[torch.Tensor] = None,
+        moe_head_ce_detach_trunk: bool = False,
     ):
         # Accept (B,2,L) or (B,K,2,L)
         group_size = None
@@ -1813,6 +1818,7 @@ class CLDNNAMC(nn.Module):
         self._moe_gate = None
         self._moe_expert_load = None
         self._moe_logits_experts = None
+        self._moe_logits_experts_aux = None
         if self.moe_head is not None:
             eta_router = None
             if bool(moe_use_oracle_gate):
@@ -1836,6 +1842,8 @@ class CLDNNAMC(nn.Module):
             self._moe_gate = gate
             self._moe_expert_load = gate.mean(dim=0)
             self._moe_logits_experts = logits_e
+            if bool(moe_head_ce_detach_trunk):
+                self._moe_logits_experts_aux = self.moe_head.expert_logits(feat.detach())
         else:
             z = self.fc_act(self.fc1(feat))
             z = self.drop(z)
