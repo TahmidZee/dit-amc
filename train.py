@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import math
 import os
@@ -32,6 +33,7 @@ from data import (
     load_rml2018a_hdf5,
     load_rml2016a,
     parse_snrs,
+    RML2016aContrastivePairDataset,
     RML2016aDataset,
     RML2016aGroupedDataset,
     RML2016aVariableGroupedDataset,
@@ -872,6 +874,60 @@ def supervised_contrastive_loss(
     return loss.sum() / n_valid
 
 
+class MoCoProjectionMLP(torch.nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(int(in_dim), int(hidden_dim)),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(int(hidden_dim), int(out_dim)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+@torch.no_grad()
+def moco_momentum_update(query_module: torch.nn.Module, key_module: torch.nn.Module, momentum: float) -> None:
+    m = float(momentum)
+    for p_q, p_k in zip(query_module.parameters(), key_module.parameters()):
+        p_k.data.mul_(m).add_(p_q.data, alpha=1.0 - m)
+    # Keep BN/LN buffers aligned to avoid stale key statistics in single-process mode.
+    for b_q, b_k in zip(query_module.buffers(), key_module.buffers()):
+        b_k.copy_(b_q)
+
+
+@torch.no_grad()
+def moco_enqueue(queue: torch.Tensor, ptr: int, keys: torch.Tensor) -> int:
+    if queue.ndim != 2 or keys.ndim != 2:
+        raise ValueError("moco_enqueue expects 2D queue and keys tensors.")
+    if queue.shape[1] != keys.shape[1]:
+        raise ValueError(f"Queue/key dim mismatch: queue={tuple(queue.shape)} keys={tuple(keys.shape)}")
+
+    qsz = int(queue.shape[0])
+    if qsz <= 0:
+        raise ValueError("MoCo queue size must be > 0.")
+
+    k = F.normalize(keys.detach(), dim=1)
+    bsz = int(k.shape[0])
+    if bsz <= 0:
+        return int(ptr) % qsz
+
+    if bsz >= qsz:
+        queue.copy_(k[-qsz:])
+        return 0
+
+    ptr = int(ptr) % qsz
+    end = ptr + bsz
+    if end <= qsz:
+        queue[ptr:end] = k
+    else:
+        first = qsz - ptr
+        queue[ptr:] = k[:first]
+        queue[: end - qsz] = k[first:]
+    return (ptr + bsz) % qsz
+
+
 def _cuda_amp_dtype() -> torch.dtype:
     if not torch.cuda.is_available():
         return torch.float32
@@ -1463,6 +1519,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contrastive-k", type=int, default=4, help="Number of windows per sample for contrastive learning.")
     parser.add_argument("--contrastive-temp", type=float, default=0.1, help="Temperature for InfoNCE loss.")
     parser.add_argument("--contrastive-lr", type=float, default=None, help="Learning rate for contrastive pre-training (defaults to --lr).")
+    parser.add_argument("--moco-pretrain-epochs", type=int, default=0, help="Number of epochs for MoCo-v2 pre-training (0 = disabled).")
+    parser.add_argument("--moco-temp", type=float, default=0.20, help="Temperature for MoCo InfoNCE logits.")
+    parser.add_argument("--moco-momentum", type=float, default=0.999, help="Momentum coefficient for MoCo key encoder EMA update.")
+    parser.add_argument("--moco-queue-size", type=int, default=16384, help="Number of negative keys in MoCo queue.")
+    parser.add_argument("--moco-proj-dim", type=int, default=128, help="Output embedding dimension for MoCo projection heads.")
+    parser.add_argument("--moco-hidden-dim", type=int, default=512, help="Hidden dimension for MoCo projection MLP.")
+    parser.add_argument("--moco-lr", type=float, default=None, help="Learning rate for MoCo pre-training (defaults to --lr).")
+    parser.add_argument("--moco-weight-decay", type=float, default=None, help="Weight decay for MoCo pre-training (defaults to --weight-decay).")
+
+    # Extra SSL augmentations for MoCo pair views.
+    parser.add_argument("--ssl-aug-awgn-prob", type=float, default=0.0, help="Probability of AWGN augmentation per SSL view.")
+    parser.add_argument("--ssl-aug-awgn-snr-min-db", type=float, default=6.0, help="Minimum target SNR (dB) for SSL AWGN augmentation.")
+    parser.add_argument("--ssl-aug-awgn-snr-max-db", type=float, default=20.0, help="Maximum target SNR (dB) for SSL AWGN augmentation.")
+    parser.add_argument("--ssl-aug-time-mask-prob", type=float, default=0.0, help="Probability of temporal masking augmentation per SSL view.")
+    parser.add_argument("--ssl-aug-time-mask-max-frac", type=float, default=0.12, help="Maximum masked time fraction for SSL temporal masking.")
+    parser.add_argument("--ssl-aug-iq-drop-prob", type=float, default=0.0, help="Probability of dropping one IQ channel per SSL view.")
 
     # Supervised Contrastive Learning (SupCon)  –  Khosla et al., NeurIPS 2020
     parser.add_argument("--supcon", action="store_true", help="Enable supervised contrastive loss (SupCon) alongside CE.")
@@ -1470,6 +1542,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--supcon-temp", type=float, default=0.07, help="Temperature τ for cosine similarities (0.07 is standard for L2-normed embeddings).")
     parser.add_argument("--supcon-proj-dim", type=int, default=128, help="Output dimension of the MLP projection head for SupCon.")
     parser.add_argument("--supcon-warmup", type=int, default=0, help="Number of epochs before SupCon loss kicks in (0 = from the start).")
+    parser.add_argument(
+        "--supcon-clean-branch-on-mixup-cls-only",
+        action="store_true",
+        help="When mixup_cls_only is active, compute SupCon from clean-branch features/labels instead of skipping SupCon.",
+    )
 
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--epochs", type=int, default=50)
@@ -2699,6 +2776,33 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("Head-specific MoE CE requires at least 2 experts.")
     if str(getattr(args, "moe_head_ce_source", "clean")).strip().lower() not in {"clean", "cls"}:
         raise ValueError("moe_head_ce_source must be one of: clean | cls.")
+    if int(getattr(args, "contrastive_pretrain_epochs", 0)) > 0 and int(getattr(args, "moco_pretrain_epochs", 0)) > 0:
+        raise ValueError("Use only one SSL pretrain mode: contrastive_pretrain_epochs OR moco_pretrain_epochs.")
+    if int(getattr(args, "moco_pretrain_epochs", 0)) < 0:
+        raise ValueError("moco_pretrain_epochs must be >= 0.")
+    if int(getattr(args, "moco_pretrain_epochs", 0)) > 0 and args.arch not in ("cldnn", "multiview"):
+        raise ValueError("MoCo pretraining currently supports only --arch cldnn or --arch multiview.")
+    if float(getattr(args, "moco_temp", 0.20)) <= 0.0:
+        raise ValueError("moco_temp must be > 0.")
+    moco_m = float(getattr(args, "moco_momentum", 0.999))
+    if moco_m < 0.0 or moco_m >= 1.0:
+        raise ValueError("moco_momentum must be in [0, 1).")
+    if int(getattr(args, "moco_queue_size", 16384)) <= 0:
+        raise ValueError("moco_queue_size must be > 0.")
+    if int(getattr(args, "moco_proj_dim", 128)) <= 0:
+        raise ValueError("moco_proj_dim must be > 0.")
+    if int(getattr(args, "moco_hidden_dim", 512)) <= 0:
+        raise ValueError("moco_hidden_dim must be > 0.")
+    if float(getattr(args, "ssl_aug_awgn_prob", 0.0)) < 0.0 or float(getattr(args, "ssl_aug_awgn_prob", 0.0)) > 1.0:
+        raise ValueError("ssl_aug_awgn_prob must be in [0,1].")
+    if float(getattr(args, "ssl_aug_time_mask_prob", 0.0)) < 0.0 or float(getattr(args, "ssl_aug_time_mask_prob", 0.0)) > 1.0:
+        raise ValueError("ssl_aug_time_mask_prob must be in [0,1].")
+    if float(getattr(args, "ssl_aug_iq_drop_prob", 0.0)) < 0.0 or float(getattr(args, "ssl_aug_iq_drop_prob", 0.0)) > 1.0:
+        raise ValueError("ssl_aug_iq_drop_prob must be in [0,1].")
+    if float(getattr(args, "ssl_aug_time_mask_max_frac", 0.12)) < 0.0 or float(getattr(args, "ssl_aug_time_mask_max_frac", 0.12)) > 1.0:
+        raise ValueError("ssl_aug_time_mask_max_frac must be in [0,1].")
+    if float(getattr(args, "ssl_aug_awgn_snr_min_db", 6.0)) > float(getattr(args, "ssl_aug_awgn_snr_max_db", 20.0)):
+        raise ValueError("ssl_aug_awgn_snr_min_db must be <= ssl_aug_awgn_snr_max_db.")
     if float(getattr(args, "focal_gamma", 0.0)) > 0.0 and float(getattr(args, "label_smoothing", 0.0)) > 0.0:
         print("[warn] focal_gamma > 0 with label_smoothing > 0 can conflict; consider label_smoothing=0.0 for focal runs.")
     if bool(getattr(args, "snr_weight_ce", False)) and float(getattr(args, "low_snr_boost", 0.0)) > 0.0:
@@ -3016,26 +3120,263 @@ def train(args: argparse.Namespace) -> None:
     epochs_no_improve = 0
 
     # =========================================================================
-    # CONTRASTIVE PRE-TRAINING PHASE (if enabled)
+    # MOCO-V2 PRE-TRAINING PHASE (if enabled)
+    # =========================================================================
+    if args.moco_pretrain_epochs > 0 and args.arch in ("cldnn", "multiview"):
+        ssl_pretrain_path = os.path.join(args.out_dir, "ssl_pretrain.jsonl")
+        if os.path.exists(ssl_pretrain_path):
+            os.remove(ssl_pretrain_path)
+
+        print(f"\n{'='*60}")
+        print(
+            "MOCO PRE-TRAINING: "
+            f"{args.moco_pretrain_epochs} epochs, T={float(args.moco_temp):.3f}, "
+            f"m={float(args.moco_momentum):.4f}, queue={int(args.moco_queue_size)}"
+        )
+        print(f"{'='*60}\n")
+
+        if str(getattr(args, "dataset", "rml2016a")) == "rml2018a":
+            X_cl, y_cl, snr_cl, _mods_cl, _snrs_cl, train_idx_cl, _val_idx_cl, _test_idx_cl = load_rml2018a_hdf5(
+                args.data_path, seed=args.seed, train_per=args.train_per, val_per=args.val_per
+            )
+        else:
+            X_cl, y_cl, snr_cl, _mods_cl, _snrs_cl, train_idx_cl, _val_idx_cl, _test_idx_cl = load_rml2016a(
+                args.data_path, seed=args.seed, train_per=args.train_per, val_per=args.val_per
+            )
+        train_snrs_cl = parse_snrs(getattr(args, "train_snrs", None))
+        train_idx_cl = filter_indices_by_snrs(train_idx_cl, snr_cl, train_snrs_cl)
+        X_t_cl, y_t_cl, snr_t_cl = build_tensors(X_cl, y_cl, snr_cl)
+        moco_dataset = RML2016aContrastivePairDataset(
+            X_t_cl,
+            y_t_cl,
+            snr_t_cl,
+            train_idx_cl,
+            normalize=args.normalize,
+            aug_phase=args.aug_phase,
+            aug_shift=args.aug_shift,
+            aug_gain=args.aug_gain,
+            aug_cfo=args.aug_cfo,
+            ssl_aug_awgn_prob=float(getattr(args, "ssl_aug_awgn_prob", 0.0)),
+            ssl_aug_awgn_snr_min_db=float(getattr(args, "ssl_aug_awgn_snr_min_db", 6.0)),
+            ssl_aug_awgn_snr_max_db=float(getattr(args, "ssl_aug_awgn_snr_max_db", 20.0)),
+            ssl_aug_time_mask_prob=float(getattr(args, "ssl_aug_time_mask_prob", 0.0)),
+            ssl_aug_time_mask_max_frac=float(getattr(args, "ssl_aug_time_mask_max_frac", 0.12)),
+            ssl_aug_iq_drop_prob=float(getattr(args, "ssl_aug_iq_drop_prob", 0.0)),
+        )
+        moco_loader = DataLoader(
+            moco_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            persistent_workers=args.num_workers > 0,
+            worker_init_fn=_seed_worker,
+        )
+        if len(moco_loader) <= 0:
+            raise RuntimeError("MoCo pretraining loader is empty. Reduce batch size or adjust split settings.")
+
+        # Probe feature dimension.
+        probe_batch = next(iter(moco_loader))
+        x_probe = probe_batch[0].to(device)
+        snr_probe = probe_batch[3].to(device)
+        snr_probe_in = snr_probe if args.snr_mode == "known" else None
+        with torch.no_grad():
+            feat_probe = model.forward_features(x_probe, snr=snr_probe_in, snr_mode=args.snr_mode)
+        feat_dim = int(feat_probe.shape[1])
+        del probe_batch, x_probe, snr_probe, snr_probe_in, feat_probe
+
+        moco_q_proj = MoCoProjectionMLP(
+            in_dim=feat_dim,
+            hidden_dim=int(getattr(args, "moco_hidden_dim", 512)),
+            out_dim=int(getattr(args, "moco_proj_dim", 128)),
+        ).to(device)
+        moco_k_proj = MoCoProjectionMLP(
+            in_dim=feat_dim,
+            hidden_dim=int(getattr(args, "moco_hidden_dim", 512)),
+            out_dim=int(getattr(args, "moco_proj_dim", 128)),
+        ).to(device)
+        moco_k_proj.load_state_dict(moco_q_proj.state_dict())
+        for p in moco_k_proj.parameters():
+            p.requires_grad_(False)
+        moco_k_proj.eval()
+
+        moco_key_encoder = copy.deepcopy(model).to(device)
+        moco_key_encoder.load_state_dict(model.state_dict())
+        for p in moco_key_encoder.parameters():
+            p.requires_grad_(False)
+        moco_key_encoder.eval()
+
+        queue_size = int(getattr(args, "moco_queue_size", 16384))
+        proj_dim = int(getattr(args, "moco_proj_dim", 128))
+        moco_queue = F.normalize(torch.randn(queue_size, proj_dim, device=device), dim=1)
+        moco_queue_ptr = 0
+
+        moco_lr = float(args.moco_lr) if args.moco_lr is not None else float(args.lr)
+        moco_wd = float(args.moco_weight_decay) if args.moco_weight_decay is not None else float(args.weight_decay)
+        moco_optimizer = torch.optim.AdamW(
+            list(model.parameters()) + list(moco_q_proj.parameters()),
+            lr=moco_lr,
+            weight_decay=moco_wd,
+        )
+        moco_steps = int(args.moco_pretrain_epochs) * len(moco_loader)
+        moco_scheduler = build_scheduler(
+            moco_optimizer,
+            args.warmup_steps,
+            moco_steps,
+            args.min_lr,
+            decay_start_step=0,
+        )
+
+        for moco_epoch in range(int(args.moco_pretrain_epochs)):
+            model.train()
+            moco_q_proj.train()
+            moco_key_encoder.eval()
+            moco_k_proj.eval()
+            moco_epoch_loss = 0.0
+            moco_epoch_pos = 0.0
+            moco_epoch_neg = 0.0
+            moco_epoch_total = 0
+            moco_start = time.time()
+
+            progress = tqdm(
+                moco_loader,
+                desc=f"MoCo {moco_epoch + 1}/{int(args.moco_pretrain_epochs)}",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+            for batch in progress:
+                x_q, x_k, _y_ssl, snr_ssl = batch[:4]
+                x_q = x_q.to(device)
+                x_k = x_k.to(device)
+                snr_ssl = snr_ssl.to(device)
+                snr_ssl_in = snr_ssl if args.snr_mode == "known" else None
+
+                moco_optimizer.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    moco_momentum_update(model, moco_key_encoder, float(getattr(args, "moco_momentum", 0.999)))
+                    moco_momentum_update(moco_q_proj, moco_k_proj, float(getattr(args, "moco_momentum", 0.999)))
+
+                if amp_enabled:
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
+                        q_feat = model.forward_features(x_q, snr=snr_ssl_in, snr_mode=args.snr_mode)
+                        q = F.normalize(moco_q_proj(q_feat), dim=1)
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True), torch.no_grad():
+                        k_feat = moco_key_encoder.forward_features(x_k, snr=snr_ssl_in, snr_mode=args.snr_mode)
+                        k = F.normalize(moco_k_proj(k_feat), dim=1)
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True):
+                        l_pos = torch.sum(q * k, dim=1, keepdim=True)
+                        l_neg = torch.matmul(q, moco_queue.detach().T)
+                        logits_moco = torch.cat([l_pos, l_neg], dim=1) / max(1e-6, float(getattr(args, "moco_temp", 0.20)))
+                        target_moco = torch.zeros(logits_moco.shape[0], dtype=torch.long, device=device)
+                        loss_moco = F.cross_entropy(logits_moco, target_moco)
+                else:
+                    q_feat = model.forward_features(x_q, snr=snr_ssl_in, snr_mode=args.snr_mode)
+                    q = F.normalize(moco_q_proj(q_feat), dim=1)
+                    with torch.no_grad():
+                        k_feat = moco_key_encoder.forward_features(x_k, snr=snr_ssl_in, snr_mode=args.snr_mode)
+                        k = F.normalize(moco_k_proj(k_feat), dim=1)
+                    l_pos = torch.sum(q * k, dim=1, keepdim=True)
+                    l_neg = torch.matmul(q, moco_queue.detach().T)
+                    logits_moco = torch.cat([l_pos, l_neg], dim=1) / max(1e-6, float(getattr(args, "moco_temp", 0.20)))
+                    target_moco = torch.zeros(logits_moco.shape[0], dtype=torch.long, device=device)
+                    loss_moco = F.cross_entropy(logits_moco, target_moco)
+
+                if scaler.is_enabled():
+                    scaler.scale(loss_moco).backward()
+                    scaler.unscale_(moco_optimizer)
+                    if args.grad_clip and args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(moco_q_proj.parameters()), args.grad_clip)
+                    scaler.step(moco_optimizer)
+                    scaler.update()
+                else:
+                    loss_moco.backward()
+                    if args.grad_clip and args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(moco_q_proj.parameters()), args.grad_clip)
+                    moco_optimizer.step()
+
+                moco_scheduler.step()
+
+                with torch.no_grad():
+                    moco_queue_ptr = moco_enqueue(moco_queue, moco_queue_ptr, k)
+
+                bsz = int(x_q.shape[0])
+                moco_epoch_loss += float(loss_moco.detach().item()) * bsz
+                moco_epoch_pos += float(l_pos.detach().mean().item()) * bsz
+                moco_epoch_neg += float(l_neg.detach().mean().item()) * bsz
+                moco_epoch_total += bsz
+                progress.set_postfix(
+                    loss=f"{moco_epoch_loss / max(1, moco_epoch_total):.4f}",
+                    lr=f"{moco_optimizer.param_groups[0]['lr']:.2e}",
+                    qptr=int(moco_queue_ptr),
+                )
+
+            moco_epoch_loss_mean = moco_epoch_loss / max(1, moco_epoch_total)
+            moco_epoch_pos_mean = moco_epoch_pos / max(1, moco_epoch_total)
+            moco_epoch_neg_mean = moco_epoch_neg / max(1, moco_epoch_total)
+            write_jsonl(
+                ssl_pretrain_path,
+                {
+                    "phase": "moco",
+                    "epoch": int(moco_epoch),
+                    "train_loss": float(moco_epoch_loss_mean),
+                    "mean_pos_logit": float(moco_epoch_pos_mean),
+                    "mean_neg_logit": float(moco_epoch_neg_mean),
+                    "lr": float(moco_optimizer.param_groups[0]["lr"]),
+                    "queue_ptr": int(moco_queue_ptr),
+                    "moco_temp": float(getattr(args, "moco_temp", 0.20)),
+                    "moco_momentum": float(getattr(args, "moco_momentum", 0.999)),
+                    "moco_queue_size": int(getattr(args, "moco_queue_size", 16384)),
+                    "moco_proj_dim": int(getattr(args, "moco_proj_dim", 128)),
+                    "moco_hidden_dim": int(getattr(args, "moco_hidden_dim", 512)),
+                    "time_sec": float(time.time() - moco_start),
+                },
+            )
+            tqdm.write(
+                "MoCo epoch "
+                f"{moco_epoch + 1}: loss={moco_epoch_loss_mean:.4f}, "
+                f"pos={moco_epoch_pos_mean:.4f}, neg={moco_epoch_neg_mean:.4f}"
+            )
+
+        del moco_key_encoder, moco_q_proj, moco_k_proj, moco_queue
+
+        print(f"\n{'='*60}")
+        print("MOCO PRE-TRAINING COMPLETE. Starting fine-tuning...")
+        print(f"{'='*60}\n")
+
+        # Reset optimizer for fine-tuning phase
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        steps_per_epoch = max(1, len(train_loader))
+        total_steps = args.epochs * steps_per_epoch
+        decay_start_step = int(getattr(args, "lr_decay_start_epoch", 0)) * steps_per_epoch
+        scheduler = build_scheduler(
+            optimizer, args.warmup_steps, total_steps, args.min_lr, decay_start_step=decay_start_step
+        )
+
+    # =========================================================================
+    # LEGACY CONTRASTIVE PRE-TRAINING PHASE (if enabled)
     # =========================================================================
     if args.contrastive_pretrain_epochs > 0 and args.arch in ("cldnn", "multiview"):
         print(f"\n{'='*60}")
         print(f"CONTRASTIVE PRE-TRAINING: {args.contrastive_pretrain_epochs} epochs, K={args.contrastive_k}")
         print(f"{'='*60}\n")
 
-        # Build a grouped dataset for contrastive learning
-        from data import RML2016aGroupedDataset, load_rml2016a, load_rml2018a_hdf5, build_tensors
         if str(getattr(args, "dataset", "rml2016a")) == "rml2018a":
-            X_cl, y_cl, snr_cl, mods_cl, snrs_cl, train_idx_cl, val_idx_cl, test_idx_cl = load_rml2018a_hdf5(
+            X_cl, y_cl, snr_cl, _mods_cl, _snrs_cl, train_idx_cl, _val_idx_cl, _test_idx_cl = load_rml2018a_hdf5(
                 args.data_path, seed=args.seed, train_per=args.train_per, val_per=args.val_per
             )
         else:
-            X_cl, y_cl, snr_cl, mods_cl, snrs_cl, train_idx_cl, val_idx_cl, test_idx_cl = load_rml2016a(
+            X_cl, y_cl, snr_cl, _mods_cl, _snrs_cl, train_idx_cl, _val_idx_cl, _test_idx_cl = load_rml2016a(
                 args.data_path, seed=args.seed, train_per=args.train_per, val_per=args.val_per
             )
+        train_snrs_cl = parse_snrs(getattr(args, "train_snrs", None))
+        train_idx_cl = filter_indices_by_snrs(train_idx_cl, snr_cl, train_snrs_cl)
         X_t_cl, y_t_cl, snr_t_cl = build_tensors(X_cl, y_cl, snr_cl)
         contrastive_dataset = RML2016aGroupedDataset(
-            X_t_cl, y_t_cl, snr_t_cl, train_idx_cl,
+            X_t_cl,
+            y_t_cl,
+            snr_t_cl,
+            train_idx_cl,
             group_k=args.contrastive_k,
             normalize=args.normalize,
             aug_phase=args.aug_phase,
@@ -3045,13 +3386,16 @@ def train(args: argparse.Namespace) -> None:
         )
         contrastive_loader = DataLoader(
             contrastive_dataset,
-            batch_size=args.batch_size // args.contrastive_k,  # Adjust for K windows
+            batch_size=max(1, args.batch_size // max(1, args.contrastive_k)),
             shuffle=True,
             drop_last=True,
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
+            persistent_workers=args.num_workers > 0,
             worker_init_fn=_seed_worker,
         )
+        if len(contrastive_loader) <= 0:
+            raise RuntimeError("Contrastive pretraining loader is empty. Reduce batch size or adjust split settings.")
 
         # Optimizer for contrastive phase
         contrastive_lr = args.contrastive_lr if args.contrastive_lr is not None else args.lr
@@ -3076,8 +3420,8 @@ def train(args: argparse.Namespace) -> None:
             )
             for batch in progress:
                 x, y, snr = batch[:3]
-                x = x.to(device)  # (B, K, 2, 128)
-                y = y.to(device)  # (B,)
+                x = x.to(device)  # (B, K, 2, L)
+                y = y.to(device)
                 snr = snr.to(device)
 
                 contrastive_optimizer.zero_grad(set_to_none=True)
@@ -3105,9 +3449,8 @@ def train(args: argparse.Namespace) -> None:
                     contrastive_optimizer.step()
 
                 contrastive_scheduler.step()
-                epoch_loss += loss.item() * x.shape[0]
+                epoch_loss += float(loss.detach().item()) * x.shape[0]
                 epoch_total += x.shape[0]
-
                 progress.set_postfix(
                     loss=f"{epoch_loss / max(1, epoch_total):.4f}",
                     lr=f"{contrastive_optimizer.param_groups[0]['lr']:.2e}",
@@ -3194,6 +3537,8 @@ def train(args: argparse.Namespace) -> None:
         epoch_loss_moe_head_low = 0.0
         epoch_loss_moe_head_high = 0.0
         epoch_loss_moe_diversity = 0.0
+        epoch_loss_supcon = 0.0
+        epoch_supcon_active = 0.0
         epoch_moe_low_active = 0.0
         epoch_moe_high_active = 0.0
         moe_n_experts_cfg = int(getattr(args, "moe_n_experts", 1))
@@ -3394,6 +3739,8 @@ def train(args: argparse.Namespace) -> None:
             loss_moe_head_low = torch.tensor(0.0, device=device)
             loss_moe_head_high = torch.tensor(0.0, device=device)
             loss_moe_diversity = torch.tensor(0.0, device=device)
+            loss_supcon = torch.tensor(0.0, device=device)
+            supcon_active_frac_batch = torch.tensor(0.0, device=device)
             moe_low_active_frac_batch = torch.tensor(0.0, device=device)
             moe_high_active_frac_batch = torch.tensor(0.0, device=device)
             moe_load_batch: Optional[torch.Tensor] = None
@@ -3742,23 +4089,31 @@ def train(args: argparse.Namespace) -> None:
                                 loss = loss + float(lambda_kd_feat_eff) * loss_kd_feat
 
                     # --- Supervised Contrastive Loss (SupCon) ---
-                    # Skip on mixup batches — labels are ambiguous after interpolation.
+                    # Optional clean-branch path under mixup_cls_only.
+                    supcon_clean_on_mixup = bool(getattr(args, "supcon_clean_branch_on_mixup_cls_only", False))
+                    supcon_mixup_ok = (not use_mixup) or (supcon_clean_on_mixup and mixup_cls_only)
                     if (
                         getattr(args, "supcon", False)
                         and args.arch != "dit"
                         and epoch >= int(getattr(args, "supcon_warmup", 0))
-                        and not use_mixup
+                        and supcon_mixup_ok
                         and hasattr(model, "proj_head")
                         and model.proj_head is not None
                     ):
-                        # Project pre-FiLM pooled features → L2-normalised embedding
-                        z_proj = model.proj_head(model._pooled_pre_film)
-                        z_proj = F.normalize(z_proj, dim=1)
-                        loss_supcon = supervised_contrastive_loss(
-                            z_proj, y,
-                            temperature=float(getattr(args, "supcon_temp", 0.07)),
-                        )
-                        loss = loss + float(getattr(args, "supcon_lambda", 0.1)) * loss_supcon
+                        if use_mixup and mixup_cls_only and supcon_clean_on_mixup:
+                            supcon_feat = student_prefilm_kd
+                        else:
+                            supcon_feat = getattr(model, "_pooled_pre_film", None)
+                        if supcon_feat is not None:
+                            z_proj = model.proj_head(supcon_feat)
+                            z_proj = F.normalize(z_proj, dim=1)
+                            loss_supcon = supervised_contrastive_loss(
+                                z_proj,
+                                y,
+                                temperature=float(getattr(args, "supcon_temp", 0.07)),
+                            )
+                            loss = loss + float(getattr(args, "supcon_lambda", 0.1)) * loss_supcon
+                            supcon_active_frac_batch = torch.tensor(1.0, device=device)
 
                     # --- SNR-path consistency loss (core novelty) ---
                     # Allow consistency when mixup is classification-only; the auxiliary
@@ -4184,22 +4539,31 @@ def train(args: argparse.Namespace) -> None:
                             loss = loss + float(lambda_kd_feat_eff) * loss_kd_feat
 
                 # --- Supervised Contrastive Loss (SupCon) ---
-                # Skip on mixup batches — labels are ambiguous after interpolation.
+                # Optional clean-branch path under mixup_cls_only.
+                supcon_clean_on_mixup = bool(getattr(args, "supcon_clean_branch_on_mixup_cls_only", False))
+                supcon_mixup_ok = (not use_mixup) or (supcon_clean_on_mixup and mixup_cls_only)
                 if (
                     getattr(args, "supcon", False)
                     and args.arch != "dit"
                     and epoch >= int(getattr(args, "supcon_warmup", 0))
-                    and not use_mixup
+                    and supcon_mixup_ok
                     and hasattr(model, "proj_head")
                     and model.proj_head is not None
                 ):
-                    z_proj = model.proj_head(model._pooled_pre_film)
-                    z_proj = F.normalize(z_proj, dim=1)
-                    loss_supcon = supervised_contrastive_loss(
-                        z_proj, y,
-                        temperature=float(getattr(args, "supcon_temp", 0.07)),
-                    )
-                    loss = loss + float(getattr(args, "supcon_lambda", 0.1)) * loss_supcon
+                    if use_mixup and mixup_cls_only and supcon_clean_on_mixup:
+                        supcon_feat = student_prefilm_kd
+                    else:
+                        supcon_feat = getattr(model, "_pooled_pre_film", None)
+                    if supcon_feat is not None:
+                        z_proj = model.proj_head(supcon_feat)
+                        z_proj = F.normalize(z_proj, dim=1)
+                        loss_supcon = supervised_contrastive_loss(
+                            z_proj,
+                            y,
+                            temperature=float(getattr(args, "supcon_temp", 0.07)),
+                        )
+                        loss = loss + float(getattr(args, "supcon_lambda", 0.1)) * loss_supcon
+                        supcon_active_frac_batch = torch.tensor(1.0, device=device)
 
                 # --- SNR-path consistency loss (core novelty) ---
                 # Allow consistency when mixup is classification-only; the auxiliary
@@ -4350,6 +4714,8 @@ def train(args: argparse.Namespace) -> None:
             epoch_loss_moe_head_low += float(loss_moe_head_low.detach().item()) * batch_size
             epoch_loss_moe_head_high += float(loss_moe_head_high.detach().item()) * batch_size
             epoch_loss_moe_diversity += float(loss_moe_diversity.detach().item()) * batch_size
+            epoch_loss_supcon += float(loss_supcon.detach().item()) * batch_size
+            epoch_supcon_active += float(supcon_active_frac_batch.detach().item()) * batch_size
             epoch_moe_low_active += float(moe_low_active_frac_batch.detach().item()) * batch_size
             epoch_moe_high_active += float(moe_high_active_frac_batch.detach().item()) * batch_size
             if moe_load_batch is not None and len(epoch_moe_expert_load) == int(moe_load_batch.numel()):
@@ -4381,6 +4747,8 @@ def train(args: argparse.Namespace) -> None:
         train_loss_moe_head_low = epoch_loss_moe_head_low / max(1, epoch_total)
         train_loss_moe_head_high = epoch_loss_moe_head_high / max(1, epoch_total)
         train_loss_moe_diversity = epoch_loss_moe_diversity / max(1, epoch_total)
+        train_loss_supcon = epoch_loss_supcon / max(1, epoch_total)
+        train_supcon_active_frac = epoch_supcon_active / max(1, epoch_total)
         train_moe_low_active_frac = epoch_moe_low_active / max(1, epoch_total)
         train_moe_high_active_frac = epoch_moe_high_active / max(1, epoch_total)
         train_moe_expert_load = [v / max(1, epoch_total) for v in epoch_moe_expert_load]
@@ -4509,6 +4877,8 @@ def train(args: argparse.Namespace) -> None:
             "train_loss_moe_head_low": float(train_loss_moe_head_low),
             "train_loss_moe_head_high": float(train_loss_moe_head_high),
             "train_loss_moe_diversity": float(train_loss_moe_diversity),
+            "train_loss_supcon": float(train_loss_supcon),
+            "train_supcon_active_frac": float(train_supcon_active_frac),
             "train_moe_low_active_frac": float(train_moe_low_active_frac),
             "train_moe_high_active_frac": float(train_moe_high_active_frac),
             "cls2dn_scale": float(cls2dn_scale),
@@ -4520,6 +4890,11 @@ def train(args: argparse.Namespace) -> None:
             "snr_weight_ce": bool(getattr(args, "snr_weight_ce", False)),
             "snr_weight_ce_scale": float(getattr(args, "snr_weight_ce_scale", 2.0)),
             "snr_weight_ce_max": float(getattr(args, "snr_weight_ce_max", 3.0)),
+            "moco_pretrain_epochs": int(getattr(args, "moco_pretrain_epochs", 0)),
+            "moco_temp": float(getattr(args, "moco_temp", 0.20)),
+            "moco_momentum": float(getattr(args, "moco_momentum", 0.999)),
+            "moco_queue_size": int(getattr(args, "moco_queue_size", 16384)),
+            "moco_proj_dim": int(getattr(args, "moco_proj_dim", 128)),
             "moe_n_experts": int(getattr(args, "moe_n_experts", 1)),
             "moe_gate_type": str(getattr(args, "moe_gate_type", "eta-sigmoid")),
             "moe_gate_tau_train": float(moe_gate_tau_curr),

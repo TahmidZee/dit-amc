@@ -254,6 +254,95 @@ def filter_indices_by_snrs(
     return indices[mask].tolist()
 
 
+def _norm_iq(x: torch.Tensor, normalize: str, eps: float) -> torch.Tensor:
+    if normalize == "none":
+        return x
+    if normalize == "rms":
+        rms = torch.sqrt(torch.mean(x * x) + float(eps))
+        return x / rms
+    raise ValueError(f"Unknown normalize mode: {normalize}")
+
+
+def _apply_base_iq_augment(
+    x: torch.Tensor,
+    aug_phase: bool,
+    aug_shift: bool,
+    aug_gain: float,
+    aug_cfo: float,
+) -> torch.Tensor:
+    # Circular time shift (start-point invariance).
+    if aug_shift:
+        shift = int(torch.randint(0, x.shape[-1], (1,)).item())
+        x = torch.roll(x, shifts=shift, dims=-1)
+
+    # Random phase rotation (carrier phase invariance).
+    if aug_phase:
+        theta = float(torch.rand(1).item()) * (2.0 * math.pi)
+        c = math.cos(theta)
+        s = math.sin(theta)
+        i = x[0]
+        q = x[1]
+        x = torch.stack([c * i - s * q, s * i + c * q], dim=0)
+
+    # Small CFO (cycles per sample). Conservative by default.
+    if aug_cfo and aug_cfo > 0:
+        f = (torch.rand(1).item() * 2.0 - 1.0) * float(aug_cfo)
+        n = torch.arange(x.shape[-1], device=x.device, dtype=torch.float32)
+        ang = 2.0 * math.pi * f * n
+        c = torch.cos(ang)
+        s = torch.sin(ang)
+        i = x[0]
+        q = x[1]
+        x = torch.stack([c * i - s * q, s * i + c * q], dim=0)
+
+    # Gain jitter.
+    if aug_gain and aug_gain > 0:
+        g = 1.0 + (torch.rand(1).item() * 2.0 - 1.0) * float(aug_gain)
+        x = x * float(g)
+
+    return x
+
+
+def _apply_ssl_iq_augment(
+    x: torch.Tensor,
+    awgn_prob: float,
+    awgn_snr_min_db: float,
+    awgn_snr_max_db: float,
+    time_mask_prob: float,
+    time_mask_max_frac: float,
+    iq_drop_prob: float,
+) -> torch.Tensor:
+    # AWGN by random target SNR.
+    if awgn_prob > 0.0 and torch.rand(1).item() < float(awgn_prob):
+        snr_lo = float(min(awgn_snr_min_db, awgn_snr_max_db))
+        snr_hi = float(max(awgn_snr_min_db, awgn_snr_max_db))
+        snr_db = snr_lo + (snr_hi - snr_lo) * float(torch.rand(1).item())
+        snr_lin = 10.0 ** (snr_db / 10.0)
+        p_sig = torch.mean(x * x)
+        noise_var = p_sig / max(1e-8, snr_lin)
+        noise_std = torch.sqrt(noise_var + 1e-12)
+        x = x + torch.randn_like(x) * noise_std
+
+    # Temporal mask.
+    if time_mask_prob > 0.0 and torch.rand(1).item() < float(time_mask_prob):
+        length = int(x.shape[-1])
+        max_frac = max(0.0, min(1.0, float(time_mask_max_frac)))
+        max_mask = max(1, int(round(max_frac * float(length))))
+        mlen = int(torch.randint(1, max_mask + 1, (1,)).item())
+        start_hi = max(1, length - mlen + 1)
+        start = int(torch.randint(0, start_hi, (1,)).item())
+        x = x.clone()
+        x[:, start : start + mlen] = 0.0
+
+    # Optional I/Q channel dropout.
+    if iq_drop_prob > 0.0 and torch.rand(1).item() < float(iq_drop_prob):
+        drop_ch = int(torch.randint(0, 2, (1,)).item())
+        x = x.clone()
+        x[drop_ch] = 0.0
+
+    return x
+
+
 class RML2016aDataset(Dataset):
     def __init__(
         self,
@@ -333,6 +422,85 @@ class RML2016aDataset(Dataset):
         if self.aug_phase or self.aug_shift or (self.aug_gain and self.aug_gain > 0) or (self.aug_cfo and self.aug_cfo > 0):
             x = self._augment(x)
         return x, self.y[i], self.snr[i]
+
+
+class RML2016aContrastivePairDataset(Dataset):
+    """
+    Return two independently augmented views from the same anchor sample.
+
+    Output:
+      x_q: (2, L)
+      x_k: (2, L)
+      y:   ()
+      snr: ()
+    """
+
+    def __init__(
+        self,
+        X: torch.Tensor,
+        y: torch.Tensor,
+        snr: torch.Tensor,
+        indices: List[int],
+        normalize: str = "rms",
+        eps: float = 1e-8,
+        aug_phase: bool = False,
+        aug_shift: bool = False,
+        aug_gain: float = 0.0,
+        aug_cfo: float = 0.0,
+        ssl_aug_awgn_prob: float = 0.0,
+        ssl_aug_awgn_snr_min_db: float = 6.0,
+        ssl_aug_awgn_snr_max_db: float = 20.0,
+        ssl_aug_time_mask_prob: float = 0.0,
+        ssl_aug_time_mask_max_frac: float = 0.12,
+        ssl_aug_iq_drop_prob: float = 0.0,
+    ) -> None:
+        self.X = X
+        self.y = y
+        self.snr = snr
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.normalize = normalize
+        self.eps = float(eps)
+
+        self.aug_phase = bool(aug_phase)
+        self.aug_shift = bool(aug_shift)
+        self.aug_gain = float(aug_gain)
+        self.aug_cfo = float(aug_cfo)
+
+        self.ssl_aug_awgn_prob = float(ssl_aug_awgn_prob)
+        self.ssl_aug_awgn_snr_min_db = float(ssl_aug_awgn_snr_min_db)
+        self.ssl_aug_awgn_snr_max_db = float(ssl_aug_awgn_snr_max_db)
+        self.ssl_aug_time_mask_prob = float(ssl_aug_time_mask_prob)
+        self.ssl_aug_time_mask_max_frac = float(ssl_aug_time_mask_max_frac)
+        self.ssl_aug_iq_drop_prob = float(ssl_aug_iq_drop_prob)
+
+    def __len__(self) -> int:
+        return self.indices.shape[0]
+
+    def _make_view(self, x_base: torch.Tensor) -> torch.Tensor:
+        x = _apply_base_iq_augment(
+            x_base,
+            aug_phase=self.aug_phase,
+            aug_shift=self.aug_shift,
+            aug_gain=self.aug_gain,
+            aug_cfo=self.aug_cfo,
+        )
+        x = _apply_ssl_iq_augment(
+            x,
+            awgn_prob=self.ssl_aug_awgn_prob,
+            awgn_snr_min_db=self.ssl_aug_awgn_snr_min_db,
+            awgn_snr_max_db=self.ssl_aug_awgn_snr_max_db,
+            time_mask_prob=self.ssl_aug_time_mask_prob,
+            time_mask_max_frac=self.ssl_aug_time_mask_max_frac,
+            iq_drop_prob=self.ssl_aug_iq_drop_prob,
+        )
+        return x
+
+    def __getitem__(self, idx: int):
+        i = int(self.indices[int(idx)])
+        x_base = _norm_iq(self.X[i], normalize=self.normalize, eps=self.eps)
+        x_q = self._make_view(x_base.clone())
+        x_k = self._make_view(x_base.clone())
+        return x_q, x_k, self.y[i], self.snr[i]
 
 
 class RML2016aGroupedDataset(Dataset):
