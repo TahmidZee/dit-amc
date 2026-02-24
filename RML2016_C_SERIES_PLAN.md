@@ -460,34 +460,43 @@ Decision gates:
 
 ---
 
-## Wave 5C (6 runs): SSL Pivot On Non-MoE Anchor
+## Wave 5C-SSLv2 (8 runs): Aggressive MoCo-v2 + SupCon Redesign
 
-Purpose: raise representation quality directly once deployable MoE specialization fails gate.
+Purpose: move SSL from legacy in-batch contrastive to a stronger representation-learning stack before committing to trunk swap.
 
-Implementation note:
-- Use only existing supported flags (`contrastive-pretrain`, `supcon`).
-- Keep the W5A/W5B anchor training family unchanged (split, augment, denoiser/noise settings).
-- Disable MoE specialization path (`--moe-n-experts 1`).
+Why this replaces prior W5C(6-run) plan:
+- historical strong contrastive run was oracle-conditioned (`snr_mode=known`), not a fair blind baseline,
+- prior SupCon runs underperformed stronger non-SupCon anchors,
+- legacy NT-Xent path lacked momentum target encoder + large negative queue.
 
-Runs:
+Implementation status (now available in code):
+- `--moco-pretrain-epochs`, `--moco-temp`, `--moco-momentum`, `--moco-queue-size`, `--moco-proj-dim`, `--moco-hidden-dim`, `--moco-lr`, `--moco-weight-decay`
+- `--ssl-aug-awgn-*`, `--ssl-aug-time-mask-*`, `--ssl-aug-iq-drop-prob`
+- `--supcon-clean-branch-on-mixup-cls-only`
+- pretrain metrics file: `ssl_pretrain.jsonl`
+- epoch metrics fields: `train_loss_supcon`, `train_supcon_active_frac`, plus MoCo config fields
 
-| ID | Run name | Delta flags | Expected effect |
+Run matrix:
+
+| ID | Run name | Delta flags | Purpose |
 |---|---|---|---|
-| S0 | `w5c_ssl_anchor_nomoe` | non-MoE anchor (`--moe-n-experts 1`) | SSL baseline reference |
-| S1 | `w5c_ssl_ntxent20` | S0 + `--contrastive-pretrain-epochs 20 --contrastive-k 4 --contrastive-temp 0.10` | NT-Xent pilot |
-| S2 | `w5c_ssl_ntxent30_t007` | S0 + `--contrastive-pretrain-epochs 30 --contrastive-k 4 --contrastive-temp 0.07` | stronger NT-Xent pretrain |
-| S3 | `w5c_ssl_supcon_l010` | S0 + `--supcon --supcon-lambda 0.10 --supcon-warmup 10 --supcon-proj-dim 128 --supcon-temp 0.07` | SupCon baseline |
-| S4 | `w5c_ssl_supcon_l015` | S3 + `--supcon-lambda 0.15` | SupCon dose response |
-| S5 | `w5c_ssl_ntxent20_supcon_l010` | S1 + S3 flags | combined SSL objective |
+| S0 | `w5c2_ssl_anchor_nomoe` | non-MoE anchor (`--moe-n-experts 1`) | baseline reference |
+| S1 | `w5c2_ssl_legacy_ntxent20` | S0 + `--contrastive-pretrain-epochs 20 --contrastive-k 4 --contrastive-temp 0.10` | legacy NT-Xent comparator |
+| S2 | `w5c2_ssl_moco20_base` | S0 + `--moco-pretrain-epochs 20 --moco-temp 0.20 --moco-momentum 0.999 --moco-queue-size 16384 --moco-proj-dim 128 --moco-hidden-dim 512` | MoCo baseline |
+| S3 | `w5c2_ssl_moco30_temp015` | S2 but `--moco-pretrain-epochs 30 --moco-temp 0.15` | stronger MoCo |
+| S4 | `w5c2_ssl_supcon_clean_l010` | S0 + `--supcon --supcon-lambda 0.10 --supcon-warmup 10 --supcon-proj-dim 128 --supcon-temp 0.07 --supcon-clean-branch-on-mixup-cls-only` | SupCon clean-branch |
+| S5 | `w5c2_ssl_supcon_clean_l015` | S4 + `--supcon-lambda 0.15` | SupCon dose response |
+| S6 | `w5c2_ssl_moco20_supcon_l010` | S2 + S4 flags | combined MoCo + SupCon |
+| S7 | `w5c2_ssl_moco20_supcon_l010_strongaug` | S6 + `--ssl-aug-awgn-prob 0.5 --ssl-aug-awgn-snr-min-db 2 --ssl-aug-awgn-snr-max-db 14 --ssl-aug-time-mask-prob 0.4 --ssl-aug-time-mask-max-frac 0.12` | robustness stress |
 
-Wave-5C promotion gate:
-- Best SSL run must satisfy all:
+Wave-5C-SSLv2 promotion gate:
+- Best run must satisfy all:
   - `test_acc >= max(S0, 0.6409) + 0.008`
   - low-band (`-20..-6`) gain `>= +0.015` vs `S0`
   - high-band (`+6..+18`) drop `<= 0.003` vs `S0`
 
-If Wave-5C fails gate:
-- Start trunk-swap implementation wave (TCN/dilated temporal trunk) as next coding milestone.
+If SSLv2 fails gate:
+- start trunk-swap implementation wave (TCN/dilated temporal backbone).
 
 ---
 
