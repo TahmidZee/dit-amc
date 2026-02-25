@@ -749,3 +749,178 @@ Common base:
 3. If no feasibility pass:
    - stop trunk hyperparameter sweep
    - pivot to alternate architecture family already present (`multiview`) before any new SSL wave.
+
+---
+
+## Wave 5D.3 (2026-02-26, ACTIVE): Ceiling-First Diagnostics (Single-Model Only)
+
+Status from completed `w5d2` reruns:
+- recipe drift is fixed (late peaks, no early collapse),
+- trunk variants are near-parity but do not beat anchor yet,
+- two Athena runs completed training but still need eval artifact backfill.
+
+### Objectives
+
+This wave is decision-focused (not broad sweeping):
+1. test whether new trunks can beat historical oracle ceiling,
+2. measure whether tiny blind deltas are seed noise,
+3. check if a small LR retune yields immediate blind gain.
+
+### Pre-run step (no training slots)
+
+Backfill eval artifacts for:
+- `w5d2_tcn_l6_c160_k3`
+- `w5d2_tcn_l8_c128_k3`
+
+Required files:
+- `test_acc_by_snr.json`
+- `test_macro_summary.json`
+
+### Frozen base recipe (all 6 runs)
+
+Keep the `w5d2` stable recipe fixed:
+- stage schedule:
+  - `--stage-a-epochs 12 --stage-b-epochs 16 --stage-a-no-cls`
+  - `--stage-b1-cls2dn-scale 0.0 --stage-b2-cls2dn-scale 0.1`
+- optimizer/schedule:
+  - `--lr 5e-4 --min-lr 1e-5 --warmup-steps 500 --lr-decay-start-epoch 15`
+- regularization/augmentation:
+  - `--dropout 0.15 --label-smoothing 0.02 --aug-phase --aug-shift`
+- keep denoiser/noise path unchanged,
+- `--moe-n-experts 1`,
+- same split/batch settings as `w5d2`.
+
+### 6-run matrix (2 Goose + 4 Athena)
+
+| ID | Host | Run name | Delta flags | Purpose |
+|---|---|---|---|---|
+| C0 | Goose | `w5d3_oracle_res_b8_c128_k5_s2016` | `--cldnn-backbone resnet1d --cldnn-resnet-blocks 8 --cldnn-resnet-channels 128 --cldnn-resnet-kernel 5 --snr-mode known --seed 2016` | Oracle ceiling test (ResNet) |
+| C1 | Goose | `w5d3_oracle_tcn_l6_c160_k3_s2016` | `--cldnn-backbone tcn --cldnn-tcn-levels 6 --cldnn-tcn-channels 160 --cldnn-tcn-kernel 3 --snr-mode known --seed 2016` | Oracle ceiling test (TCN) |
+| C2 | Athena | `w5d3_blind_res_b8_c128_k5_s3407` | ResNet b8 config + `--snr-mode predict --seed 3407` | Seed variance check (ResNet) |
+| C3 | Athena | `w5d3_blind_tcn_l6_c160_k3_s3407` | TCN l6 c160 config + `--snr-mode predict --seed 3407` | Seed variance check (TCN) |
+| C4 | Athena | `w5d3_blind_res_b8_c128_k5_lr4e4_s2016` | ResNet b8 config + `--snr-mode predict --seed 2016 --lr 4e-4` | Minimal optimization retune (ResNet) |
+| C5 | Athena | `w5d3_blind_tcn_l6_c160_k3_lr4e4_s2016` | TCN l6 c160 config + `--snr-mode predict --seed 2016 --lr 4e-4` | Minimal optimization retune (TCN) |
+
+### Hard decision gates
+
+References:
+- blind anchor: `w5a_bidir2_cls512` test `0.6409`,
+- historical oracle reference: `~0.6855`.
+
+1. Oracle headroom gate:
+   - pass if `max(C0, C1) >= 0.6905` or `>= old_oracle + 0.005`,
+   - secondary check: low-band (`-20..-6`) oracle gain `>= +0.010`.
+2. Blind practical gate (per trunk family):
+   - `mean(test_seed2016, test_seed3407) >= 0.6439`,
+   - low-band gain `>= +0.010`,
+   - high-band (`+6..+18`) drop `<= 0.003`.
+3. Variance tie rule:
+   - if `|delta vs anchor| < 0.0015` and seed std `>= 0.0015`, treat as tie (no promotion).
+
+### Post-wave branching (locked)
+
+1. Oracle pass + blind fail:
+   - keep winning trunk family,
+   - next wave = blind-gap closure only on that trunk (no new architecture sweep), start with one privileged-distillation micro-wave.
+2. Oracle fail for both:
+   - stop trunk-swap path,
+   - revert to LSTM anchor line,
+   - no further TCN/ResNet hyperparameter sweeps.
+3. Oracle pass + blind pass:
+   - promote winning trunk as new anchor,
+   - run 3-seed confirmation on promoted candidate.
+
+---
+
+## Wave 5E.1 / 5E.2 (2026-02-26, ACTIVE): Deconfounded Waveform Diffusion Front-End
+
+### Why this wave
+
+- Prior MoE/SSL/trunk-swap waves did not produce reliable blind gains.
+- We now isolate feasibility of a **waveform diffusion denoiser front-end** with a frozen backend before any full-stack coupling.
+
+### Implemented API additions
+
+Training/eval flags now available in `train.py`:
+
+- core:
+  - `--dn-diff-enable`
+  - `--dn-diff-target {v,eps}`
+  - `--dn-diff-train-timesteps`
+- split t-source:
+  - `--dn-diff-train-t-start-source {snr_pred,fixed}`
+  - `--dn-diff-eval-t-start-source {snr_pred,snr_true,fixed}`
+  - `--dn-diff-fixed-t-start`
+  - `--dn-diff-snr2t-scale`
+  - `--dn-diff-snr2t-bias`
+- eval sampler:
+  - `--dn-diff-eval-mode {ddim,onestep}`
+  - `--dn-diff-eval-steps`
+  - `--dn-diff-ddim-eta`
+  - `--dn-diff-multisample`
+- protection/masking:
+  - `--dn-diff-low-snr-thresh`
+  - `--dn-diff-high-snr-margin`
+  - `--dn-diff-hard-bypass-high-snr`
+  - `--dn-diff-apply-lowband-only-train`
+  - `--dn-diff-loss-snr-lo`
+  - `--dn-diff-loss-snr-hi`
+- loss/control:
+  - `--dn-diff-freeze-classifier`
+  - `--lambda-dn-diff`
+  - `--lambda-dn-recon`
+  - `--lambda-dn-feat-align`
+  - `--lambda-dn-logit-align`
+  - `--dn-diff-align-teacher {none,frozen,ema}`
+  - `--dn-diff-feat-align-start-epoch`
+  - `--dn-diff-logit-align-start-epoch`
+- diagnostics:
+  - `--dn-diff-cond-diagnostic {none,zero,shuffle}`
+  - `--dn-diff-force-deterministic-multisample`
+
+`metrics.jsonl` now includes additive diffusion fields:
+- config: `dn_diff_enabled`, `dn_diff_target`, `dn_diff_train_t_source`, `dn_diff_eval_t_source`, `dn_diff_eval_mode`, `dn_diff_eval_steps`, `dn_diff_ddim_eta`, `dn_diff_multisample`, etc.
+- train losses: `train_loss_dn_diff`, `train_loss_dn_recon`, `train_loss_dn_feat_align`, `train_loss_dn_logit_align`
+- diagnostics: `dn_diff_t_start_mean`, `dn_diff_t_start_std`, `dn_diff_active_frac_low/mid/high`
+- validation mirrors: `val_dn_diff_*`
+
+### Wave 5E.1 run matrix (2 Goose + 4 Athena)
+
+Base:
+- current stable single-model CLDNN recipe,
+- `--arch cldnn --moe-n-experts 1`,
+- `--epochs 80 --early-stop-patience 12 --early-stop-min-delta 0.0005`.
+
+| ID | Host | Run name | Purpose |
+|---|---|---|---|
+| E0 | Goose | `w5e1_ctrl_frozen_residual_s2016` | matched frozen control (no diffusion) |
+| E1 | Goose | `w5e1_diff_core_pred_evalpred_s2016` | blind diffusion feasibility |
+| E2 | Athena | `w5e1_diff_core_pred_evaloracle_s2016` | oracle-eval-only t-start diagnostic |
+| E3 | Athena | `w5e1_diff_core_pred_evalfixed30_s2016` | fixed-t sanity |
+| E4 | Athena | `w5e1_diff_core_pred_evalpred_recon003_s2016` | recon ablation |
+| E5 | Athena | `w5e1_diff_core_pred_evalpred_featalign_s2016` | delayed feature-align probe |
+
+### Mandatory non-run diagnostics
+
+1. Conditioning usefulness (E1 checkpoint):
+- `--dn-diff-cond-diagnostic none|zero|shuffle`
+
+2. One-step vs DDIM mismatch (E1/E2 checkpoints):
+- `--dn-diff-eval-mode onestep`
+- `--dn-diff-eval-mode ddim --dn-diff-eval-steps 8`
+
+### Hard gates
+
+- Feasibility pass (any E1..E5):
+  - low (`-14..-6`) `>= E0 + 0.010`
+  - high (`+6..+18`) drop `<= 0.003`
+  - overall `>= E0 - 0.002`
+- Mapping gate:
+  - `E2 - E1 >= +0.005` overall or `+0.010` low ⇒ SNR→t mapping bottleneck.
+
+### Wave 5E.2 trigger
+
+Only if E.1 passes:
+- keep winning E.1 core config,
+- add feature align, then logit align, then late partial unfreeze,
+- run multisample sweeps (`N=3`, then `N=5`) with stochastic DDIM only.

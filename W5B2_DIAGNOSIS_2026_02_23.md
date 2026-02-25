@@ -133,3 +133,25 @@ Current active direction:
   - `tcn`
   - `resnet1d`
 - Keep training recipe fixed and isolate trunk effects via an 8-run pilot (2 Goose + 6 Athena).
+
+---
+
+## Addendum (2026-02-26): Wave 5E Diffusion Front-End Implementation
+
+Based on post-W5D.3 discussions, a deconfounded Wave 5E implementation is now in code:
+
+1. Waveform diffusion front-end is added for CLDNN (`--dn-diff-enable`) with:
+   - `v/eps` target support,
+   - DDIM and one-step eval modes,
+   - split train/eval `t_start` source,
+   - SNR→t scale/bias calibration.
+2. E.1 safety controls are implemented:
+   - matched frozen-control capability (`--dn-diff-freeze-classifier`),
+   - hard high-SNR bypass,
+   - low-band-only train loss masking.
+3. Diagnostics required by the revised plan are implemented:
+   - conditioning ablation (`none|zero|shuffle`),
+   - one-step vs DDIM comparison support,
+   - `metrics.jsonl` fields for diffusion losses, t-start stats, and per-band active fractions.
+
+Decision policy remains unchanged: run Wave 5E.1 first, then enter Wave 5E.2 only if E.1 passes hard gates.

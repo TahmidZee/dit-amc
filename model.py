@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from diffusion import DiffusionSchedule
+
 
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
     half = dim // 2
@@ -253,6 +255,84 @@ class DenoiserUNet1D(nn.Module):
         delta = self.out(u1).to(dtype=x.dtype)
         scale = self._residual_scale(eta.float()).to(dtype=delta.dtype).view(-1, 1, 1)
         return x + scale * delta
+
+
+class WaveformDiffusionDenoiser1D(nn.Module):
+    """Conditional waveform denoiser that predicts eps/v for diffusion training."""
+
+    def __init__(
+        self,
+        in_channels: int = 2,
+        base_channels: int = 48,
+        cond_dim: int = 64,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        c = int(base_channels)
+        cd = int(cond_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(cd, cd),
+            nn.GELU(),
+            nn.Linear(cd, cd),
+            nn.GELU(),
+        )
+        self.eta_mlp = nn.Sequential(
+            nn.Linear(1, cd),
+            nn.GELU(),
+            nn.Linear(cd, cd),
+            nn.GELU(),
+        )
+        self.cond_fuse = nn.Sequential(
+            nn.Linear(2 * cd, cd),
+            nn.GELU(),
+        )
+        self.cond_proj = nn.Sequential(
+            nn.Conv1d(int(in_channels), c, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(c, c, kernel_size=3, padding=1),
+        )
+        self.in_proj = nn.Conv1d(int(in_channels) * 2, c, kernel_size=3, padding=1)
+        self.enc1 = FiLMResBlock1D(c, cd, dropout=dropout)
+        self.down1 = nn.Conv1d(c, 2 * c, kernel_size=4, stride=2, padding=1)
+        self.enc2 = FiLMResBlock1D(2 * c, cd, dropout=dropout)
+        self.down2 = nn.Conv1d(2 * c, 4 * c, kernel_size=4, stride=2, padding=1)
+        self.mid = FiLMResBlock1D(4 * c, cd, dropout=dropout)
+        self.up2 = nn.Conv1d(4 * c, 2 * c, kernel_size=3, padding=1)
+        self.dec2 = FiLMResBlock1D(4 * c, cd, dropout=dropout)
+        self.up1 = nn.Conv1d(4 * c, c, kernel_size=3, padding=1)
+        self.dec1 = FiLMResBlock1D(2 * c, cd, dropout=dropout)
+        self.out = nn.Conv1d(2 * c, int(in_channels), kernel_size=3, padding=1)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        x_cond: torch.Tensor,
+        t: torch.Tensor,
+        eta_cond: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if eta_cond is None:
+            eta_cond = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
+        if eta_cond.ndim == 2 and eta_cond.shape[1] == 1:
+            eta_cond = eta_cond.squeeze(1)
+        t_emb = timestep_embedding(t.long(), self.time_mlp[0].in_features)
+        t_cond = self.time_mlp(t_emb.to(dtype=x_t.dtype))
+        e_cond = self.eta_mlp(eta_cond.float().view(-1, 1).to(dtype=x_t.dtype))
+        cond = self.cond_fuse(torch.cat([t_cond, e_cond], dim=1))
+
+        x_in = torch.cat([x_t.float(), x_cond.float()], dim=1)
+        c_in = self.cond_proj(x_cond.float())
+        e1 = self.enc1(self.in_proj(x_in) + c_in, cond)
+        e2 = self.enc2(self.down1(e1), cond)
+        m = self.mid(self.down2(e2), cond)
+        u2 = F.interpolate(m, size=e2.shape[-1], mode="linear", align_corners=False)
+        u2 = self.up2(u2)
+        u2 = torch.cat([u2, e2], dim=1)
+        u2 = self.dec2(u2, cond)
+        u1 = F.interpolate(u2, size=e1.shape[-1], mode="linear", align_corners=False)
+        u1 = self.up1(u1)
+        u1 = torch.cat([u1, e1], dim=1)
+        u1 = self.dec1(u1, cond)
+        return self.out(u1).to(dtype=x_t.dtype)
 
 
 class ResBlock1d(nn.Module):
@@ -1114,6 +1194,22 @@ class CLDNNAMC(nn.Module):
         denoiser_soft_high_snr_blend: bool = True,
         denoiser_eta_hi: float = -math.log(10.0),
         denoiser_tau_eta: float = 0.46,
+        dn_diff_enable: bool = False,
+        dn_diff_target: str = "v",  # v|eps
+        dn_diff_train_timesteps: int = 100,
+        dn_diff_eval_mode: str = "ddim",  # ddim|onestep
+        dn_diff_eval_steps: int = 8,
+        dn_diff_ddim_eta: float = 0.0,
+        dn_diff_multisample: int = 1,
+        dn_diff_eval_t_start_source: str = "snr_pred",  # snr_pred|snr_true|fixed
+        dn_diff_fixed_t_start: int = 30,
+        dn_diff_snr2t_scale: float = 1.0,
+        dn_diff_snr2t_bias: float = 0.0,
+        dn_diff_low_snr_thresh: float = -6.0,
+        dn_diff_high_snr_margin: float = 2.0,
+        dn_diff_hard_bypass_high_snr: bool = True,
+        dn_diff_cond_diagnostic: str = "none",  # none|zero|shuffle
+        dn_diff_force_deterministic_multisample: bool = False,
         noise_head_hidden: int = 32,
         expert_features: bool = False,  # Enable expert feature branch
         expert_channels: int = 64,  # Channels for expert feature CNN
@@ -1175,9 +1271,42 @@ class CLDNNAMC(nn.Module):
         self.snr_loss_detach_backbone = bool(snr_loss_detach_backbone)
         self.use_expert = bool(expert_features)
         self.denoiser_enabled = bool(denoiser)
-        if bool(denoiser_dual_path) and not self.denoiser_enabled:
-            raise ValueError("denoiser_dual_path requires denoiser=True.")
-        self.denoiser_dual_path = bool(denoiser_dual_path) if self.denoiser_enabled else False
+        self.dn_diff_enabled = bool(dn_diff_enable)
+        self.dn_diff_target = str(dn_diff_target).strip().lower()
+        self.dn_diff_train_timesteps = int(dn_diff_train_timesteps)
+        self.dn_diff_eval_mode = str(dn_diff_eval_mode).strip().lower()
+        self.dn_diff_eval_steps = int(dn_diff_eval_steps)
+        self.dn_diff_ddim_eta = float(dn_diff_ddim_eta)
+        self.dn_diff_ddim_eta_used = float(dn_diff_ddim_eta)
+        self.dn_diff_multisample = int(dn_diff_multisample)
+        self.dn_diff_eval_t_start_source = str(dn_diff_eval_t_start_source).strip().lower()
+        self.dn_diff_fixed_t_start = int(dn_diff_fixed_t_start)
+        self.dn_diff_snr2t_scale = float(dn_diff_snr2t_scale)
+        self.dn_diff_snr2t_bias = float(dn_diff_snr2t_bias)
+        self.dn_diff_low_snr_thresh = float(dn_diff_low_snr_thresh)
+        self.dn_diff_high_snr_margin = float(dn_diff_high_snr_margin)
+        self.dn_diff_hard_bypass_high_snr = bool(dn_diff_hard_bypass_high_snr)
+        self.dn_diff_cond_diagnostic = str(dn_diff_cond_diagnostic).strip().lower()
+        self.dn_diff_force_deterministic_multisample = bool(dn_diff_force_deterministic_multisample)
+        self._dn_diff_t_start: Optional[torch.Tensor] = None
+        self._dn_diff_active_mask: Optional[torch.Tensor] = None
+        if self.dn_diff_target not in {"v", "eps"}:
+            raise ValueError("dn_diff_target must be one of: v | eps.")
+        if self.dn_diff_eval_mode not in {"ddim", "onestep"}:
+            raise ValueError("dn_diff_eval_mode must be one of: ddim | onestep.")
+        if self.dn_diff_eval_t_start_source not in {"snr_pred", "snr_true", "fixed"}:
+            raise ValueError("dn_diff_eval_t_start_source must be one of: snr_pred|snr_true|fixed.")
+        if self.dn_diff_cond_diagnostic not in {"none", "zero", "shuffle"}:
+            raise ValueError("dn_diff_cond_diagnostic must be one of: none|zero|shuffle.")
+        if self.dn_diff_train_timesteps <= 1:
+            raise ValueError("dn_diff_train_timesteps must be > 1.")
+        if self.dn_diff_eval_steps <= 0:
+            raise ValueError("dn_diff_eval_steps must be > 0.")
+        if self.dn_diff_multisample <= 0:
+            raise ValueError("dn_diff_multisample must be > 0.")
+        if bool(denoiser_dual_path) and not (self.denoiser_enabled or self.dn_diff_enabled):
+            raise ValueError("denoiser_dual_path requires denoiser=True or dn_diff_enable=True.")
+        self.denoiser_dual_path = bool(denoiser_dual_path) if (self.denoiser_enabled or self.dn_diff_enabled) else False
         self.classifier_paths = 2 if self.denoiser_dual_path else 1
         self.force_denoiser_bypass = False
         if self.snr_cond and self.noise_cond:
@@ -1446,14 +1575,18 @@ class CLDNNAMC(nn.Module):
             self.noise_proxy_scale_raw = None
             self.noise_proxy_bias = None
 
-        # Optional V3 denoiser/noise-head path (kept separate from legacy A1 path).
-        if self.denoiser_enabled:
+        # Optional denoiser/noise-head paths.
+        if self.denoiser_enabled or self.dn_diff_enabled:
             self.noise_fraction_net = NoiseFractionNet(
                 in_channels=2,
                 hidden_channels=int(noise_head_hidden),
                 eta_min=self.noise_eta_min,
                 eta_max=self.noise_eta_max,
             )
+        else:
+            self.noise_fraction_net = None
+
+        if self.denoiser_enabled:
             self.denoiser = DenoiserUNet1D(
                 in_channels=2,
                 base_channels=int(denoiser_base_channels),
@@ -1464,8 +1597,19 @@ class CLDNNAMC(nn.Module):
                 tau_eta=float(denoiser_tau_eta),
             )
         else:
-            self.noise_fraction_net = None
             self.denoiser = None
+
+        if self.dn_diff_enabled:
+            self.dn_diff_model = WaveformDiffusionDenoiser1D(
+                in_channels=2,
+                base_channels=max(32, int(denoiser_base_channels)),
+                cond_dim=max(16, int(noise_head_hidden)),
+                dropout=float(denoiser_dropout),
+            )
+            self.dn_diff_schedule = DiffusionSchedule(timesteps=self.dn_diff_train_timesteps)
+        else:
+            self.dn_diff_model = None
+            self.dn_diff_schedule = None
 
         # Classifier head — auto-scale hidden size to num_classes
         n_cyclo = self.cyclo_stats.N_STATS if self.cyclo_stats is not None else 0
@@ -1539,6 +1683,187 @@ class CLDNNAMC(nn.Module):
             eta_min=self.noise_eta_min,
             eta_max=self.noise_eta_max,
         )
+
+    @staticmethod
+    def _snr_from_eta(eta: torch.Tensor) -> torch.Tensor:
+        rho = torch.clamp(torch.sigmoid(eta.float()), min=1e-6, max=1.0 - 1e-6)
+        snr_lin = torch.clamp((1.0 - rho) / rho, min=1e-8)
+        return 10.0 * torch.log10(snr_lin)
+
+    def _dn_diff_apply_cond_diagnostic(self, x_cond: torch.Tensor, mode: str) -> torch.Tensor:
+        m = str(mode).strip().lower()
+        if m == "none":
+            return x_cond
+        if m == "zero":
+            return torch.zeros_like(x_cond)
+        if m == "shuffle":
+            if x_cond.shape[0] <= 1:
+                return x_cond
+            perm = torch.randperm(x_cond.shape[0], device=x_cond.device)
+            return x_cond[perm]
+        raise ValueError("dn_diff_cond_diagnostic must be one of: none|zero|shuffle.")
+
+    def dn_diff_predict(
+        self,
+        x_t: torch.Tensor,
+        x_cond: torch.Tensor,
+        t: torch.Tensor,
+        snr: Optional[torch.Tensor] = None,
+        snr_mode: str = "predict",
+        cond_diagnostic: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        if self.dn_diff_model is None:
+            raise RuntimeError("dn_diff_predict requires dn_diff_enable=True.")
+        eta_pred = None
+        if self.noise_fraction_net is not None:
+            eta_pred, _aux = self.noise_fraction_net(x_cond)
+        eta_cond = None
+        if snr_mode == "known" and snr is not None:
+            eta_cond = self._eta_from_snr(snr)
+        elif snr_mode == "predict" and eta_pred is not None:
+            eta_cond = eta_pred.detach()
+        if eta_cond is None:
+            eta_cond = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
+        diag_mode = self.dn_diff_cond_diagnostic if cond_diagnostic is None else cond_diagnostic
+        x_cond_in = self._dn_diff_apply_cond_diagnostic(x_cond, diag_mode)
+        pred = self.dn_diff_model(x_t=x_t, x_cond=x_cond_in, t=t, eta_cond=eta_cond)
+        return pred, eta_pred, eta_cond
+
+    def _dn_diff_map_snr_to_t(self, snr_db: torch.Tensor) -> torch.Tensor:
+        if self.dn_diff_schedule is None:
+            raise RuntimeError("dn_diff_schedule is not initialized.")
+        sched = self.dn_diff_schedule.to(snr_db.device)
+        t_base = sched.snr_to_t(snr_db.float())
+        t_scaled = self.dn_diff_snr2t_scale * t_base.float() + self.dn_diff_snr2t_bias
+        return torch.clamp(torch.round(t_scaled).long(), min=0, max=sched.timesteps - 1)
+
+    def _dn_diff_eval_t_start(
+        self,
+        x_raw: torch.Tensor,
+        snr_flat: Optional[torch.Tensor],
+        snr_mode: str,
+    ) -> torch.Tensor:
+        if self.dn_diff_schedule is None:
+            raise RuntimeError("dn_diff_schedule is not initialized.")
+        src = str(self.dn_diff_eval_t_start_source).strip().lower()
+        if src == "fixed":
+            t = torch.full(
+                (x_raw.shape[0],),
+                int(self.dn_diff_fixed_t_start),
+                device=x_raw.device,
+                dtype=torch.long,
+            )
+            return torch.clamp(t, min=0, max=self.dn_diff_schedule.timesteps - 1)
+        if src == "snr_true" and snr_flat is not None:
+            return self._dn_diff_map_snr_to_t(snr_flat)
+
+        snr_est = None
+        if self.noise_fraction_net is not None:
+            eta_pred, _aux = self.noise_fraction_net(x_raw)
+            snr_est = self._snr_from_eta(eta_pred.detach())
+        if snr_est is None:
+            if snr_flat is not None:
+                snr_est = snr_flat.float()
+            else:
+                snr_est = torch.zeros((x_raw.shape[0],), device=x_raw.device, dtype=x_raw.dtype)
+        return self._dn_diff_map_snr_to_t(snr_est)
+
+    def _dn_diff_eval_reconstruct(
+        self,
+        x_raw: torch.Tensor,
+        snr_flat: Optional[torch.Tensor],
+        snr_mode: str,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.dn_diff_schedule is None:
+            raise RuntimeError("dn_diff_schedule is not initialized.")
+        sched = self.dn_diff_schedule.to(x_raw.device)
+        t_start = self._dn_diff_eval_t_start(x_raw=x_raw, snr_flat=snr_flat, snr_mode=snr_mode)
+        self._dn_diff_t_start = t_start.detach()
+
+        n_samples = max(1, int(self.dn_diff_multisample))
+        eta_eff = float(self.dn_diff_ddim_eta)
+        if (
+            n_samples > 1
+            and abs(eta_eff) < 1e-12
+            and not bool(self.dn_diff_force_deterministic_multisample)
+        ):
+            eta_eff = 0.2
+        self.dn_diff_ddim_eta_used = float(eta_eff)
+
+        x_samples = []
+        eta_pred_last = None
+        eta_cond_last = None
+        for _ in range(n_samples):
+            x_noise = torch.randn_like(x_raw)
+            x_start = sched.q_sample(x_raw, t_start, x_noise)
+            if self.dn_diff_eval_mode == "onestep":
+                pred, eta_pred, eta_cond = self.dn_diff_predict(
+                    x_t=x_start,
+                    x_cond=x_raw,
+                    t=t_start,
+                    snr=snr_flat,
+                    snr_mode=snr_mode,
+                )
+                if self.dn_diff_target == "v":
+                    x0_pred = sched.predict_x0_from_v(x_start, t_start, pred)
+                else:
+                    x0_pred = sched.predict_x0_from_eps(x_start, t_start, pred)
+            else:
+                eta_pred = None
+                eta_cond = None
+
+                def _denoise_fn(x_cur: torch.Tensor, t_cur: torch.Tensor) -> torch.Tensor:
+                    pred_cur, _eta_pred_cur, _eta_cond_cur = self.dn_diff_predict(
+                        x_t=x_cur,
+                        x_cond=x_raw,
+                        t=t_cur,
+                        snr=snr_flat,
+                        snr_mode=snr_mode,
+                    )
+                    return pred_cur
+
+                _x_final, x0_pred = sched.ddim_sample_loop(
+                    denoise_fn=_denoise_fn,
+                    x_start=x_start,
+                    t_start=t_start,
+                    steps=int(self.dn_diff_eval_steps),
+                    target=self.dn_diff_target,
+                    eta=float(eta_eff),
+                    clip_x0=False,
+                )
+            x_samples.append(x0_pred)
+            eta_pred_last = eta_pred
+            eta_cond_last = eta_cond
+
+        x_dn = torch.stack(x_samples, dim=0).mean(dim=0)
+        snr_for_bypass = snr_flat
+        if snr_for_bypass is None and self.noise_fraction_net is not None:
+            eta_bypass, _aux_bypass = self.noise_fraction_net(x_raw)
+            snr_for_bypass = self._snr_from_eta(eta_bypass.detach())
+        if bool(self.dn_diff_hard_bypass_high_snr) and snr_for_bypass is not None:
+            cutoff = float(self.dn_diff_low_snr_thresh + self.dn_diff_high_snr_margin)
+            bypass_mask = snr_for_bypass.float() > cutoff
+            self._dn_diff_active_mask = (~bypass_mask).float()
+            x_dn = torch.where(bypass_mask.view(-1, 1, 1), x_raw, x_dn)
+        else:
+            self._dn_diff_active_mask = torch.ones((x_raw.shape[0],), device=x_raw.device, dtype=x_raw.dtype)
+        return x_dn, eta_pred_last, eta_cond_last
+
+    def set_dn_diff_train_freeze(self, freeze_classifier: bool) -> None:
+        if not self.dn_diff_enabled:
+            return
+        if not bool(freeze_classifier):
+            for p in self.parameters():
+                p.requires_grad_(True)
+            return
+        for p in self.parameters():
+            p.requires_grad_(False)
+        if self.dn_diff_model is not None:
+            for p in self.dn_diff_model.parameters():
+                p.requires_grad_(True)
+        if self.noise_fraction_net is not None:
+            for p in self.noise_fraction_net.parameters():
+                p.requires_grad_(True)
 
     @staticmethod
     def _scale_grad(x: torch.Tensor, scale: float) -> torch.Tensor:
@@ -1944,7 +2269,7 @@ class CLDNNAMC(nn.Module):
 
         # Prepare SNR for conditioning
         snr_flat = None
-        if (self.snr_cond or self.noise_cond or self.denoiser_enabled) and snr is not None:
+        if (self.snr_cond or self.noise_cond or self.denoiser_enabled or self.dn_diff_enabled) and snr is not None:
             if group_size is not None:
                 snr_flat = snr.repeat_interleave(group_size)
             else:
@@ -1954,7 +2279,40 @@ class CLDNNAMC(nn.Module):
         x_for_clf = x_flat
         eta_pred_external = None
         self._x_dn_flat = None
-        if self.denoiser_enabled:
+        self._dn_diff_active_mask = None
+        self._dn_diff_t_start = None
+        if self.dn_diff_enabled:
+            x_raw = x_flat[:, :2, :]
+            if bool(self.force_denoiser_bypass or denoiser_bypass):
+                x_dn = x_raw
+                eta_pred_dn = None
+                if self.noise_fraction_net is not None:
+                    eta_pred_dn, _aux = self.noise_fraction_net(x_raw)
+                eta_cond = eta_pred_dn.detach() if eta_pred_dn is not None else None
+            elif self.training:
+                x_dn = x_raw
+                eta_pred_dn = None
+                if self.noise_fraction_net is not None:
+                    eta_pred_dn, _aux = self.noise_fraction_net(x_raw)
+                eta_cond = eta_pred_dn.detach() if eta_pred_dn is not None else None
+            else:
+                x_dn, eta_pred_dn, eta_cond = self._dn_diff_eval_reconstruct(
+                    x_raw=x_raw,
+                    snr_flat=snr_flat,
+                    snr_mode=snr_mode,
+                )
+            self._x_dn_flat = x_dn
+            eta_pred_external = eta_pred_dn
+            if self.denoiser_dual_path:
+                x_raw_for_clf = self._maybe_low_snr_raw_dropout(
+                    x_raw,
+                    eta_cond=eta_cond,
+                    snr_flat=snr_flat,
+                )
+                x_for_clf = torch.cat([x_raw_for_clf, x_dn], dim=1)
+            else:
+                x_for_clf = x_dn
+        elif self.denoiser_enabled:
             x_raw = x_flat[:, :2, :]
             x_dn, eta_pred_dn, _eta_cond = self.denoise_only(x_raw, snr=snr_flat, snr_mode=snr_mode)
             if bool(self.force_denoiser_bypass or denoiser_bypass):
@@ -2085,7 +2443,7 @@ class CLDNNAMC(nn.Module):
 
         # Prepare SNR for conditioning
         snr_flat = None
-        if (self.snr_cond or self.noise_cond or self.denoiser_enabled) and snr is not None:
+        if (self.snr_cond or self.noise_cond or self.denoiser_enabled or self.dn_diff_enabled) and snr is not None:
             if group_size is not None:
                 snr_flat = snr.repeat_interleave(group_size)
             else:

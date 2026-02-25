@@ -1727,6 +1727,98 @@ def parse_args() -> argparse.Namespace:
         default=999.0,
         help="Optional degraded-SNR upper bound for applying L_feat (set < 900 to enable).",
     )
+    parser.add_argument("--dn-diff-enable", action="store_true", help="Enable waveform diffusion denoiser front-end for CLDNN.")
+    parser.add_argument("--dn-diff-target", type=str, choices=["v", "eps"], default="v", help="Prediction target for diffusion denoiser (v or eps).")
+    parser.add_argument("--dn-diff-train-timesteps", type=int, default=100, help="Diffusion timestep count for waveform denoiser schedule.")
+    parser.add_argument(
+        "--dn-diff-train-t-start-source",
+        type=str,
+        choices=["snr_pred", "fixed"],
+        default="snr_pred",
+        help="Training t-start source for diffusion objective.",
+    )
+    parser.add_argument(
+        "--dn-diff-eval-t-start-source",
+        type=str,
+        choices=["snr_pred", "snr_true", "fixed"],
+        default="snr_pred",
+        help="Eval t-start source for diffusion denoising.",
+    )
+    parser.add_argument("--dn-diff-fixed-t-start", type=int, default=30, help="Fixed t-start when train/eval t-source is fixed.")
+    parser.add_argument("--dn-diff-snr2t-scale", type=float, default=1.0, help="Scale factor applied to snr_to_t mapping.")
+    parser.add_argument("--dn-diff-snr2t-bias", type=float, default=0.0, help="Bias applied after snr_to_t mapping.")
+    parser.add_argument("--dn-diff-eval-mode", type=str, choices=["ddim", "onestep"], default="ddim", help="Diffusion eval reconstruction mode.")
+    parser.add_argument("--dn-diff-eval-steps", type=int, default=8, help="DDIM steps for eval-time denoising.")
+    parser.add_argument("--dn-diff-ddim-eta", type=float, default=0.0, help="DDIM eta (0 = deterministic).")
+    parser.add_argument("--dn-diff-multisample", type=int, default=1, help="Number of denoised samples to average at eval.")
+    parser.add_argument("--dn-diff-low-snr-thresh", type=float, default=-6.0, help="Low-SNR denoising threshold (dB).")
+    parser.add_argument("--dn-diff-high-snr-margin", type=float, default=2.0, help="High-SNR bypass margin above low-SNR threshold.")
+    parser.add_argument(
+        "--dn-diff-hard-bypass-high-snr",
+        dest="dn_diff_hard_bypass_high_snr",
+        action="store_true",
+        help="Hard-bypass diffusion denoiser at high SNR.",
+    )
+    parser.add_argument(
+        "--no-dn-diff-hard-bypass-high-snr",
+        dest="dn_diff_hard_bypass_high_snr",
+        action="store_false",
+        help="Disable hard high-SNR diffusion bypass.",
+    )
+    parser.set_defaults(dn_diff_hard_bypass_high_snr=True)
+    parser.add_argument(
+        "--dn-diff-apply-lowband-only-train",
+        dest="dn_diff_apply_lowband_only_train",
+        action="store_true",
+        help="Apply diffusion losses only inside configured low-SNR training band.",
+    )
+    parser.add_argument(
+        "--no-dn-diff-apply-lowband-only-train",
+        dest="dn_diff_apply_lowband_only_train",
+        action="store_false",
+        help="Disable low-band-only masking for diffusion losses.",
+    )
+    parser.set_defaults(dn_diff_apply_lowband_only_train=True)
+    parser.add_argument("--dn-diff-loss-snr-lo", type=float, default=-14.0, help="Lower SNR bound for diffusion training loss mask.")
+    parser.add_argument("--dn-diff-loss-snr-hi", type=float, default=-6.0, help="Upper SNR bound for diffusion training loss mask.")
+    parser.add_argument(
+        "--dn-diff-freeze-classifier",
+        dest="dn_diff_freeze_classifier",
+        action="store_true",
+        help="Freeze classifier stack; default resolves to true when dn_diff is enabled, else false.",
+    )
+    parser.add_argument(
+        "--no-dn-diff-freeze-classifier",
+        dest="dn_diff_freeze_classifier",
+        action="store_false",
+        help="Disable classifier freezing during diffusion training.",
+    )
+    parser.set_defaults(dn_diff_freeze_classifier=None)
+    parser.add_argument("--lambda-dn-diff", type=float, default=1.0, help="Weight for diffusion denoiser target loss.")
+    parser.add_argument("--lambda-dn-recon", type=float, default=0.0, help="Weight for one-step reconstruction loss from diffusion x0 prediction.")
+    parser.add_argument("--lambda-dn-feat-align", type=float, default=0.0, help="Weight for diffusion feature-alignment loss.")
+    parser.add_argument("--lambda-dn-logit-align", type=float, default=0.0, help="Weight for diffusion logit-alignment loss.")
+    parser.add_argument(
+        "--dn-diff-align-teacher",
+        type=str,
+        choices=["none", "frozen", "ema"],
+        default="frozen",
+        help="Teacher mode for diffusion alignment losses.",
+    )
+    parser.add_argument("--dn-diff-feat-align-start-epoch", type=int, default=20, help="Epoch to start diffusion feature alignment.")
+    parser.add_argument("--dn-diff-logit-align-start-epoch", type=int, default=30, help="Epoch to start diffusion logit alignment.")
+    parser.add_argument(
+        "--dn-diff-cond-diagnostic",
+        type=str,
+        choices=["none", "zero", "shuffle"],
+        default="none",
+        help="Conditioning diagnostic mode for diffusion eval.",
+    )
+    parser.add_argument(
+        "--dn-diff-force-deterministic-multisample",
+        action="store_true",
+        help="Keep DDIM deterministic for multisample eval (debug only).",
+    )
     parser.add_argument(
         "--feat-encoder-ckpt",
         type=str,
@@ -1898,6 +1990,24 @@ def build_model_from_cfg(
             moe_gate_tau=float(cfg.get("moe_gate_tau", 0.3) if isinstance(cfg, dict) else getattr(fallback, "moe_gate_tau", 0.3)),
             moe_gate_use_feat=bool(cfg.get("moe_gate_use_feat", False) if isinstance(cfg, dict) else getattr(fallback, "moe_gate_use_feat", False)),
             supcon_proj_dim=int(_cfg_get(cfg, fallback, "supcon_proj_dim", 0)) if bool(_cfg_get(cfg, fallback, "supcon", False)) else 0,
+            dn_diff_enable=bool(_cfg_get(cfg, fallback, "dn_diff_enable", False)),
+            dn_diff_target=str(_cfg_get(cfg, fallback, "dn_diff_target", "v")),
+            dn_diff_train_timesteps=int(_cfg_get(cfg, fallback, "dn_diff_train_timesteps", 100)),
+            dn_diff_eval_mode=str(_cfg_get(cfg, fallback, "dn_diff_eval_mode", "ddim")),
+            dn_diff_eval_steps=int(_cfg_get(cfg, fallback, "dn_diff_eval_steps", 8)),
+            dn_diff_ddim_eta=float(_cfg_get(cfg, fallback, "dn_diff_ddim_eta", 0.0)),
+            dn_diff_multisample=int(_cfg_get(cfg, fallback, "dn_diff_multisample", 1)),
+            dn_diff_eval_t_start_source=str(_cfg_get(cfg, fallback, "dn_diff_eval_t_start_source", "snr_pred")),
+            dn_diff_fixed_t_start=int(_cfg_get(cfg, fallback, "dn_diff_fixed_t_start", 30)),
+            dn_diff_snr2t_scale=float(_cfg_get(cfg, fallback, "dn_diff_snr2t_scale", 1.0)),
+            dn_diff_snr2t_bias=float(_cfg_get(cfg, fallback, "dn_diff_snr2t_bias", 0.0)),
+            dn_diff_low_snr_thresh=float(_cfg_get(cfg, fallback, "dn_diff_low_snr_thresh", -6.0)),
+            dn_diff_high_snr_margin=float(_cfg_get(cfg, fallback, "dn_diff_high_snr_margin", 2.0)),
+            dn_diff_hard_bypass_high_snr=bool(_cfg_get(cfg, fallback, "dn_diff_hard_bypass_high_snr", True)),
+            dn_diff_cond_diagnostic=str(_cfg_get(cfg, fallback, "dn_diff_cond_diagnostic", "none")),
+            dn_diff_force_deterministic_multisample=bool(
+                _cfg_get(cfg, fallback, "dn_diff_force_deterministic_multisample", False)
+            ),
         ).to(device)
     return model, arch
 
@@ -2219,6 +2329,15 @@ def evaluate(
     moe_gate_count = 0
     moe_gate_transition_count = 0
     moe_gate_entropy_sum = 0.0
+    dn_diff_t_sum = 0.0
+    dn_diff_t_sq_sum = 0.0
+    dn_diff_t_count = 0
+    dn_diff_active_low_sum = 0.0
+    dn_diff_active_mid_sum = 0.0
+    dn_diff_active_high_sum = 0.0
+    dn_diff_active_low_count = 0
+    dn_diff_active_mid_count = 0
+    dn_diff_active_high_count = 0
 
     with torch.no_grad():
         for batch in loader:
@@ -2319,6 +2438,34 @@ def evaluate(
                     moe_gate_transition_load_sum += g_trans.sum(dim=0).detach().cpu().numpy()
                     moe_gate_transition_count += int(g_trans.shape[0])
 
+            if bool(getattr(model, "dn_diff_enabled", False)):
+                t_start_eval = getattr(model, "_dn_diff_t_start", None)
+                if isinstance(t_start_eval, torch.Tensor):
+                    t_eval_f = t_start_eval.detach().float().view(-1)
+                    dn_diff_t_sum += float(t_eval_f.sum().item())
+                    dn_diff_t_sq_sum += float((t_eval_f * t_eval_f).sum().item())
+                    dn_diff_t_count += int(t_eval_f.numel())
+
+                active_eval = getattr(model, "_dn_diff_active_mask", None)
+                if isinstance(active_eval, torch.Tensor):
+                    a = active_eval.detach().float().view(-1)
+                    if x.ndim == 4 and int(a.numel()) == int(x.shape[0] * x.shape[1]):
+                        a = a.view(x.shape[0], x.shape[1]).mean(dim=1)
+                    elif int(a.numel()) != int(y.shape[0]):
+                        a = None
+                    if a is not None:
+                        mid_mask_dev = (~low_mask_dev) & (snr.float() < 6.0)
+                        high_mask_dev = snr.float() >= 6.0
+                        if bool(torch.any(low_mask_dev)):
+                            dn_diff_active_low_sum += float(a[low_mask_dev].sum().item())
+                            dn_diff_active_low_count += int(low_mask_dev.sum().item())
+                        if bool(torch.any(mid_mask_dev)):
+                            dn_diff_active_mid_sum += float(a[mid_mask_dev].sum().item())
+                            dn_diff_active_mid_count += int(mid_mask_dev.sum().item())
+                        if bool(torch.any(high_mask_dev)):
+                            dn_diff_active_high_sum += float(a[high_mask_dev].sum().item())
+                            dn_diff_active_high_count += int(high_mask_dev.sum().item())
+
             snr_cpu = snr.detach().cpu().numpy().astype(np.int32)
             preds_cpu = preds.detach().cpu().numpy()
             y_cpu = y.detach().cpu().numpy()
@@ -2358,6 +2505,32 @@ def evaluate(
                 )
             else:
                 summary[f"moe_gate_expert_{i}_load_transition"] = 0.0
+    if dn_diff_t_count > 0:
+        t_mean = dn_diff_t_sum / float(dn_diff_t_count)
+        t_var = max(0.0, dn_diff_t_sq_sum / float(dn_diff_t_count) - t_mean * t_mean)
+        summary["dn_diff_t_start_mean"] = float(t_mean)
+        summary["dn_diff_t_start_std"] = float(math.sqrt(t_var))
+    else:
+        summary["dn_diff_t_start_mean"] = 0.0
+        summary["dn_diff_t_start_std"] = 0.0
+    summary["dn_diff_active_frac_low"] = (
+        float(dn_diff_active_low_sum / float(dn_diff_active_low_count))
+        if dn_diff_active_low_count > 0
+        else 0.0
+    )
+    summary["dn_diff_active_frac_mid"] = (
+        float(dn_diff_active_mid_sum / float(dn_diff_active_mid_count))
+        if dn_diff_active_mid_count > 0
+        else 0.0
+    )
+    summary["dn_diff_active_frac_high"] = (
+        float(dn_diff_active_high_sum / float(dn_diff_active_high_count))
+        if dn_diff_active_high_count > 0
+        else 0.0
+    )
+    summary["dn_diff_eval_steps"] = float(getattr(model, "dn_diff_eval_steps", 0))
+    summary["dn_diff_ddim_eta"] = float(getattr(model, "dn_diff_ddim_eta_used", getattr(model, "dn_diff_ddim_eta", 0.0)))
+    summary["dn_diff_multisample"] = float(getattr(model, "dn_diff_multisample", 1))
     return acc, total, acc_by_snr, summary
 
 
@@ -2603,6 +2776,8 @@ def evaluate_eta_calibration(
 
 def train(args: argparse.Namespace) -> None:
     apply_preset(args)
+    if bool(getattr(args, "dn_diff_enable", False)) and args.arch != "cldnn":
+        raise ValueError("dn_diff_enable is currently supported only for --arch cldnn.")
     if bool(getattr(args, "cldnn_snr_cond", False)) and bool(getattr(args, "cldnn_noise_cond", False)):
         raise ValueError("Use only one conditioning path: --cldnn-snr-cond OR --cldnn-noise-cond.")
     if args.arch != "cldnn" and (
@@ -2759,6 +2934,39 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("lfeat_snr_new_lo must be <= lfeat_snr_new_hi.")
     if float(getattr(args, "dn_pair_snr_new_lo", -999.0)) > float(getattr(args, "dn_pair_snr_new_hi", 999.0)):
         raise ValueError("dn_pair_snr_new_lo must be <= dn_pair_snr_new_hi.")
+    if bool(getattr(args, "dn_diff_enable", False)):
+        if args.arch != "cldnn":
+            raise ValueError("dn_diff_enable requires --arch cldnn.")
+        if int(getattr(args, "dn_diff_train_timesteps", 100)) <= 1:
+            raise ValueError("dn_diff_train_timesteps must be > 1.")
+        if int(getattr(args, "dn_diff_eval_steps", 8)) <= 0:
+            raise ValueError("dn_diff_eval_steps must be > 0.")
+        if int(getattr(args, "dn_diff_multisample", 1)) <= 0:
+            raise ValueError("dn_diff_multisample must be > 0.")
+        if float(getattr(args, "dn_diff_loss_snr_lo", -14.0)) > float(getattr(args, "dn_diff_loss_snr_hi", -6.0)):
+            raise ValueError("dn_diff_loss_snr_lo must be <= dn_diff_loss_snr_hi.")
+        if int(getattr(args, "dn_diff_fixed_t_start", 30)) < 0:
+            raise ValueError("dn_diff_fixed_t_start must be >= 0.")
+        if float(getattr(args, "lambda_dn_diff", 1.0)) < 0.0:
+            raise ValueError("lambda_dn_diff must be >= 0.")
+        if float(getattr(args, "lambda_dn_recon", 0.0)) < 0.0:
+            raise ValueError("lambda_dn_recon must be >= 0.")
+        if float(getattr(args, "lambda_dn_feat_align", 0.0)) < 0.0:
+            raise ValueError("lambda_dn_feat_align must be >= 0.")
+        if float(getattr(args, "lambda_dn_logit_align", 0.0)) < 0.0:
+            raise ValueError("lambda_dn_logit_align must be >= 0.")
+        if int(getattr(args, "dn_diff_feat_align_start_epoch", 20)) < 0:
+            raise ValueError("dn_diff_feat_align_start_epoch must be >= 0.")
+        if int(getattr(args, "dn_diff_logit_align_start_epoch", 30)) < 0:
+            raise ValueError("dn_diff_logit_align_start_epoch must be >= 0.")
+        if str(getattr(args, "dn_diff_train_t_start_source", "snr_pred")).strip().lower() == "snr_true":
+            raise ValueError("dn_diff_train_t_start_source cannot be snr_true.")
+        if (
+            int(getattr(args, "dn_diff_multisample", 1)) > 1
+            and abs(float(getattr(args, "dn_diff_ddim_eta", 0.0))) < 1e-12
+            and not bool(getattr(args, "dn_diff_force_deterministic_multisample", False))
+        ):
+            print("[dn_diff] multisample with eta=0 detected; eval eta will be auto-promoted to 0.2.")
     if float(getattr(args, "snr_consist_low_delta_min", 2.0)) < 0.0 or float(getattr(args, "snr_consist_low_delta_max", 4.0)) < 0.0:
         raise ValueError("snr_consist_low_delta_min/max must be >= 0.")
     if float(getattr(args, "snr_consist_low_delta_max", 4.0)) < float(getattr(args, "snr_consist_low_delta_min", 2.0)):
@@ -2995,6 +3203,24 @@ def train(args: argparse.Namespace) -> None:
             moe_gate_tau=float(getattr(args, "moe_gate_tau", 0.3)),
             moe_gate_use_feat=bool(getattr(args, "moe_gate_use_feat", False)),
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
+            dn_diff_enable=bool(getattr(args, "dn_diff_enable", False)),
+            dn_diff_target=str(getattr(args, "dn_diff_target", "v")),
+            dn_diff_train_timesteps=int(getattr(args, "dn_diff_train_timesteps", 100)),
+            dn_diff_eval_mode=str(getattr(args, "dn_diff_eval_mode", "ddim")),
+            dn_diff_eval_steps=int(getattr(args, "dn_diff_eval_steps", 8)),
+            dn_diff_ddim_eta=float(getattr(args, "dn_diff_ddim_eta", 0.0)),
+            dn_diff_multisample=int(getattr(args, "dn_diff_multisample", 1)),
+            dn_diff_eval_t_start_source=str(getattr(args, "dn_diff_eval_t_start_source", "snr_pred")),
+            dn_diff_fixed_t_start=int(getattr(args, "dn_diff_fixed_t_start", 30)),
+            dn_diff_snr2t_scale=float(getattr(args, "dn_diff_snr2t_scale", 1.0)),
+            dn_diff_snr2t_bias=float(getattr(args, "dn_diff_snr2t_bias", 0.0)),
+            dn_diff_low_snr_thresh=float(getattr(args, "dn_diff_low_snr_thresh", -6.0)),
+            dn_diff_high_snr_margin=float(getattr(args, "dn_diff_high_snr_margin", 2.0)),
+            dn_diff_hard_bypass_high_snr=bool(getattr(args, "dn_diff_hard_bypass_high_snr", True)),
+            dn_diff_cond_diagnostic=str(getattr(args, "dn_diff_cond_diagnostic", "none")),
+            dn_diff_force_deterministic_multisample=bool(
+                getattr(args, "dn_diff_force_deterministic_multisample", False)
+            ),
         ).to(device)
         schedule = None
 
@@ -3061,7 +3287,36 @@ def train(args: argparse.Namespace) -> None:
                 f"bias={proxy_fit_info.get('proxy_cal_bias', 0.0):.6f}"
             )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    freeze_cfg = getattr(args, "dn_diff_freeze_classifier", None)
+    if freeze_cfg is None:
+        dn_diff_freeze_classifier_eff = bool(getattr(args, "dn_diff_enable", False))
+    else:
+        dn_diff_freeze_classifier_eff = bool(freeze_cfg)
+    if dn_diff_freeze_classifier_eff and not (
+        bool(getattr(args, "dn_diff_enable", False))
+        or bool(getattr(args, "cldnn_denoiser", False))
+    ):
+        raise ValueError("--dn-diff-freeze-classifier requires dn_diff_enable or cldnn_denoiser path.")
+
+    freeze_cls_for_dn = dn_diff_freeze_classifier_eff
+    if args.arch == "cldnn" and freeze_cls_for_dn:
+        if bool(getattr(args, "dn_diff_enable", False)) and hasattr(model, "set_dn_diff_train_freeze"):
+            model.set_dn_diff_train_freeze(True)
+        elif bool(getattr(args, "cldnn_denoiser", False)):
+            # Matched frozen-control mode: keep denoiser/noise head trainable, freeze classifier stack.
+            for p in model.parameters():
+                p.requires_grad_(False)
+            for name, p in model.named_parameters():
+                if name.startswith("denoiser") or name.startswith("noise_fraction_net"):
+                    p.requires_grad_(True)
+
+    def _current_trainable_params() -> List[torch.nn.Parameter]:
+        params = [p for p in model.parameters() if p.requires_grad]
+        if not params:
+            raise RuntimeError("No trainable model parameters are enabled.")
+        return params
+
+    optimizer = torch.optim.AdamW(_current_trainable_params(), lr=args.lr, weight_decay=args.weight_decay)
     steps_per_epoch = max(1, len(train_loader))
     total_steps = args.epochs * steps_per_epoch
     decay_start_step = int(getattr(args, "lr_decay_start_epoch", 0)) * steps_per_epoch
@@ -3421,7 +3676,7 @@ def train(args: argparse.Namespace) -> None:
         print(f"{'='*60}\n")
 
         # Reset optimizer for fine-tuning phase
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(_current_trainable_params(), lr=args.lr, weight_decay=args.weight_decay)
         steps_per_epoch = max(1, len(train_loader))
         total_steps = args.epochs * steps_per_epoch
         decay_start_step = int(getattr(args, "lr_decay_start_epoch", 0)) * steps_per_epoch
@@ -3539,13 +3794,31 @@ def train(args: argparse.Namespace) -> None:
         print(f"{'='*60}\n")
 
         # Reset optimizer for fine-tuning phase
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(_current_trainable_params(), lr=args.lr, weight_decay=args.weight_decay)
         steps_per_epoch = max(1, len(train_loader))
         total_steps = args.epochs * steps_per_epoch
         decay_start_step = int(getattr(args, "lr_decay_start_epoch", 0)) * steps_per_epoch
         scheduler = build_scheduler(
             optimizer, args.warmup_steps, total_steps, args.min_lr, decay_start_step=decay_start_step
         )
+
+    dn_diff_align_teacher_mode = str(getattr(args, "dn_diff_align_teacher", "frozen")).strip().lower()
+    dn_diff_align_teacher: Optional[torch.nn.Module] = None
+    dn_diff_align_teacher_momentum = float(getattr(args, "ema_decay", 0.9996))
+    dn_diff_align_teacher_needed = (
+        bool(getattr(args, "dn_diff_enable", False))
+        and dn_diff_align_teacher_mode in {"frozen", "ema"}
+        and (
+            float(getattr(args, "lambda_dn_feat_align", 0.0)) > 0.0
+            or float(getattr(args, "lambda_dn_logit_align", 0.0)) > 0.0
+        )
+    )
+    if dn_diff_align_teacher_needed:
+        dn_diff_align_teacher = copy.deepcopy(model).to(device)
+        dn_diff_align_teacher.eval()
+        for p in dn_diff_align_teacher.parameters():
+            p.requires_grad_(False)
+        print(f"[dn_diff] alignment teacher initialized ({dn_diff_align_teacher_mode}).")
 
     for epoch in range(start_epoch, args.epochs):
         phase1 = epoch < args.phase1_epochs
@@ -3556,6 +3829,10 @@ def train(args: argparse.Namespace) -> None:
         if bool(getattr(args, "cldnn_denoiser", False)) and bool(getattr(args, "stage_a_no_cls", False)):
             if epoch < int(getattr(args, "stage_a_epochs", 0)):
                 cls_loss_mult = 0.0
+        if bool(dn_diff_freeze_classifier_eff):
+            cls_loss_mult = 0.0
+        lambda_snr_eff = 0.0 if bool(getattr(args, "dn_diff_enable", False)) else float(args.lambda_snr)
+        lambda_noise_eff = 0.0 if bool(getattr(args, "dn_diff_enable", False)) else float(getattr(args, "lambda_noise", 0.0))
         lambda_feat = 0.0
         if (
             args.arch == "cldnn"
@@ -3615,6 +3892,15 @@ def train(args: argparse.Namespace) -> None:
         epoch_loss_moe_diversity = 0.0
         epoch_loss_supcon = 0.0
         epoch_supcon_active = 0.0
+        epoch_loss_dn_diff = 0.0
+        epoch_loss_dn_recon = 0.0
+        epoch_loss_dn_feat_align = 0.0
+        epoch_loss_dn_logit_align = 0.0
+        epoch_dn_t_start_mean = 0.0
+        epoch_dn_t_start_std = 0.0
+        epoch_dn_active_low = 0.0
+        epoch_dn_active_mid = 0.0
+        epoch_dn_active_high = 0.0
         epoch_moe_low_active = 0.0
         epoch_moe_high_active = 0.0
         moe_n_experts_cfg = int(getattr(args, "moe_n_experts", 1))
@@ -3817,6 +4103,15 @@ def train(args: argparse.Namespace) -> None:
             loss_moe_diversity = torch.tensor(0.0, device=device)
             loss_supcon = torch.tensor(0.0, device=device)
             supcon_active_frac_batch = torch.tensor(0.0, device=device)
+            loss_dn_diff = torch.tensor(0.0, device=device)
+            loss_dn_recon = torch.tensor(0.0, device=device)
+            loss_dn_feat_align = torch.tensor(0.0, device=device)
+            loss_dn_logit_align = torch.tensor(0.0, device=device)
+            dn_t_start_mean_batch = torch.tensor(0.0, device=device)
+            dn_t_start_std_batch = torch.tensor(0.0, device=device)
+            dn_active_low_batch = torch.tensor(0.0, device=device)
+            dn_active_mid_batch = torch.tensor(0.0, device=device)
+            dn_active_high_batch = torch.tensor(0.0, device=device)
             moe_low_active_frac_batch = torch.tensor(0.0, device=device)
             moe_high_active_frac_batch = torch.tensor(0.0, device=device)
             moe_load_batch: Optional[torch.Tensor] = None
@@ -3913,7 +4208,7 @@ def train(args: argparse.Namespace) -> None:
 
                     loss_snr = F.smooth_l1_loss(snr_pred, snr_aux) if args.lambda_snr > 0 else 0.0
                     loss_noise = 0.0
-                    if float(getattr(args, "lambda_noise", 0.0)) > 0:
+                    if float(lambda_noise_eff) > 0.0:
                         eta_pred = eta_pred_for_noise if eta_pred_for_noise is not None else getattr(model, "_eta_pred", None)
                         if eta_pred is not None:
                             eta_target = snr_db_to_eta_target(
@@ -3927,8 +4222,8 @@ def train(args: argparse.Namespace) -> None:
                     loss = (
                         cls_loss_mult * loss_cls
                         + lambda_diff * loss_diff
-                        + args.lambda_snr * loss_snr
-                        + float(getattr(args, "lambda_noise", 0.0)) * loss_noise
+                        + float(lambda_snr_eff) * loss_snr
+                        + float(lambda_noise_eff) * loss_noise
                     )
                     if args.arch == "cldnn" and moe_n_experts_cfg > 1:
                         moe_logits_experts_batch = (
@@ -3971,6 +4266,7 @@ def train(args: argparse.Namespace) -> None:
                     if (
                         bool(getattr(args, "cldnn_denoiser", False))
                         and args.arch == "cldnn"
+                        and not bool(getattr(args, "dn_diff_enable", False))
                         and hasattr(model, "denoise_only")
                     ):
                         if x_aux.ndim == 4:
@@ -4364,7 +4660,7 @@ def train(args: argparse.Namespace) -> None:
 
                 loss_snr = F.smooth_l1_loss(snr_pred, snr_aux) if args.lambda_snr > 0 else 0.0
                 loss_noise = 0.0
-                if float(getattr(args, "lambda_noise", 0.0)) > 0:
+                if float(lambda_noise_eff) > 0.0:
                     eta_pred = eta_pred_for_noise if eta_pred_for_noise is not None else getattr(model, "_eta_pred", None)
                     if eta_pred is not None:
                         eta_target = snr_db_to_eta_target(
@@ -4378,8 +4674,8 @@ def train(args: argparse.Namespace) -> None:
                 loss = (
                     cls_loss_mult * loss_cls
                     + lambda_diff * loss_diff
-                    + args.lambda_snr * loss_snr
-                    + float(getattr(args, "lambda_noise", 0.0)) * loss_noise
+                    + float(lambda_snr_eff) * loss_snr
+                    + float(lambda_noise_eff) * loss_noise
                 )
                 if args.arch == "cldnn" and moe_n_experts_cfg > 1:
                     moe_logits_experts_batch = (
@@ -4422,6 +4718,7 @@ def train(args: argparse.Namespace) -> None:
                 if (
                     bool(getattr(args, "cldnn_denoiser", False))
                     and args.arch == "cldnn"
+                    and not bool(getattr(args, "dn_diff_enable", False))
                     and hasattr(model, "denoise_only")
                 ):
                     if x_aux.ndim == 4:
@@ -4724,6 +5021,176 @@ def train(args: argparse.Namespace) -> None:
                         ramp = 1.0
                     loss = loss + consist_lambda * ramp * loss_consist
 
+            if bool(getattr(args, "dn_diff_enable", False)) and args.arch == "cldnn":
+                if x_aux.ndim == 4:
+                    g_dn = x_aux.shape[1]
+                    x_dn_ref = x_aux.reshape(-1, x_aux.shape[2], x_aux.shape[3])
+                    snr_dn_ref = snr_aux.repeat_interleave(g_dn)
+                else:
+                    x_dn_ref = x_aux
+                    snr_dn_ref = snr_aux
+
+                dn_pair_delta_min = float(getattr(args, "dn_pair_delta_min", 2.0))
+                dn_pair_delta_max = float(getattr(args, "dn_pair_delta_max", 8.0))
+                dn_pair_snr_floor = (
+                    float(getattr(args, "dn_pair_snr_floor_db"))
+                    if getattr(args, "dn_pair_snr_floor_db", None) is not None
+                    else float(snr_min_db)
+                )
+                dn_pair_snr_new_lo_raw = float(getattr(args, "dn_pair_snr_new_lo", -999.0))
+                dn_pair_snr_new_hi_raw = float(getattr(args, "dn_pair_snr_new_hi", 999.0))
+                dn_pair_snr_new_lo = dn_pair_snr_new_lo_raw if dn_pair_snr_new_lo_raw > -900.0 else None
+                dn_pair_snr_new_hi = dn_pair_snr_new_hi_raw if dn_pair_snr_new_hi_raw < 900.0 else None
+                x_cond_dn, _delta_dn = snr_path_degrade(
+                    x_dn_ref,
+                    snr_dn_ref,
+                    delta_min=dn_pair_delta_min,
+                    delta_max=dn_pair_delta_max,
+                    snr_floor=dn_pair_snr_floor,
+                    snr_target_min=dn_pair_snr_new_lo,
+                    snr_target_max=dn_pair_snr_new_hi,
+                )
+
+                train_t_source = str(getattr(args, "dn_diff_train_t_start_source", "snr_pred")).strip().lower()
+                if train_t_source == "fixed":
+                    t_dn = torch.full(
+                        (x_dn_ref.shape[0],),
+                        int(getattr(args, "dn_diff_fixed_t_start", 30)),
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    if hasattr(model, "dn_diff_schedule") and getattr(model, "dn_diff_schedule", None) is not None:
+                        t_dn = torch.clamp(t_dn, min=0, max=int(model.dn_diff_schedule.timesteps) - 1)
+                else:
+                    snr_est_dn: Optional[torch.Tensor] = None
+                    if getattr(model, "noise_fraction_net", None) is not None:
+                        with torch.no_grad():
+                            eta_est_dn, _aux_eta = model.noise_fraction_net(x_cond_dn)  # type: ignore[attr-defined]
+                        snr_est_dn = model._snr_from_eta(eta_est_dn.detach())  # type: ignore[attr-defined]
+                    if snr_est_dn is None:
+                        snr_est_dn = snr_dn_ref.float()
+                    t_dn = model._dn_diff_map_snr_to_t(snr_est_dn)  # type: ignore[attr-defined]
+
+                if getattr(model, "dn_diff_schedule", None) is None:
+                    raise RuntimeError("dn_diff_enable requires model.dn_diff_schedule.")
+                dn_schedule = model.dn_diff_schedule.to(device)  # type: ignore[attr-defined]
+                noise_dn = torch.randn_like(x_dn_ref)
+                x_t_dn = dn_schedule.q_sample(x_dn_ref, t_dn, noise_dn)
+                snr_dn_in = snr_dn_ref if args.snr_mode == "known" else None
+                pred_dn, _eta_pred_dn, _eta_cond_dn = model.dn_diff_predict(  # type: ignore[attr-defined]
+                    x_t=x_t_dn,
+                    x_cond=x_cond_dn,
+                    t=t_dn,
+                    snr=snr_dn_in,
+                    snr_mode=args.snr_mode,
+                    cond_diagnostic="none",
+                )
+
+                dn_target_type = str(getattr(args, "dn_diff_target", "v")).strip().lower()
+                if dn_target_type == "v":
+                    alpha_bar_dn = dn_schedule.alpha_bars.gather(0, t_dn).view(-1, 1, 1)
+                    target_dn = torch.sqrt(torch.clamp(alpha_bar_dn, min=0.0)) * noise_dn - torch.sqrt(
+                        torch.clamp(1.0 - alpha_bar_dn, min=0.0)
+                    ) * x_dn_ref
+                    x0_dn = dn_schedule.predict_x0_from_v(x_t_dn, t_dn, pred_dn)
+                else:
+                    target_dn = noise_dn
+                    x0_dn = dn_schedule.predict_x0_from_eps(x_t_dn, t_dn, pred_dn)
+
+                diff_vec = torch.mean((pred_dn.float() - target_dn.float()) ** 2, dim=(1, 2))
+                recon_vec = torch.mean(torch.abs(x0_dn.float() - x_dn_ref.float()), dim=(1, 2))
+                if bool(getattr(args, "dn_diff_apply_lowband_only_train", True)):
+                    dn_loss_mask = (
+                        (snr_dn_ref.float() >= float(getattr(args, "dn_diff_loss_snr_lo", -14.0)))
+                        & (snr_dn_ref.float() <= float(getattr(args, "dn_diff_loss_snr_hi", -6.0)))
+                    ).float()
+                else:
+                    dn_loss_mask = torch.ones_like(snr_dn_ref.float())
+                dn_denom = torch.clamp(dn_loss_mask.sum(), min=1.0)
+                loss_dn_diff = (diff_vec * dn_loss_mask).sum() / dn_denom
+                loss_dn_recon = (recon_vec * dn_loss_mask).sum() / dn_denom
+                loss = loss + float(getattr(args, "lambda_dn_diff", 1.0)) * loss_dn_diff
+                loss = loss + float(getattr(args, "lambda_dn_recon", 0.0)) * loss_dn_recon
+
+                if (
+                    float(getattr(args, "lambda_dn_feat_align", 0.0)) > 0.0
+                    and epoch >= int(getattr(args, "dn_diff_feat_align_start_epoch", 20))
+                    and hasattr(model, "early_features")
+                ):
+                    if bool(getattr(model, "has_feat_encoder", False)) is False and hasattr(model, "build_feat_encoder"):
+                        model.build_feat_encoder()
+                    feat_in_pred = x0_dn.float()
+                    feat_in_tgt = x_dn_ref.float()
+                    if bool(getattr(model, "denoiser_dual_path", False)):
+                        feat_in_pred = torch.cat([x_cond_dn.float(), x0_dn.float()], dim=1)
+                        feat_in_tgt = torch.cat([x_cond_dn.float(), x_dn_ref.float()], dim=1)
+                    feat_pred_dn = model.early_features(feat_in_pred)
+                    if dn_diff_align_teacher is not None and hasattr(dn_diff_align_teacher, "early_features"):
+                        if (
+                            hasattr(dn_diff_align_teacher, "build_feat_encoder")
+                            and bool(getattr(dn_diff_align_teacher, "has_feat_encoder", False)) is False
+                        ):
+                            dn_diff_align_teacher.build_feat_encoder()
+                        with torch.no_grad():
+                            feat_tgt_dn = dn_diff_align_teacher.early_features(feat_in_tgt)
+                    else:
+                        feat_tgt_dn = model.early_features(feat_in_tgt).detach()
+                    feat_vec_dn = torch.mean(torch.abs(feat_pred_dn - feat_tgt_dn), dim=1)
+                    loss_dn_feat_align = (feat_vec_dn * dn_loss_mask).sum() / dn_denom
+                    loss = loss + float(getattr(args, "lambda_dn_feat_align", 0.0)) * loss_dn_feat_align
+
+                if (
+                    float(getattr(args, "lambda_dn_logit_align", 0.0)) > 0.0
+                    and epoch >= int(getattr(args, "dn_diff_logit_align_start_epoch", 30))
+                ):
+                    if x_aux.ndim == 4:
+                        x0_dn_cls = x0_dn.view(x_aux.shape[0], x_aux.shape[1], x_aux.shape[2], x_aux.shape[3])
+                    else:
+                        x0_dn_cls = x0_dn
+                    t_align = torch.zeros((x_aux.shape[0],), device=device, dtype=torch.long)
+                    align_teacher_model = dn_diff_align_teacher if dn_diff_align_teacher is not None else model
+                    with torch.no_grad():
+                        logits_dn_tgt, _, _ = align_teacher_model(
+                            x_aux,
+                            t_align,
+                            snr=snr_in_aux,
+                            snr_mode=args.snr_mode,
+                            group_mask=mask,
+                            denoiser_bypass=True,
+                        )
+                    logits_dn_pred, _, _ = model(
+                        x0_dn_cls,
+                        t_align,
+                        snr=snr_in_aux,
+                        snr_mode=args.snr_mode,
+                        group_mask=mask,
+                        denoiser_bypass=True,
+                    )
+                    logit_vec_dn = torch.mean((logits_dn_pred.float() - logits_dn_tgt.detach().float()) ** 2, dim=1)
+                    if bool(getattr(args, "dn_diff_apply_lowband_only_train", True)):
+                        dn_logit_mask = (
+                            (snr_aux.float() >= float(getattr(args, "dn_diff_loss_snr_lo", -14.0)))
+                            & (snr_aux.float() <= float(getattr(args, "dn_diff_loss_snr_hi", -6.0)))
+                        ).float()
+                    else:
+                        dn_logit_mask = torch.ones_like(snr_aux.float())
+                    dn_logit_denom = torch.clamp(dn_logit_mask.sum(), min=1.0)
+                    loss_dn_logit_align = (logit_vec_dn * dn_logit_mask).sum() / dn_logit_denom
+                    loss = loss + float(getattr(args, "lambda_dn_logit_align", 0.0)) * loss_dn_logit_align
+
+                dn_t_start_mean_batch = t_dn.float().mean()
+                dn_t_start_std_batch = t_dn.float().std(unbiased=False)
+                low_mask_dn = (snr_dn_ref.float() >= -14.0) & (snr_dn_ref.float() <= -6.0)
+                mid_mask_dn = (snr_dn_ref.float() > -6.0) & (snr_dn_ref.float() < 6.0)
+                high_mask_dn = snr_dn_ref.float() >= 6.0
+                dn_active_vec = dn_loss_mask
+                if bool(torch.any(low_mask_dn)):
+                    dn_active_low_batch = dn_active_vec[low_mask_dn].mean()
+                if bool(torch.any(mid_mask_dn)):
+                    dn_active_mid_batch = dn_active_vec[mid_mask_dn].mean()
+                if bool(torch.any(high_mask_dn)):
+                    dn_active_high_batch = dn_active_vec[high_mask_dn].mean()
+
             if args.arch == "cldnn" and int(getattr(args, "moe_n_experts", 1)) > 1:
                 gate_batch = getattr(model, "_moe_gate", None)
                 moe_spec_lambda_cfg = float(getattr(args, "moe_specialize_lambda", 0.0))
@@ -4770,6 +5237,12 @@ def train(args: argparse.Namespace) -> None:
             global_step += 1
             if ema is not None and global_step >= args.ema_start and (global_step % max(1, args.ema_every) == 0):
                 ema.update(model)
+            if dn_diff_align_teacher is not None and dn_diff_align_teacher_mode == "ema":
+                moco_momentum_update(
+                    model,
+                    dn_diff_align_teacher,
+                    momentum=dn_diff_align_teacher_momentum,
+                )
 
             logits_for_acc_batch = logits_for_acc if logits_for_acc is not None else logits
             batch_size = x_clean.shape[0]
@@ -4792,6 +5265,15 @@ def train(args: argparse.Namespace) -> None:
             epoch_loss_moe_diversity += float(loss_moe_diversity.detach().item()) * batch_size
             epoch_loss_supcon += float(loss_supcon.detach().item()) * batch_size
             epoch_supcon_active += float(supcon_active_frac_batch.detach().item()) * batch_size
+            epoch_loss_dn_diff += float(loss_dn_diff.detach().item()) * batch_size
+            epoch_loss_dn_recon += float(loss_dn_recon.detach().item()) * batch_size
+            epoch_loss_dn_feat_align += float(loss_dn_feat_align.detach().item()) * batch_size
+            epoch_loss_dn_logit_align += float(loss_dn_logit_align.detach().item()) * batch_size
+            epoch_dn_t_start_mean += float(dn_t_start_mean_batch.detach().item()) * batch_size
+            epoch_dn_t_start_std += float(dn_t_start_std_batch.detach().item()) * batch_size
+            epoch_dn_active_low += float(dn_active_low_batch.detach().item()) * batch_size
+            epoch_dn_active_mid += float(dn_active_mid_batch.detach().item()) * batch_size
+            epoch_dn_active_high += float(dn_active_high_batch.detach().item()) * batch_size
             epoch_moe_low_active += float(moe_low_active_frac_batch.detach().item()) * batch_size
             epoch_moe_high_active += float(moe_high_active_frac_batch.detach().item()) * batch_size
             if moe_load_batch is not None and len(epoch_moe_expert_load) == int(moe_load_batch.numel()):
@@ -4825,6 +5307,15 @@ def train(args: argparse.Namespace) -> None:
         train_loss_moe_diversity = epoch_loss_moe_diversity / max(1, epoch_total)
         train_loss_supcon = epoch_loss_supcon / max(1, epoch_total)
         train_supcon_active_frac = epoch_supcon_active / max(1, epoch_total)
+        train_loss_dn_diff = epoch_loss_dn_diff / max(1, epoch_total)
+        train_loss_dn_recon = epoch_loss_dn_recon / max(1, epoch_total)
+        train_loss_dn_feat_align = epoch_loss_dn_feat_align / max(1, epoch_total)
+        train_loss_dn_logit_align = epoch_loss_dn_logit_align / max(1, epoch_total)
+        train_dn_t_start_mean = epoch_dn_t_start_mean / max(1, epoch_total)
+        train_dn_t_start_std = epoch_dn_t_start_std / max(1, epoch_total)
+        train_dn_active_frac_low = epoch_dn_active_low / max(1, epoch_total)
+        train_dn_active_frac_mid = epoch_dn_active_mid / max(1, epoch_total)
+        train_dn_active_frac_high = epoch_dn_active_high / max(1, epoch_total)
         train_moe_low_active_frac = epoch_moe_low_active / max(1, epoch_total)
         train_moe_high_active_frac = epoch_moe_high_active / max(1, epoch_total)
         train_moe_expert_load = [v / max(1, epoch_total) for v in epoch_moe_expert_load]
@@ -4930,15 +5421,30 @@ def train(args: argparse.Namespace) -> None:
             "lr": optimizer.param_groups[0]["lr"],
             "time_sec": time.time() - start_time,
             "lambda_diff": lambda_diff,
+            "lambda_snr_eff": float(lambda_snr_eff),
             "lambda_noise": float(getattr(args, "lambda_noise", 0.0)),
+            "lambda_noise_eff": float(lambda_noise_eff),
             "lambda_dn": float(getattr(args, "lambda_dn", 0.0)),
             "lambda_id": float(getattr(args, "lambda_id", 0.0)),
             "lambda_feat": float(lambda_feat),
+            "lambda_dn_diff": float(getattr(args, "lambda_dn_diff", 1.0)),
+            "lambda_dn_recon": float(getattr(args, "lambda_dn_recon", 0.0)),
+            "lambda_dn_feat_align": float(getattr(args, "lambda_dn_feat_align", 0.0)),
+            "lambda_dn_logit_align": float(getattr(args, "lambda_dn_logit_align", 0.0)),
             "lambda_kd": float(lambda_kd_eff),
             "lambda_kd_denoise": float(lambda_kd_denoise_eff),
             "lambda_kd_feat": float(lambda_kd_feat_eff),
             "train_loss_feat": float(train_loss_feat),
             "train_lfeat_active_frac": float(train_lfeat_active_frac),
+            "train_loss_dn_diff": float(train_loss_dn_diff),
+            "train_loss_dn_recon": float(train_loss_dn_recon),
+            "train_loss_dn_feat_align": float(train_loss_dn_feat_align),
+            "train_loss_dn_logit_align": float(train_loss_dn_logit_align),
+            "dn_diff_t_start_mean": float(train_dn_t_start_mean),
+            "dn_diff_t_start_std": float(train_dn_t_start_std),
+            "dn_diff_active_frac_low": float(train_dn_active_frac_low),
+            "dn_diff_active_frac_mid": float(train_dn_active_frac_mid),
+            "dn_diff_active_frac_high": float(train_dn_active_frac_high),
             "train_loss_kd": float(train_loss_kd),
             "train_kd_active_frac": float(train_kd_active_frac),
             "train_loss_kd_hi": float(train_loss_kd_hi),
@@ -5015,6 +5521,28 @@ def train(args: argparse.Namespace) -> None:
             "cldnn_resnet_kernel": int(getattr(args, "cldnn_resnet_kernel", 5)),
             "cldnn_noise_cond": bool(getattr(args, "cldnn_noise_cond", False)),
             "cldnn_denoiser": bool(getattr(args, "cldnn_denoiser", False)),
+            "dn_diff_enabled": bool(getattr(args, "dn_diff_enable", False)),
+            "dn_diff_target": str(getattr(args, "dn_diff_target", "v")),
+            "dn_diff_train_timesteps": int(getattr(args, "dn_diff_train_timesteps", 100)),
+            "dn_diff_train_t_source": str(getattr(args, "dn_diff_train_t_start_source", "snr_pred")),
+            "dn_diff_eval_t_source": str(getattr(args, "dn_diff_eval_t_start_source", "snr_pred")),
+            "dn_diff_eval_mode": str(getattr(args, "dn_diff_eval_mode", "ddim")),
+            "dn_diff_eval_steps": int(getattr(args, "dn_diff_eval_steps", 8)),
+            "dn_diff_ddim_eta": float(getattr(args, "dn_diff_ddim_eta", 0.0)),
+            "dn_diff_multisample": int(getattr(args, "dn_diff_multisample", 1)),
+            "dn_diff_snr2t_scale": float(getattr(args, "dn_diff_snr2t_scale", 1.0)),
+            "dn_diff_snr2t_bias": float(getattr(args, "dn_diff_snr2t_bias", 0.0)),
+            "dn_diff_low_snr_thresh": float(getattr(args, "dn_diff_low_snr_thresh", -6.0)),
+            "dn_diff_high_snr_margin": float(getattr(args, "dn_diff_high_snr_margin", 2.0)),
+            "dn_diff_hard_bypass_high_snr": bool(getattr(args, "dn_diff_hard_bypass_high_snr", True)),
+            "dn_diff_apply_lowband_only_train": bool(getattr(args, "dn_diff_apply_lowband_only_train", True)),
+            "dn_diff_loss_snr_lo": float(getattr(args, "dn_diff_loss_snr_lo", -14.0)),
+            "dn_diff_loss_snr_hi": float(getattr(args, "dn_diff_loss_snr_hi", -6.0)),
+            "dn_diff_freeze_classifier": bool(dn_diff_freeze_classifier_eff),
+            "dn_diff_align_teacher": str(getattr(args, "dn_diff_align_teacher", "frozen")),
+            "dn_diff_feat_align_start_epoch": int(getattr(args, "dn_diff_feat_align_start_epoch", 20)),
+            "dn_diff_logit_align_start_epoch": int(getattr(args, "dn_diff_logit_align_start_epoch", 30)),
+            "dn_diff_cond_diagnostic": str(getattr(args, "dn_diff_cond_diagnostic", "none")),
         }
         for i, load_i in enumerate(train_moe_expert_load):
             record[f"train_moe_expert_{i}_load"] = float(load_i)
@@ -5024,7 +5552,7 @@ def train(args: argparse.Namespace) -> None:
             record["eta_pearson"] = float(noise_calib.get("eta_pearson", 0.0))
             record["eta_spearman"] = float(noise_calib.get("eta_spearman", 0.0))
         for k, v in val_summary.items():
-            if k.startswith("moe_"):
+            if k.startswith("moe_") or k.startswith("dn_diff_"):
                 record[f"val_{k}"] = float(v)
         write_jsonl(metrics_path, record)
 
@@ -5137,6 +5665,8 @@ def train(args: argparse.Namespace) -> None:
 
 def run_eval(args: argparse.Namespace) -> None:
     apply_preset(args)
+    if bool(getattr(args, "dn_diff_enable", False)) and args.arch != "cldnn":
+        raise ValueError("dn_diff_enable is currently supported only for --arch cldnn.")
     if bool(getattr(args, "cldnn_snr_cond", False)) and bool(getattr(args, "cldnn_noise_cond", False)):
         raise ValueError("Use only one conditioning path: --cldnn-snr-cond OR --cldnn-noise-cond.")
     if args.arch != "cldnn" and (
@@ -5250,6 +5780,24 @@ def run_eval(args: argparse.Namespace) -> None:
             moe_gate_tau=float(getattr(args, "moe_gate_tau", 0.3)),
             moe_gate_use_feat=bool(getattr(args, "moe_gate_use_feat", False)),
             supcon_proj_dim=int(getattr(args, 'supcon_proj_dim', 0)) if getattr(args, 'supcon', False) else 0,
+            dn_diff_enable=bool(getattr(args, "dn_diff_enable", False)),
+            dn_diff_target=str(getattr(args, "dn_diff_target", "v")),
+            dn_diff_train_timesteps=int(getattr(args, "dn_diff_train_timesteps", 100)),
+            dn_diff_eval_mode=str(getattr(args, "dn_diff_eval_mode", "ddim")),
+            dn_diff_eval_steps=int(getattr(args, "dn_diff_eval_steps", 8)),
+            dn_diff_ddim_eta=float(getattr(args, "dn_diff_ddim_eta", 0.0)),
+            dn_diff_multisample=int(getattr(args, "dn_diff_multisample", 1)),
+            dn_diff_eval_t_start_source=str(getattr(args, "dn_diff_eval_t_start_source", "snr_pred")),
+            dn_diff_fixed_t_start=int(getattr(args, "dn_diff_fixed_t_start", 30)),
+            dn_diff_snr2t_scale=float(getattr(args, "dn_diff_snr2t_scale", 1.0)),
+            dn_diff_snr2t_bias=float(getattr(args, "dn_diff_snr2t_bias", 0.0)),
+            dn_diff_low_snr_thresh=float(getattr(args, "dn_diff_low_snr_thresh", -6.0)),
+            dn_diff_high_snr_margin=float(getattr(args, "dn_diff_high_snr_margin", 2.0)),
+            dn_diff_hard_bypass_high_snr=bool(getattr(args, "dn_diff_hard_bypass_high_snr", True)),
+            dn_diff_cond_diagnostic=str(getattr(args, "dn_diff_cond_diagnostic", "none")),
+            dn_diff_force_deterministic_multisample=bool(
+                getattr(args, "dn_diff_force_deterministic_multisample", False)
+            ),
         ).to(device)
 
     if args.ckpt is None:
