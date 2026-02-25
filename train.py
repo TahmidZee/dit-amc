@@ -1612,6 +1612,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=0)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument(
+        "--early-stop-start-epoch",
+        type=int,
+        default=0,
+        help="Apply early stopping only at/after this 1-based epoch index (0 disables the start gate).",
+    )
+    parser.add_argument(
         "--snr-floor-db",
         type=float,
         default=None,
@@ -2871,6 +2877,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--cldnn-expert-eta-gate requires --cldnn-expert-features.")
     if int(getattr(args, "stage_a_epochs", 0)) < 0 or int(getattr(args, "stage_b_epochs", 0)) < 0:
         raise ValueError("stage_a_epochs and stage_b_epochs must be >= 0.")
+    if int(getattr(args, "early_stop_patience", 0)) < 0:
+        raise ValueError("early_stop_patience must be >= 0.")
+    if int(getattr(args, "early_stop_start_epoch", 0)) < 0:
+        raise ValueError("early_stop_start_epoch must be >= 0.")
     if int(getattr(args, "feat_ramp_epochs", 0)) < 0:
         raise ValueError("feat_ramp_epochs must be >= 0.")
     if float(getattr(args, "lambda_feat", 0.0)) > 0 and not bool(getattr(args, "cldnn_denoiser", False)):
@@ -3449,6 +3459,7 @@ def train(args: argparse.Namespace) -> None:
     best_val = -1.0
     best_epoch = None
     epochs_no_improve = 0
+    early_stop_start_epoch = int(getattr(args, "early_stop_start_epoch", 0))
 
     # =========================================================================
     # MOCO-V2 PRE-TRAINING PHASE (if enabled)
@@ -5512,6 +5523,9 @@ def train(args: argparse.Namespace) -> None:
             "curriculum_soft_low_weight": float(getattr(args, "curriculum_soft_low_weight", 0.1)),
             "mixup_snr_min": getattr(args, "mixup_snr_min", None),
             "mixup_cls_only": bool(getattr(args, "mixup_cls_only", True)),
+            "early_stop_patience": int(getattr(args, "early_stop_patience", 0)),
+            "early_stop_min_delta": float(getattr(args, "early_stop_min_delta", 0.0)),
+            "early_stop_start_epoch": int(early_stop_start_epoch),
             "cldnn_backbone": str(getattr(args, "cldnn_backbone", "lstm")),
             "cldnn_tcn_levels": int(getattr(args, "cldnn_tcn_levels", 6)),
             "cldnn_tcn_channels": int(getattr(args, "cldnn_tcn_channels", 128)),
@@ -5599,7 +5613,11 @@ def train(args: argparse.Namespace) -> None:
             f"val_acc={val_acc:.4f}"
         )
 
-        if args.early_stop_patience and args.early_stop_patience > 0:
+        if (
+            args.early_stop_patience
+            and args.early_stop_patience > 0
+            and (early_stop_start_epoch <= 0 or (epoch + 1) >= early_stop_start_epoch)
+        ):
             if epochs_no_improve >= int(args.early_stop_patience):
                 tqdm.write(
                     f"Early stopping at epoch {epoch + 1}: no val_acc improvement for "
