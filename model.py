@@ -564,6 +564,134 @@ class TemporalAttentionPool(nn.Module):
         return pooled, w
 
 
+class TemporalResidualBlock1D(nn.Module):
+    """Residual 1D block with optional channel projection."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int = 3,
+        dilation: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        k = int(kernel_size)
+        d = int(dilation)
+        if k <= 0 or (k % 2) == 0:
+            raise ValueError("TemporalResidualBlock1D requires odd kernel_size > 0.")
+        if d <= 0:
+            raise ValueError("TemporalResidualBlock1D requires dilation > 0.")
+        pad = (k // 2) * d
+        self.conv1 = nn.Conv1d(int(in_channels), int(out_channels), kernel_size=k, padding=pad, dilation=d)
+        self.conv2 = nn.Conv1d(int(out_channels), int(out_channels), kernel_size=k, padding=pad, dilation=d)
+        self.bn1 = nn.BatchNorm1d(int(out_channels))
+        self.bn2 = nn.BatchNorm1d(int(out_channels))
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(float(dropout)) if float(dropout) > 0 else nn.Identity()
+        if int(in_channels) != int(out_channels):
+            self.skip = nn.Conv1d(int(in_channels), int(out_channels), kernel_size=1)
+        else:
+            self.skip = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.skip(x)
+        y = self.conv1(x)
+        y = self.bn1(y)
+        y = self.act(y)
+        y = self.drop(y)
+        y = self.conv2(y)
+        y = self.bn2(y)
+        y = self.act(y)
+        return y + residual
+
+
+class TemporalBackboneTCN(nn.Module):
+    """Dilated temporal ConvNet that maps (B,C,T) to (B,T,D)."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        channels: int = 128,
+        levels: int = 6,
+        kernel_size: int = 3,
+        dilation_base: int = 2,
+        dropout: float = 0.15,
+    ) -> None:
+        super().__init__()
+        if int(levels) <= 0:
+            raise ValueError("TemporalBackboneTCN requires levels > 0.")
+        if int(channels) <= 0:
+            raise ValueError("TemporalBackboneTCN requires channels > 0.")
+        if int(dilation_base) <= 0:
+            raise ValueError("TemporalBackboneTCN requires dilation_base > 0.")
+        blocks = []
+        c_in = int(in_channels)
+        c_out = int(channels)
+        base = int(dilation_base)
+        for i in range(int(levels)):
+            d = int(base ** i)
+            blocks.append(
+                TemporalResidualBlock1D(
+                    in_channels=c_in,
+                    out_channels=c_out,
+                    kernel_size=int(kernel_size),
+                    dilation=d,
+                    dropout=float(dropout),
+                )
+            )
+            c_in = c_out
+        self.blocks = nn.Sequential(*blocks)
+        self.output_dim = c_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.blocks(x)
+        return y.transpose(1, 2)
+
+
+class TemporalBackboneResNet1D(nn.Module):
+    """Residual 1D stack with cyclical dilation; maps (B,C,T) to (B,T,D)."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        channels: int = 128,
+        blocks: int = 8,
+        kernel_size: int = 5,
+        dilation_cycle: int = 4,
+        dropout: float = 0.15,
+    ) -> None:
+        super().__init__()
+        if int(blocks) <= 0:
+            raise ValueError("TemporalBackboneResNet1D requires blocks > 0.")
+        if int(channels) <= 0:
+            raise ValueError("TemporalBackboneResNet1D requires channels > 0.")
+        if int(dilation_cycle) <= 0:
+            raise ValueError("TemporalBackboneResNet1D requires dilation_cycle > 0.")
+        c_in = int(in_channels)
+        c_out = int(channels)
+        cyc = int(dilation_cycle)
+        layers = []
+        for i in range(int(blocks)):
+            d = int(2 ** (i % cyc))
+            layers.append(
+                TemporalResidualBlock1D(
+                    in_channels=c_in,
+                    out_channels=c_out,
+                    kernel_size=int(kernel_size),
+                    dilation=d,
+                    dropout=float(dropout),
+                )
+            )
+            c_in = c_out
+        self.blocks = nn.Sequential(*layers)
+        self.output_dim = c_out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.blocks(x)
+        return y.transpose(1, 2)
+
+
 class MoEClassifierHead(nn.Module):
     """
     Mixture-of-Experts classifier head for CLDNN features.
@@ -937,7 +1065,7 @@ class CyclostationaryStats(nn.Module):
 
 class CLDNNAMC(nn.Module):
     """
-    K=1-first AMC model inspired by MCLDNN / CLDNN family (CNN + LSTM), implemented in PyTorch.
+    K=1-first AMC model inspired by MCLDNN / CLDNN family (CNN + temporal backbone), implemented in PyTorch.
 
     Design goals:
       - Strong inductive bias for short IQ sequences (e.g., L=128) and longer windows (e.g., L=1024)
@@ -958,6 +1086,17 @@ class CLDNNAMC(nn.Module):
         lstm_hidden: int = 128,
         lstm_layers: int = 2,
         bidirectional: bool = False,
+        cldnn_backbone: str = "lstm",  # lstm|tcn|resnet1d
+        cldnn_tcn_levels: int = 6,
+        cldnn_tcn_channels: int = 128,
+        cldnn_tcn_kernel: int = 3,
+        cldnn_tcn_dilation_base: int = 2,
+        cldnn_tcn_dropout: float = 0.15,
+        cldnn_resnet_blocks: int = 8,
+        cldnn_resnet_channels: int = 128,
+        cldnn_resnet_kernel: int = 5,
+        cldnn_resnet_dilation_cycle: int = 4,
+        cldnn_resnet_dropout: float = 0.15,
         dropout: float = 0.5,
         pool: str = "attn",  # attn|last|mean
         snr_cond: bool = False,  # Enable SNR conditioning via FiLM
@@ -1018,6 +1157,19 @@ class CLDNNAMC(nn.Module):
         self._snr_half_range_db = 0.5 * (self.snr_max_db - self.snr_min_db)
         self.time_out = max(1, self.seq_len - 4)  # after conv_merge / expert conv_reduce (kernel=5 valid)
         self.pool = pool
+        self.cldnn_backbone = str(cldnn_backbone).strip().lower()
+        if self.cldnn_backbone not in {"lstm", "tcn", "resnet1d"}:
+            raise ValueError("cldnn_backbone must be one of: lstm|tcn|resnet1d.")
+        self.cldnn_tcn_levels = int(cldnn_tcn_levels)
+        self.cldnn_tcn_channels = int(cldnn_tcn_channels)
+        self.cldnn_tcn_kernel = int(cldnn_tcn_kernel)
+        self.cldnn_tcn_dilation_base = int(cldnn_tcn_dilation_base)
+        self.cldnn_tcn_dropout = float(cldnn_tcn_dropout)
+        self.cldnn_resnet_blocks = int(cldnn_resnet_blocks)
+        self.cldnn_resnet_channels = int(cldnn_resnet_channels)
+        self.cldnn_resnet_kernel = int(cldnn_resnet_kernel)
+        self.cldnn_resnet_dilation_cycle = int(cldnn_resnet_dilation_cycle)
+        self.cldnn_resnet_dropout = float(cldnn_resnet_dropout)
         self.snr_cond = bool(snr_cond)
         self.noise_cond = bool(noise_cond)
         self.snr_loss_detach_backbone = bool(snr_loss_detach_backbone)
@@ -1107,6 +1259,26 @@ class CLDNNAMC(nn.Module):
         if self.moe_n_experts == 1:
             # Keep compatibility: MoE disabled in single-expert mode regardless of gate settings.
             self.moe_gate_type = "eta-sigmoid"
+        if self.cldnn_tcn_levels <= 0:
+            raise ValueError("cldnn_tcn_levels must be > 0.")
+        if self.cldnn_tcn_channels <= 0:
+            raise ValueError("cldnn_tcn_channels must be > 0.")
+        if self.cldnn_tcn_kernel <= 0 or (self.cldnn_tcn_kernel % 2) == 0:
+            raise ValueError("cldnn_tcn_kernel must be odd and > 0.")
+        if self.cldnn_tcn_dilation_base <= 0:
+            raise ValueError("cldnn_tcn_dilation_base must be > 0.")
+        if self.cldnn_tcn_dropout < 0.0:
+            raise ValueError("cldnn_tcn_dropout must be >= 0.")
+        if self.cldnn_resnet_blocks <= 0:
+            raise ValueError("cldnn_resnet_blocks must be > 0.")
+        if self.cldnn_resnet_channels <= 0:
+            raise ValueError("cldnn_resnet_channels must be > 0.")
+        if self.cldnn_resnet_kernel <= 0 or (self.cldnn_resnet_kernel % 2) == 0:
+            raise ValueError("cldnn_resnet_kernel must be odd and > 0.")
+        if self.cldnn_resnet_dilation_cycle <= 0:
+            raise ValueError("cldnn_resnet_dilation_cycle must be > 0.")
+        if self.cldnn_resnet_dropout < 0.0:
+            raise ValueError("cldnn_resnet_dropout must be >= 0.")
 
         # Branch 1: IQ joint Conv2D over (2 x L) per path.
         self.conv_iq = nn.Conv2d(
@@ -1157,13 +1329,10 @@ class CLDNNAMC(nn.Module):
             reduce_in = merge_channels
 
         # -----------------------------------------------------------------
-        # Temporal reduction: strided convolutions to reduce T before LSTM.
-        # For L=128 → time_out=124 → no reduction needed.
-        # For L=1024 → time_out=1020 → reduce by ~8x to ~128 steps.
-        # Each stride-2 conv halves the sequence; we stack enough to get
-        # close to the target of ~128 LSTM timesteps.
+        # Temporal reduction: strided convolutions to reduce T for the
+        # temporal backbone (LSTM/TCN/ResNet1D).
         # -----------------------------------------------------------------
-        self._target_lstm_len = 128  # aim for ~128 LSTM timesteps
+        self._target_lstm_len = 128  # historical target for temporal sequence length
         reduce_layers: list = []
         t_len = self.time_out
         while t_len > self._target_lstm_len * 1.5:
@@ -1182,22 +1351,47 @@ class CLDNNAMC(nn.Module):
             self.temporal_reduce = nn.Sequential(*reduce_layers)
         else:
             self.temporal_reduce = None
-        lstm_input_size = reduce_in
+        temporal_input_size = reduce_in
         self._lstm_time_len = t_len  # actual length after reduction
 
-        # LSTM over (possibly reduced) time axis
-        self.lstm = nn.LSTM(
-            input_size=lstm_input_size,
-            hidden_size=lstm_hidden,
-            num_layers=int(lstm_layers),
-            batch_first=True,
-            bidirectional=bool(bidirectional),
-            dropout=float(dropout) if int(lstm_layers) > 1 else 0.0,
-        )
-        lstm_out_dim = lstm_hidden * (2 if bidirectional else 1)
-        self.lstm_out_dim = lstm_out_dim
-
-        self.attn_pool = TemporalAttentionPool(lstm_out_dim, hidden=max(64, lstm_out_dim // 2))
+        self.tcn_backbone: Optional[TemporalBackboneTCN] = None
+        self.resnet_backbone: Optional[TemporalBackboneResNet1D] = None
+        if self.cldnn_backbone == "lstm":
+            # Preserve legacy default path exactly.
+            self.lstm = nn.LSTM(
+                input_size=temporal_input_size,
+                hidden_size=lstm_hidden,
+                num_layers=int(lstm_layers),
+                batch_first=True,
+                bidirectional=bool(bidirectional),
+                dropout=float(dropout) if int(lstm_layers) > 1 else 0.0,
+            )
+            temporal_out_dim = lstm_hidden * (2 if bidirectional else 1)
+        elif self.cldnn_backbone == "tcn":
+            self.lstm = None
+            self.tcn_backbone = TemporalBackboneTCN(
+                in_channels=temporal_input_size,
+                channels=self.cldnn_tcn_channels,
+                levels=self.cldnn_tcn_levels,
+                kernel_size=self.cldnn_tcn_kernel,
+                dilation_base=self.cldnn_tcn_dilation_base,
+                dropout=self.cldnn_tcn_dropout,
+            )
+            temporal_out_dim = int(self.tcn_backbone.output_dim)
+        else:
+            self.lstm = None
+            self.resnet_backbone = TemporalBackboneResNet1D(
+                in_channels=temporal_input_size,
+                channels=self.cldnn_resnet_channels,
+                blocks=self.cldnn_resnet_blocks,
+                kernel_size=self.cldnn_resnet_kernel,
+                dilation_cycle=self.cldnn_resnet_dilation_cycle,
+                dropout=self.cldnn_resnet_dropout,
+            )
+            temporal_out_dim = int(self.resnet_backbone.output_dim)
+        self.temporal_out_dim = temporal_out_dim
+        self.lstm_out_dim = temporal_out_dim
+        self.attn_pool = TemporalAttentionPool(temporal_out_dim, hidden=max(64, temporal_out_dim // 2))
 
         # Conditioning path: either SNR-FiLM or noise-fraction-FiLM (eta).
         if self.snr_cond:
@@ -1208,8 +1402,8 @@ class CLDNNAMC(nn.Module):
                 nn.GELU(),
             )
             # FiLM: gamma (scale) and beta (shift) for the pooled feature
-            self.film_gamma = nn.Linear(snr_embed_dim, lstm_out_dim)
-            self.film_beta = nn.Linear(snr_embed_dim, lstm_out_dim)
+            self.film_gamma = nn.Linear(snr_embed_dim, temporal_out_dim)
+            self.film_beta = nn.Linear(snr_embed_dim, temporal_out_dim)
             # Stabilize training: start FiLM close to identity (gamma≈1, beta≈0)
             nn.init.zeros_(self.film_gamma.weight)
             nn.init.ones_(self.film_gamma.bias)
@@ -1228,15 +1422,15 @@ class CLDNNAMC(nn.Module):
             # Learn a residual correction on top of an analytic monotonic proxy.
             self.noise_proxy_scale_raw = nn.Parameter(torch.tensor(1.0))
             self.noise_proxy_bias = nn.Parameter(torch.tensor(0.0))
-            self.noise_delta_head = nn.Linear(lstm_out_dim, 1)
+            self.noise_delta_head = nn.Linear(temporal_out_dim, 1)
             self.noise_embed = nn.Sequential(
                 nn.Linear(1, snr_embed_dim),
                 nn.GELU(),
                 nn.Linear(snr_embed_dim, snr_embed_dim),
                 nn.GELU(),
             )
-            self.noise_film_gamma = nn.Linear(snr_embed_dim, lstm_out_dim)
-            self.noise_film_beta = nn.Linear(snr_embed_dim, lstm_out_dim)
+            self.noise_film_gamma = nn.Linear(snr_embed_dim, temporal_out_dim)
+            self.noise_film_beta = nn.Linear(snr_embed_dim, temporal_out_dim)
             nn.init.zeros_(self.noise_film_gamma.weight)
             nn.init.ones_(self.noise_film_gamma.bias)
             nn.init.zeros_(self.noise_film_beta.weight)
@@ -1275,7 +1469,7 @@ class CLDNNAMC(nn.Module):
 
         # Classifier head — auto-scale hidden size to num_classes
         n_cyclo = self.cyclo_stats.N_STATS if self.cyclo_stats is not None else 0
-        cls_input_dim = lstm_out_dim + n_cyclo
+        cls_input_dim = temporal_out_dim + n_cyclo
         if cls_hidden > 0:
             _cls_h = int(cls_hidden)
         else:
@@ -1299,7 +1493,7 @@ class CLDNNAMC(nn.Module):
             )
 
         # SNR head for auxiliary supervision and predict-mode FiLM
-        self.snr_head = nn.Linear(lstm_out_dim, 1)
+        self.snr_head = nn.Linear(temporal_out_dim, 1)
 
         # SupCon projection head (optional).  Maps pre-FiLM pooled features
         # to a low-dim L2-normalised space for supervised contrastive loss.
@@ -1307,10 +1501,10 @@ class CLDNNAMC(nn.Module):
         self.supcon_proj_dim = int(supcon_proj_dim)
         if self.supcon_proj_dim > 0:
             self.proj_head = nn.Sequential(
-                nn.Linear(lstm_out_dim, lstm_out_dim),
-                nn.BatchNorm1d(lstm_out_dim),
+                nn.Linear(temporal_out_dim, temporal_out_dim),
+                nn.BatchNorm1d(temporal_out_dim),
                 nn.ReLU(inplace=True),
-                nn.Linear(lstm_out_dim, self.supcon_proj_dim),
+                nn.Linear(temporal_out_dim, self.supcon_proj_dim),
             )
         else:
             self.proj_head = None
@@ -1557,7 +1751,7 @@ class CLDNNAMC(nn.Module):
         snr_flat: (B*,) optional SNR values for conditioning
         snr_mode: "known" | "predict" | "none"
         returns:
-          feat: (B*, D_cls) where D_cls = lstm_out_dim + n_global_stats (if expert)
+          feat: (B*, D_cls) where D_cls = temporal_out_dim + n_global_stats (if expert)
           snr_pred: (B*,)
         """
         b = x_flat.shape[0]
@@ -1622,16 +1816,25 @@ class CLDNNAMC(nn.Module):
         if self.temporal_reduce is not None:
             h = self.temporal_reduce(h)  # (B, C, T_reduced)
 
-        # (B, C, T) → (B, T, C) for LSTM
-        h = h.transpose(1, 2)
+        # Temporal backbone (LSTM, TCN, or ResNet1D) -> (B, T, D)
+        if self.cldnn_backbone == "lstm":
+            h_seq = h.transpose(1, 2)
+            temporal_out, _ = self.lstm(h_seq)  # type: ignore[arg-type]
+        elif self.cldnn_backbone == "tcn":
+            if self.tcn_backbone is None:
+                raise RuntimeError("TCN backbone selected but not initialized.")
+            temporal_out = self.tcn_backbone(h)
+        else:
+            if self.resnet_backbone is None:
+                raise RuntimeError("ResNet1D backbone selected but not initialized.")
+            temporal_out = self.resnet_backbone(h)
 
-        lstm_out, _ = self.lstm(h)  # (B, T, D)
         if self.pool == "attn":
-            feat, _w = self.attn_pool(lstm_out)
+            feat, _w = self.attn_pool(temporal_out)
         elif self.pool == "mean":
-            feat = lstm_out.mean(dim=1)
+            feat = temporal_out.mean(dim=1)
         else:  # last
-            feat = lstm_out[:, -1, :]
+            feat = temporal_out[:, -1, :]
 
         # Predict SNR from features (before FiLM, so it's not circular)
         feat_for_snr = feat.detach() if self.snr_loss_detach_backbone else feat

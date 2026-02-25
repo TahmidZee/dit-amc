@@ -1026,7 +1026,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=["dit", "cldnn", "multiview"],
         default="dit",
-        help="Model architecture. dit=DiffusionAMC. cldnn=CNN+LSTM. multiview=IQ+STFT dual-branch with cross-view attention.",
+        help="Model architecture. dit=DiffusionAMC. cldnn=CNN+temporal backbone (LSTM/TCN/ResNet1D). multiview=IQ+STFT dual-branch with cross-view attention.",
     )
 
     parser.add_argument("--patch-size", type=int, default=None)
@@ -1049,7 +1049,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cldnn-lstm-hidden", type=int, default=128, help="LSTM hidden size.")
     parser.add_argument("--cldnn-lstm-layers", type=int, default=2, help="Number of LSTM layers.")
     parser.add_argument("--cldnn-bidir", action="store_true", help="Use bidirectional LSTM.")
-    parser.add_argument("--cldnn-pool", type=str, default="attn", choices=["attn", "last", "mean"], help="Temporal pooling over LSTM outputs.")
+    parser.add_argument(
+        "--cldnn-backbone",
+        type=str,
+        choices=["lstm", "tcn", "resnet1d"],
+        default="lstm",
+        help="Temporal backbone for CLDNN classifier path.",
+    )
+    parser.add_argument("--cldnn-tcn-levels", type=int, default=6, help="Number of dilated residual blocks in TCN backbone.")
+    parser.add_argument("--cldnn-tcn-channels", type=int, default=128, help="Hidden channels in TCN backbone.")
+    parser.add_argument("--cldnn-tcn-kernel", type=int, default=3, help="Kernel size for TCN residual convolutions (odd).")
+    parser.add_argument("--cldnn-tcn-dilation-base", type=int, default=2, help="Dilation growth base for TCN levels.")
+    parser.add_argument("--cldnn-tcn-dropout", type=float, default=0.15, help="Dropout used inside TCN residual blocks.")
+    parser.add_argument("--cldnn-resnet-blocks", type=int, default=8, help="Number of residual blocks in ResNet1D backbone.")
+    parser.add_argument("--cldnn-resnet-channels", type=int, default=128, help="Hidden channels in ResNet1D backbone.")
+    parser.add_argument("--cldnn-resnet-kernel", type=int, default=5, help="Kernel size for ResNet1D convolutions (odd).")
+    parser.add_argument("--cldnn-resnet-dilation-cycle", type=int, default=4, help="Dilation cycle length for ResNet1D blocks.")
+    parser.add_argument("--cldnn-resnet-dropout", type=float, default=0.15, help="Dropout used inside ResNet1D residual blocks.")
+    parser.add_argument("--cldnn-pool", type=str, default="attn", choices=["attn", "last", "mean"], help="Temporal pooling over backbone sequence outputs.")
     parser.add_argument("--cldnn-snr-cond", action="store_true", help="Enable SNR conditioning via FiLM for CLDNN.")
     parser.add_argument("--cldnn-noise-cond", action="store_true", help="Enable noise-fraction conditioning via eta=logit(rho) FiLM for CLDNN.")
     parser.add_argument("--cldnn-denoiser", action="store_true", help="Enable residual conditional U-Net denoiser preprocessor.")
@@ -1826,6 +1843,17 @@ def build_model_from_cfg(
             lstm_hidden=int(_cfg_get(cfg, fallback, "cldnn_lstm_hidden", 128)),
             lstm_layers=int(_cfg_get(cfg, fallback, "cldnn_lstm_layers", 2)),
             bidirectional=bool(_cfg_get(cfg, fallback, "cldnn_bidir", False)),
+            cldnn_backbone=str(_cfg_get(cfg, fallback, "cldnn_backbone", "lstm")),
+            cldnn_tcn_levels=int(_cfg_get(cfg, fallback, "cldnn_tcn_levels", 6)),
+            cldnn_tcn_channels=int(_cfg_get(cfg, fallback, "cldnn_tcn_channels", 128)),
+            cldnn_tcn_kernel=int(_cfg_get(cfg, fallback, "cldnn_tcn_kernel", 3)),
+            cldnn_tcn_dilation_base=int(_cfg_get(cfg, fallback, "cldnn_tcn_dilation_base", 2)),
+            cldnn_tcn_dropout=float(_cfg_get(cfg, fallback, "cldnn_tcn_dropout", 0.15)),
+            cldnn_resnet_blocks=int(_cfg_get(cfg, fallback, "cldnn_resnet_blocks", 8)),
+            cldnn_resnet_channels=int(_cfg_get(cfg, fallback, "cldnn_resnet_channels", 128)),
+            cldnn_resnet_kernel=int(_cfg_get(cfg, fallback, "cldnn_resnet_kernel", 5)),
+            cldnn_resnet_dilation_cycle=int(_cfg_get(cfg, fallback, "cldnn_resnet_dilation_cycle", 4)),
+            cldnn_resnet_dropout=float(_cfg_get(cfg, fallback, "cldnn_resnet_dropout", 0.15)),
             dropout=float(_cfg_get(cfg, fallback, "dropout", 0.1)),
             pool=str(_cfg_get(cfg, fallback, "cldnn_pool", "attn")),
             snr_cond=bool(_cfg_get(cfg, fallback, "cldnn_snr_cond", False)),
@@ -2588,6 +2616,32 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("Noise/denoiser options are currently supported only for --arch cldnn.")
     if bool(getattr(args, "cldnn_denoiser_dual_path", False)) and not bool(getattr(args, "cldnn_denoiser", False)):
         raise ValueError("--cldnn-denoiser-dual-path requires --cldnn-denoiser.")
+    if args.arch == "cldnn":
+        cldnn_backbone = str(getattr(args, "cldnn_backbone", "lstm")).strip().lower()
+        if cldnn_backbone not in {"lstm", "tcn", "resnet1d"}:
+            raise ValueError("cldnn_backbone must be one of: lstm|tcn|resnet1d.")
+        if int(getattr(args, "cldnn_tcn_levels", 6)) <= 0:
+            raise ValueError("cldnn_tcn_levels must be > 0.")
+        if int(getattr(args, "cldnn_tcn_channels", 128)) <= 0:
+            raise ValueError("cldnn_tcn_channels must be > 0.")
+        tcn_k = int(getattr(args, "cldnn_tcn_kernel", 3))
+        if tcn_k <= 0 or (tcn_k % 2) == 0:
+            raise ValueError("cldnn_tcn_kernel must be odd and > 0.")
+        if int(getattr(args, "cldnn_tcn_dilation_base", 2)) <= 0:
+            raise ValueError("cldnn_tcn_dilation_base must be > 0.")
+        if float(getattr(args, "cldnn_tcn_dropout", 0.15)) < 0.0:
+            raise ValueError("cldnn_tcn_dropout must be >= 0.")
+        if int(getattr(args, "cldnn_resnet_blocks", 8)) <= 0:
+            raise ValueError("cldnn_resnet_blocks must be > 0.")
+        if int(getattr(args, "cldnn_resnet_channels", 128)) <= 0:
+            raise ValueError("cldnn_resnet_channels must be > 0.")
+        res_k = int(getattr(args, "cldnn_resnet_kernel", 5))
+        if res_k <= 0 or (res_k % 2) == 0:
+            raise ValueError("cldnn_resnet_kernel must be odd and > 0.")
+        if int(getattr(args, "cldnn_resnet_dilation_cycle", 4)) <= 0:
+            raise ValueError("cldnn_resnet_dilation_cycle must be > 0.")
+        if float(getattr(args, "cldnn_resnet_dropout", 0.15)) < 0.0:
+            raise ValueError("cldnn_resnet_dropout must be >= 0.")
     raw_drop_prob = float(getattr(args, "cldnn_raw_low_snr_drop_prob", 0.0))
     raw_drop_min = float(getattr(args, "cldnn_raw_low_snr_drop_min_scale", 0.0))
     raw_drop_max = float(getattr(args, "cldnn_raw_low_snr_drop_max_scale", 0.0))
@@ -2886,6 +2940,17 @@ def train(args: argparse.Namespace) -> None:
             lstm_hidden=int(args.cldnn_lstm_hidden),
             lstm_layers=int(args.cldnn_lstm_layers),
             bidirectional=bool(args.cldnn_bidir),
+            cldnn_backbone=str(getattr(args, "cldnn_backbone", "lstm")),
+            cldnn_tcn_levels=int(getattr(args, "cldnn_tcn_levels", 6)),
+            cldnn_tcn_channels=int(getattr(args, "cldnn_tcn_channels", 128)),
+            cldnn_tcn_kernel=int(getattr(args, "cldnn_tcn_kernel", 3)),
+            cldnn_tcn_dilation_base=int(getattr(args, "cldnn_tcn_dilation_base", 2)),
+            cldnn_tcn_dropout=float(getattr(args, "cldnn_tcn_dropout", 0.15)),
+            cldnn_resnet_blocks=int(getattr(args, "cldnn_resnet_blocks", 8)),
+            cldnn_resnet_channels=int(getattr(args, "cldnn_resnet_channels", 128)),
+            cldnn_resnet_kernel=int(getattr(args, "cldnn_resnet_kernel", 5)),
+            cldnn_resnet_dilation_cycle=int(getattr(args, "cldnn_resnet_dilation_cycle", 4)),
+            cldnn_resnet_dropout=float(getattr(args, "cldnn_resnet_dropout", 0.15)),
             dropout=float(args.dropout),
             pool=str(args.cldnn_pool),
             snr_cond=bool(args.cldnn_snr_cond),
@@ -3038,6 +3103,17 @@ def train(args: argparse.Namespace) -> None:
                 lstm_hidden=int(args.cldnn_lstm_hidden),
                 lstm_layers=int(args.cldnn_lstm_layers),
                 bidirectional=bool(args.cldnn_bidir),
+                cldnn_backbone=str(getattr(args, "cldnn_backbone", "lstm")),
+                cldnn_tcn_levels=int(getattr(args, "cldnn_tcn_levels", 6)),
+                cldnn_tcn_channels=int(getattr(args, "cldnn_tcn_channels", 128)),
+                cldnn_tcn_kernel=int(getattr(args, "cldnn_tcn_kernel", 3)),
+                cldnn_tcn_dilation_base=int(getattr(args, "cldnn_tcn_dilation_base", 2)),
+                cldnn_tcn_dropout=float(getattr(args, "cldnn_tcn_dropout", 0.15)),
+                cldnn_resnet_blocks=int(getattr(args, "cldnn_resnet_blocks", 8)),
+                cldnn_resnet_channels=int(getattr(args, "cldnn_resnet_channels", 128)),
+                cldnn_resnet_kernel=int(getattr(args, "cldnn_resnet_kernel", 5)),
+                cldnn_resnet_dilation_cycle=int(getattr(args, "cldnn_resnet_dilation_cycle", 4)),
+                cldnn_resnet_dropout=float(getattr(args, "cldnn_resnet_dropout", 0.15)),
                 dropout=float(args.dropout),
                 pool=str(args.cldnn_pool),
                 snr_cond=bool(args.cldnn_snr_cond),
@@ -4930,6 +5006,13 @@ def train(args: argparse.Namespace) -> None:
             "curriculum_soft_low_weight": float(getattr(args, "curriculum_soft_low_weight", 0.1)),
             "mixup_snr_min": getattr(args, "mixup_snr_min", None),
             "mixup_cls_only": bool(getattr(args, "mixup_cls_only", True)),
+            "cldnn_backbone": str(getattr(args, "cldnn_backbone", "lstm")),
+            "cldnn_tcn_levels": int(getattr(args, "cldnn_tcn_levels", 6)),
+            "cldnn_tcn_channels": int(getattr(args, "cldnn_tcn_channels", 128)),
+            "cldnn_tcn_kernel": int(getattr(args, "cldnn_tcn_kernel", 3)),
+            "cldnn_resnet_blocks": int(getattr(args, "cldnn_resnet_blocks", 8)),
+            "cldnn_resnet_channels": int(getattr(args, "cldnn_resnet_channels", 128)),
+            "cldnn_resnet_kernel": int(getattr(args, "cldnn_resnet_kernel", 5)),
             "cldnn_noise_cond": bool(getattr(args, "cldnn_noise_cond", False)),
             "cldnn_denoiser": bool(getattr(args, "cldnn_denoiser", False)),
         }
@@ -5060,6 +5143,7 @@ def run_eval(args: argparse.Namespace) -> None:
         bool(getattr(args, "cldnn_noise_cond", False)) or bool(getattr(args, "cldnn_denoiser", False))
     ):
         raise ValueError("Noise/denoiser options are currently supported only for --arch cldnn.")
+    os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     _, _, test_loader, mods, snrs, seq_len = build_loaders(args, device)
     snr_min_db = float(min(snrs)) if snrs else -20.0
@@ -5111,6 +5195,17 @@ def run_eval(args: argparse.Namespace) -> None:
             lstm_hidden=int(args.cldnn_lstm_hidden),
             lstm_layers=int(args.cldnn_lstm_layers),
             bidirectional=bool(args.cldnn_bidir),
+            cldnn_backbone=str(getattr(args, "cldnn_backbone", "lstm")),
+            cldnn_tcn_levels=int(getattr(args, "cldnn_tcn_levels", 6)),
+            cldnn_tcn_channels=int(getattr(args, "cldnn_tcn_channels", 128)),
+            cldnn_tcn_kernel=int(getattr(args, "cldnn_tcn_kernel", 3)),
+            cldnn_tcn_dilation_base=int(getattr(args, "cldnn_tcn_dilation_base", 2)),
+            cldnn_tcn_dropout=float(getattr(args, "cldnn_tcn_dropout", 0.15)),
+            cldnn_resnet_blocks=int(getattr(args, "cldnn_resnet_blocks", 8)),
+            cldnn_resnet_channels=int(getattr(args, "cldnn_resnet_channels", 128)),
+            cldnn_resnet_kernel=int(getattr(args, "cldnn_resnet_kernel", 5)),
+            cldnn_resnet_dilation_cycle=int(getattr(args, "cldnn_resnet_dilation_cycle", 4)),
+            cldnn_resnet_dropout=float(getattr(args, "cldnn_resnet_dropout", 0.15)),
             dropout=float(args.dropout),
             pool=str(args.cldnn_pool),
             snr_cond=bool(args.cldnn_snr_cond),
@@ -5179,17 +5274,13 @@ def run_eval(args: argparse.Namespace) -> None:
         moe_transition_snr_lo=float(getattr(args, "moe_transition_snr_lo", -8.0)),
         moe_transition_snr_hi=float(getattr(args, "moe_transition_snr_hi", -2.0)),
     )
+    with open(os.path.join(args.out_dir, "test_acc_by_snr.json"), "w", encoding="utf-8") as f:
+        json.dump(test_acc_by_snr, f, indent=2)
+    with open(os.path.join(args.out_dir, "test_macro_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(test_summary, f, indent=2)
     print(f"Test acc: {test_acc:.4f}")
     print("Test acc by SNR:", test_acc_by_snr)
-    print(
-        "Test macro summary:",
-        {
-            "macro_acc": float(test_summary.get("macro_acc", 0.0)),
-            "macro_f1": float(test_summary.get("macro_f1", 0.0)),
-            "low_macro_acc": float(test_summary.get("low_macro_acc", 0.0)),
-            "low_macro_f1": float(test_summary.get("low_macro_f1", 0.0)),
-        },
-    )
+    print("Test macro summary:", test_summary)
 
 
 def _resolve_dataset_defaults(args: argparse.Namespace) -> None:

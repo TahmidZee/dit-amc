@@ -681,3 +681,71 @@ Machine path reminder:
 - Wave 5C combines the best of all prior techniques on the new architecture.
 - Wave 5D provides a clean inference-time path (TTA + ensemble) for the final push to 0.70.
 - The plan has explicit go/no-go gates at each wave, with fallback strategies if milestones are missed.
+
+---
+
+## Wave 5D Refresh (2026-02-25, ACTIVE): CLDNN Temporal Backbone Pivot
+
+This section supersedes the earlier "Wave 5D inference-time TTA/ensemble" section for current execution.
+
+### Why the pivot
+
+- W5B.3/W5B.4 showed the oracle-routing confound was real, but MoE specialization still did not deliver a deployable gain.
+- W5C-SSLv2 runs were materially worse than anchor, so the current SSL stack is not the next high-ROI lever.
+- The best remaining lever is representation architecture while keeping the rest of the recipe fixed.
+
+### Implemented code for this wave
+
+- `--cldnn-backbone {lstm,tcn,resnet1d}` with default `lstm`
+- TCN controls:
+  - `--cldnn-tcn-levels`
+  - `--cldnn-tcn-channels`
+  - `--cldnn-tcn-kernel`
+  - `--cldnn-tcn-dilation-base`
+  - `--cldnn-tcn-dropout`
+- ResNet1D controls:
+  - `--cldnn-resnet-blocks`
+  - `--cldnn-resnet-channels`
+  - `--cldnn-resnet-kernel`
+  - `--cldnn-resnet-dilation-cycle`
+  - `--cldnn-resnet-dropout`
+- `metrics.jsonl` now logs:
+  - `cldnn_backbone`
+  - `cldnn_tcn_levels/channels/kernel`
+  - `cldnn_resnet_blocks/channels/kernel`
+- `--eval-only` now persists:
+  - `test_acc_by_snr.json`
+  - `test_macro_summary.json`
+
+### Active 8-run pilot matrix (no-MoE)
+
+Common base:
+- `--arch cldnn --moe-n-experts 1 --snr-mode predict`
+- keep denoiser/noise/split/optimizer settings from anchor unchanged
+- `--epochs 120 --early-stop-patience 15 --early-stop-min-delta 0.0005`
+- seed `2016`
+
+| ID | Host | Run name | Delta flags |
+|---|---|---|---|
+| T0 | Goose | `w5d_tcn_l6_c128_k3` | `--cldnn-backbone tcn --cldnn-tcn-levels 6 --cldnn-tcn-channels 128 --cldnn-tcn-kernel 3` |
+| R0 | Goose | `w5d_res_b8_c128_k5` | `--cldnn-backbone resnet1d --cldnn-resnet-blocks 8 --cldnn-resnet-channels 128 --cldnn-resnet-kernel 5` |
+| T1 | Athena | `w5d_tcn_l8_c128_k3` | T0 + `--cldnn-tcn-levels 8` |
+| T2 | Athena | `w5d_tcn_l6_c160_k3` | T0 + `--cldnn-tcn-channels 160` |
+| T3 | Athena | `w5d_tcn_l8_c160_k5` | `--cldnn-backbone tcn --cldnn-tcn-levels 8 --cldnn-tcn-channels 160 --cldnn-tcn-kernel 5` |
+| R1 | Athena | `w5d_res_b10_c128_k5` | R0 + `--cldnn-resnet-blocks 10` |
+| R2 | Athena | `w5d_res_b8_c160_k5` | R0 + `--cldnn-resnet-channels 160` |
+| R3 | Athena | `w5d_res_b10_c160_k7` | `--cldnn-backbone resnet1d --cldnn-resnet-blocks 10 --cldnn-resnet-channels 160 --cldnn-resnet-kernel 7` |
+
+### Decision gates (active)
+
+1. Feasibility gate:
+   - any run with `test_acc >= anchor + 0.003`
+   - low-band (`-20..-6`) gain `>= +0.010`
+   - high-band (`+6..+18`) drop `<= 0.003`
+2. Promotion gate:
+   - any run with `test_acc >= anchor + 0.008`
+   - low-band gain `>= +0.015`
+   - high-band drop `<= 0.003`
+3. If no feasibility pass:
+   - stop trunk hyperparameter sweep
+   - pivot to alternate architecture family already present (`multiview`) before any new SSL wave.
