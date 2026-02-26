@@ -5562,22 +5562,36 @@ def train(args: argparse.Namespace) -> None:
                 loss = loss + float(lambda_dn_diff_eff_cfg) * loss_dn_diff
                 loss = loss + float(getattr(args, "lambda_dn_recon", 0.0)) * loss_dn_recon
 
-                if float(lambda_dn_cls_eff_cfg) > 0.0:
+                # -- Shared classifier forward on denoised x0 --
+                # Used by both dn-cls loss and logit alignment; computed once
+                # to avoid a redundant classifier pass.
+                _need_dn_cls = float(lambda_dn_cls_eff_cfg) > 0.0
+                _need_dn_logit_align = (
+                    float(getattr(args, "lambda_dn_logit_align", 0.0)) > 0.0
+                    and epoch >= int(getattr(args, "dn_diff_logit_align_start_epoch", 30))
+                )
+                logits_dn_shared = None
+                if _need_dn_cls or _need_dn_logit_align:
                     if x_aux.ndim == 4:
                         x0_dn_cls = x0_dn.view(x_aux.shape[0], x_aux.shape[1], x_aux.shape[2], x_aux.shape[3])
                     else:
                         x0_dn_cls = x0_dn
                     t_dn_cls = torch.zeros((x_aux.shape[0],), device=device, dtype=torch.long)
-                    dn_cls_ctx = nullcontext()
+                    _dn_cls_ctx = nullcontext()
                     if bool(dn_diff_freeze_classifier_eff):
                         model_dn_cls = model.module if hasattr(model, "module") else model
                         backbone_name = str(getattr(model_dn_cls, "cldnn_backbone", "")).strip().lower()
                         if backbone_name == "lstm":
                             # Frozen-classifier mode keeps the stack in eval(); disable cuDNN
                             # for this auxiliary pass so RNN input-gradient backprop is valid.
-                            dn_cls_ctx = torch.backends.cudnn.flags(enabled=False)
-                    with dn_cls_ctx:
-                        logits_dn_cls, _, _ = model(
+                            _dn_cls_ctx = torch.backends.cudnn.flags(enabled=False)
+                    _amp_ctx_cls = (
+                        torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
+                        if amp_enabled
+                        else nullcontext()
+                    )
+                    with _dn_cls_ctx, _amp_ctx_cls:
+                        logits_dn_shared, _, _ = model(
                             x0_dn_cls,
                             t_dn_cls,
                             snr=snr_in_aux,
@@ -5586,15 +5600,17 @@ def train(args: argparse.Namespace) -> None:
                             denoiser_bypass=True,
                             **moe_kwargs_aux,
                         )
+
+                if _need_dn_cls:
                     if use_mixup and (not mixup_cls_only):
                         ce_dn_a = focal_cross_entropy(
-                            logits_dn_cls,
+                            logits_dn_shared,
                             y_a,
                             gamma=focal_gamma,
                             label_smoothing=float(args.label_smoothing),
                         )
                         ce_dn_b = focal_cross_entropy(
-                            logits_dn_cls,
+                            logits_dn_shared,
                             y_b,
                             gamma=focal_gamma,
                             label_smoothing=float(args.label_smoothing),
@@ -5602,7 +5618,7 @@ def train(args: argparse.Namespace) -> None:
                         ce_dn = lam * ce_dn_a + (1.0 - lam) * ce_dn_b
                     else:
                         ce_dn = focal_cross_entropy(
-                            logits_dn_cls,
+                            logits_dn_shared,
                             y,
                             gamma=focal_gamma,
                             label_smoothing=float(args.label_smoothing),
@@ -5639,34 +5655,18 @@ def train(args: argparse.Namespace) -> None:
                     loss_dn_feat_align = (feat_vec_dn * dn_loss_mask).sum() / dn_denom
                     loss = loss + float(getattr(args, "lambda_dn_feat_align", 0.0)) * loss_dn_feat_align
 
-                if (
-                    float(getattr(args, "lambda_dn_logit_align", 0.0)) > 0.0
-                    and epoch >= int(getattr(args, "dn_diff_logit_align_start_epoch", 30))
-                ):
-                    if x_aux.ndim == 4:
-                        x0_dn_cls = x0_dn.view(x_aux.shape[0], x_aux.shape[1], x_aux.shape[2], x_aux.shape[3])
-                    else:
-                        x0_dn_cls = x0_dn
-                    t_align = torch.zeros((x_aux.shape[0],), device=device, dtype=torch.long)
+                if _need_dn_logit_align:
                     align_teacher_model = dn_diff_align_teacher if dn_diff_align_teacher is not None else model
                     with torch.no_grad():
                         logits_dn_tgt, _, _ = align_teacher_model(
                             x_aux,
-                            t_align,
+                            t_dn_cls,
                             snr=snr_in_aux,
                             snr_mode=args.snr_mode,
                             group_mask=mask,
                             denoiser_bypass=True,
                         )
-                    logits_dn_pred, _, _ = model(
-                        x0_dn_cls,
-                        t_align,
-                        snr=snr_in_aux,
-                        snr_mode=args.snr_mode,
-                        group_mask=mask,
-                        denoiser_bypass=True,
-                    )
-                    logit_vec_dn = torch.mean((logits_dn_pred.float() - logits_dn_tgt.detach().float()) ** 2, dim=1)
+                    logit_vec_dn = torch.mean((logits_dn_shared.float() - logits_dn_tgt.detach().float()) ** 2, dim=1)
                     if bool(getattr(args, "dn_diff_apply_lowband_only_train", True)):
                         dn_logit_mask = (
                             (snr_aux.float() >= float(getattr(args, "dn_diff_loss_snr_lo", -14.0)))
