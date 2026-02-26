@@ -955,3 +955,39 @@ Only if E.1 passes:
 - keep winning E.1 core config,
 - add feature align, then logit align, then late partial unfreeze,
 - run multisample sweeps (`N=3`, then `N=5`) with stochastic DDIM only.
+
+### Wave 5E.2 update (Option D primary, 2026-02-26)
+
+Decision:
+- use **hybrid denoiser objective** as default (diffusion regularizer + task-aware CE),
+- treat pure frozen E.1 as diagnostic-only (not final optimization target).
+
+Rationale:
+- pure diffusion objective (`lambda_dn_diff` only) improved denoiser loss but plateaued below matched control,
+- adding task-aware signal (`lambda_dn_cls`) is required to optimize for classification utility,
+- keeping diffusion loss nonzero reduces degenerate classifier-hack behavior.
+
+New Option-D schedule controls in `train.py`:
+- `--dn-diff-cls-warmup`
+- `--dn-diff-cls-ramp`
+- `--dn-diff-diff-warmup`
+- `--dn-diff-diff-ramp`
+- `--dn-diff-diff-final-scale`
+
+Per-epoch effective loss weights now logged:
+- `lambda_dn_cls_eff`
+- `lambda_dn_diff_eff`
+
+Recommended default schedule for first E.2 wave:
+- `--lambda-dn-cls 0.20`
+- `--dn-diff-cls-warmup 12`
+- `--dn-diff-cls-ramp 16`
+- `--lambda-dn-diff 1.0`
+- `--dn-diff-diff-warmup 12`
+- `--dn-diff-diff-ramp 16`
+- `--dn-diff-diff-final-scale 0.20`
+
+Interpretation:
+- Stage A: classifier signal off, full diffusion regularization.
+- Stage B: classifier signal ramps in while diffusion weight decays to regularizer level.
+- Post-Stage B: task-aware objective dominates, diffusion remains as stability prior.

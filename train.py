@@ -247,6 +247,47 @@ def get_lambda_kd(
     return target * progress
 
 
+def get_lambda_dn_cls(epoch: int, args: argparse.Namespace) -> float:
+    """
+    Optional warmup/ramp for task-aware dn-diff classification loss.
+    """
+    target = float(getattr(args, "lambda_dn_cls", 0.0))
+    if target <= 0.0:
+        return 0.0
+    warmup = int(max(0, getattr(args, "dn_diff_cls_warmup", 0)))
+    if epoch < warmup:
+        return 0.0
+    ramp_epochs = int(max(0, getattr(args, "dn_diff_cls_ramp", 0)))
+    if ramp_epochs <= 0:
+        return target
+    progress = (epoch - warmup + 1) / float(max(1, ramp_epochs))
+    progress = min(1.0, max(0.0, progress))
+    return target * progress
+
+
+def get_lambda_dn_diff(epoch: int, args: argparse.Namespace) -> float:
+    """
+    Optional warmup + decay schedule for dn-diff reconstruction objective.
+
+    Before warmup: keep base lambda.
+    After warmup: linearly move base lambda toward base*final_scale over ramp epochs.
+    """
+    base = float(getattr(args, "lambda_dn_diff", 1.0))
+    if base <= 0.0:
+        return 0.0
+    warmup = int(max(0, getattr(args, "dn_diff_diff_warmup", 0)))
+    final_scale = float(getattr(args, "dn_diff_diff_final_scale", 1.0))
+    if epoch < warmup:
+        return base
+    ramp_epochs = int(max(0, getattr(args, "dn_diff_diff_ramp", 0)))
+    if ramp_epochs <= 0:
+        return base * final_scale
+    progress = (epoch - warmup + 1) / float(max(1, ramp_epochs))
+    progress = min(1.0, max(0.0, progress))
+    scale = 1.0 + (final_scale - 1.0) * progress
+    return base * scale
+
+
 def kd_distillation_loss(
     logits_student: torch.Tensor,
     logits_teacher: torch.Tensor,
@@ -1870,6 +1911,36 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Task-aware CE on denoised outputs (updates denoiser path; classifier can remain frozen).",
     )
+    parser.add_argument(
+        "--dn-diff-cls-warmup",
+        type=int,
+        default=0,
+        help="Epochs to keep dn-diff classification loss disabled before ramping.",
+    )
+    parser.add_argument(
+        "--dn-diff-cls-ramp",
+        type=int,
+        default=0,
+        help="Linear ramp epochs for dn-diff classification loss after warmup.",
+    )
+    parser.add_argument(
+        "--dn-diff-diff-warmup",
+        type=int,
+        default=0,
+        help="Epochs to keep full dn-diff reconstruction weight before optional decay.",
+    )
+    parser.add_argument(
+        "--dn-diff-diff-ramp",
+        type=int,
+        default=0,
+        help="Linear ramp epochs for dn-diff reconstruction weight toward --dn-diff-diff-final-scale.",
+    )
+    parser.add_argument(
+        "--dn-diff-diff-final-scale",
+        type=float,
+        default=1.0,
+        help="Final multiplicative scale applied to --lambda-dn-diff after warmup/ramp.",
+    )
     parser.add_argument("--lambda-dn-feat-align", type=float, default=0.0, help="Weight for diffusion feature-alignment loss.")
     parser.add_argument("--lambda-dn-logit-align", type=float, default=0.0, help="Weight for diffusion logit-alignment loss.")
     parser.add_argument(
@@ -3082,6 +3153,16 @@ def train(args: argparse.Namespace) -> None:
             raise ValueError("lambda_dn_recon must be >= 0.")
         if float(getattr(args, "lambda_dn_cls", 0.0)) < 0.0:
             raise ValueError("lambda_dn_cls must be >= 0.")
+        if int(getattr(args, "dn_diff_cls_warmup", 0)) < 0:
+            raise ValueError("dn_diff_cls_warmup must be >= 0.")
+        if int(getattr(args, "dn_diff_cls_ramp", 0)) < 0:
+            raise ValueError("dn_diff_cls_ramp must be >= 0.")
+        if int(getattr(args, "dn_diff_diff_warmup", 0)) < 0:
+            raise ValueError("dn_diff_diff_warmup must be >= 0.")
+        if int(getattr(args, "dn_diff_diff_ramp", 0)) < 0:
+            raise ValueError("dn_diff_diff_ramp must be >= 0.")
+        if float(getattr(args, "dn_diff_diff_final_scale", 1.0)) < 0.0:
+            raise ValueError("dn_diff_diff_final_scale must be >= 0.")
         if float(getattr(args, "lambda_dn_feat_align", 0.0)) < 0.0:
             raise ValueError("lambda_dn_feat_align must be >= 0.")
         if float(getattr(args, "lambda_dn_logit_align", 0.0)) < 0.0:
@@ -4125,6 +4206,8 @@ def train(args: argparse.Namespace) -> None:
         lambda_diff = args.phase1_lambda_diff if phase1 else args.lambda_diff
         p_clean = args.phase1_p_clean if phase1 else args.p_clean
         cls2dn_scale = get_cls2dn_scale(epoch, args)
+        lambda_dn_diff_eff_cfg = get_lambda_dn_diff(epoch, args)
+        lambda_dn_cls_eff_cfg = get_lambda_dn_cls(epoch, args)
         cls_loss_mult = 1.0
         if bool(getattr(args, "cldnn_denoiser", False)) and bool(getattr(args, "stage_a_no_cls", False)):
             if epoch < int(getattr(args, "stage_a_epochs", 0)):
@@ -5476,10 +5559,10 @@ def train(args: argparse.Namespace) -> None:
                 dn_denom = torch.clamp(dn_loss_mask.sum(), min=1.0)
                 loss_dn_diff = (diff_vec * dn_loss_mask).sum() / dn_denom
                 loss_dn_recon = (recon_vec * dn_loss_mask).sum() / dn_denom
-                loss = loss + float(getattr(args, "lambda_dn_diff", 1.0)) * loss_dn_diff
+                loss = loss + float(lambda_dn_diff_eff_cfg) * loss_dn_diff
                 loss = loss + float(getattr(args, "lambda_dn_recon", 0.0)) * loss_dn_recon
 
-                if float(getattr(args, "lambda_dn_cls", 0.0)) > 0.0:
+                if float(lambda_dn_cls_eff_cfg) > 0.0:
                     if x_aux.ndim == 4:
                         x0_dn_cls = x0_dn.view(x_aux.shape[0], x_aux.shape[1], x_aux.shape[2], x_aux.shape[3])
                     else:
@@ -5527,7 +5610,7 @@ def train(args: argparse.Namespace) -> None:
                     ce_dn = ce_dn * curriculum_mask_aux
                     denom_dn_cls = torch.clamp(curriculum_mask_aux.sum(), min=1.0)
                     loss_dn_cls = ce_dn.sum() / denom_dn_cls
-                    loss = loss + float(getattr(args, "lambda_dn_cls", 0.0)) * loss_dn_cls
+                    loss = loss + float(lambda_dn_cls_eff_cfg) * loss_dn_cls
 
                 if (
                     float(getattr(args, "lambda_dn_feat_align", 0.0)) > 0.0
@@ -5848,8 +5931,10 @@ def train(args: argparse.Namespace) -> None:
             "lambda_id": float(getattr(args, "lambda_id", 0.0)),
             "lambda_feat": float(lambda_feat),
             "lambda_dn_diff": float(getattr(args, "lambda_dn_diff", 1.0)),
+            "lambda_dn_diff_eff": float(lambda_dn_diff_eff_cfg),
             "lambda_dn_recon": float(getattr(args, "lambda_dn_recon", 0.0)),
             "lambda_dn_cls": float(getattr(args, "lambda_dn_cls", 0.0)),
+            "lambda_dn_cls_eff": float(lambda_dn_cls_eff_cfg),
             "lambda_dn_feat_align": float(getattr(args, "lambda_dn_feat_align", 0.0)),
             "lambda_dn_logit_align": float(getattr(args, "lambda_dn_logit_align", 0.0)),
             "lambda_kd": float(lambda_kd_eff),
@@ -5974,6 +6059,11 @@ def train(args: argparse.Namespace) -> None:
             "dn_diff_loss_snr_lo": float(getattr(args, "dn_diff_loss_snr_lo", -14.0)),
             "dn_diff_loss_snr_hi": float(getattr(args, "dn_diff_loss_snr_hi", -6.0)),
             "dn_diff_loss_cond_source": str(getattr(args, "dn_diff_loss_cond_source", "raw")),
+            "dn_diff_cls_warmup": int(getattr(args, "dn_diff_cls_warmup", 0)),
+            "dn_diff_cls_ramp": int(getattr(args, "dn_diff_cls_ramp", 0)),
+            "dn_diff_diff_warmup": int(getattr(args, "dn_diff_diff_warmup", 0)),
+            "dn_diff_diff_ramp": int(getattr(args, "dn_diff_diff_ramp", 0)),
+            "dn_diff_diff_final_scale": float(getattr(args, "dn_diff_diff_final_scale", 1.0)),
             "dn_diff_freeze_classifier": bool(dn_diff_freeze_classifier_eff),
             "dn_diff_align_teacher": str(getattr(args, "dn_diff_align_teacher", "frozen")),
             "dn_diff_feat_align_start_epoch": int(getattr(args, "dn_diff_feat_align_start_epoch", 20)),
