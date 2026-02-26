@@ -1197,6 +1197,8 @@ class CLDNNAMC(nn.Module):
         dn_diff_enable: bool = False,
         dn_diff_target: str = "v",  # v|eps
         dn_diff_train_timesteps: int = 100,
+        dn_diff_beta_start: float = 1e-4,
+        dn_diff_beta_end: float = 2e-2,
         dn_diff_eval_mode: str = "ddim",  # ddim|onestep
         dn_diff_eval_steps: int = 8,
         dn_diff_ddim_eta: float = 0.0,
@@ -1274,6 +1276,8 @@ class CLDNNAMC(nn.Module):
         self.dn_diff_enabled = bool(dn_diff_enable)
         self.dn_diff_target = str(dn_diff_target).strip().lower()
         self.dn_diff_train_timesteps = int(dn_diff_train_timesteps)
+        self.dn_diff_beta_start = float(dn_diff_beta_start)
+        self.dn_diff_beta_end = float(dn_diff_beta_end)
         self.dn_diff_eval_mode = str(dn_diff_eval_mode).strip().lower()
         self.dn_diff_eval_steps = int(dn_diff_eval_steps)
         self.dn_diff_ddim_eta = float(dn_diff_ddim_eta)
@@ -1606,7 +1610,11 @@ class CLDNNAMC(nn.Module):
                 cond_dim=max(16, int(noise_head_hidden)),
                 dropout=float(denoiser_dropout),
             )
-            self.dn_diff_schedule = DiffusionSchedule(timesteps=self.dn_diff_train_timesteps)
+            self.dn_diff_schedule = DiffusionSchedule(
+                timesteps=self.dn_diff_train_timesteps,
+                beta_start=self.dn_diff_beta_start,
+                beta_end=self.dn_diff_beta_end,
+            )
         else:
             self.dn_diff_model = None
             self.dn_diff_schedule = None

@@ -31,11 +31,13 @@ python train.py \
     --data-path ./RML2016.10a_dict.pkl \
     --out-dir ./runs/cldnn_a4_rml2016_mixup02_cls_only \
     \
+    --cldnn-denoiser \
     --cldnn-denoiser-dual-path \
     --cldnn-noise-cond \
+    --fit-noise-proxy-calibration \
     \
-    --stage-a-epochs 5 \
-    --stage-b-epochs 15 \
+    --stage-a-epochs 8 \
+    --stage-b-epochs 16 \
     --stage-a-no-cls \
     --stage-b1-cls2dn-scale 0.0 \
     --stage-b2-cls2dn-scale 0.1 \
@@ -43,7 +45,7 @@ python train.py \
     --lambda-dn 0.3 \
     --lambda-id 0.05 \
     --lambda-noise 0.1 \
-    --lambda-kd 0.0 \
+    --lambda-snr 0.0 \
     \
     --dropout 0.20 \
     --label-smoothing 0.02 \
@@ -53,6 +55,7 @@ python train.py \
     \
     --aug-phase \
     --aug-shift \
+    --amp \
     \
     --batch-size 512 \
     --epochs 120 \
@@ -60,7 +63,8 @@ python train.py \
     --min-lr 1e-5 \
     --warmup-steps 500 \
     --lr-decay-start-epoch 15 \
-    --weight-decay 1e-2 \
+    --weight-decay 1e-4 \
+    --early-stop-patience 25 \
     \
     --train-per 600 \
     --val-per 200 \
@@ -71,10 +75,10 @@ python train.py \
 ```
 
 **Notes:**
-- Stage A (epochs 0-4): Denoiser/noise-head bootstrap, classifier frozen
-- Stage B (epochs 5-19): Classifier warm start with controlled gradients
-- Stage C (epochs 20-119): Joint fine-tuning
-- Loss weights will be adjusted automatically per stage (see `train.py` stage logic)
+- Stage A (epochs 0-7): Denoiser/noise-head bootstrap, classifier frozen
+- Stage B (epochs 8-23): Classifier warm start with controlled gradients
+- Stage C (epochs 24-119): Joint fine-tuning
+- Loss weights stay fixed from command-line lambdas in the current implementation
 - `--mixup-cls-only` ensures denoiser/noise losses use clean inputs
 
 ---
@@ -92,11 +96,13 @@ python train.py \
     --data-path ./RML2016.10a_dict.pkl \
     --out-dir ./runs/cldnn_a4_rml2016_mixup03_snrmin6_cls_only \
     \
+    --cldnn-denoiser \
     --cldnn-denoiser-dual-path \
     --cldnn-noise-cond \
+    --fit-noise-proxy-calibration \
     \
-    --stage-a-epochs 5 \
-    --stage-b-epochs 15 \
+    --stage-a-epochs 8 \
+    --stage-b-epochs 16 \
     --stage-a-no-cls \
     --stage-b1-cls2dn-scale 0.0 \
     --stage-b2-cls2dn-scale 0.1 \
@@ -104,7 +110,7 @@ python train.py \
     --lambda-dn 0.3 \
     --lambda-id 0.05 \
     --lambda-noise 0.1 \
-    --lambda-kd 0.0 \
+    --lambda-snr 0.0 \
     \
     --dropout 0.20 \
     --label-smoothing 0.02 \
@@ -115,6 +121,7 @@ python train.py \
     \
     --aug-phase \
     --aug-shift \
+    --amp \
     \
     --batch-size 512 \
     --epochs 120 \
@@ -122,7 +129,8 @@ python train.py \
     --min-lr 1e-5 \
     --warmup-steps 500 \
     --lr-decay-start-epoch 15 \
-    --weight-decay 1e-2 \
+    --weight-decay 1e-4 \
+    --early-stop-patience 25 \
     \
     --train-per 600 \
     --val-per 200 \
@@ -138,28 +146,28 @@ python train.py \
 
 ---
 
-## Stage-Wise Loss Weight Details
+## Stage-Wise Training Details
 
-The training script automatically adjusts loss weights per stage. Here's what happens:
+The training script applies stage behavior to classifier gradients; lambda values remain fixed from CLI.
 
-**Stage A (epochs 0-4):**
+**Stage A (epochs 0-7):**
 - Classification loss: disabled (`--stage-a-no-cls`)
 - Denoiser/noise losses: active (lambda values from command)
 - Goal: Bootstrap denoiser and noise head before classifier coupling
 
-**Stage B (epochs 5-19):**
+**Stage B (epochs 8-23):**
 - Classification loss: enabled with controlled gradients
-  - First half (epochs 5-11): `cls2dn_scale = 0.0` (no gradients to denoiser)
-  - Second half (epochs 12-19): `cls2dn_scale = 0.1` (weak coupling)
+  - First half (epochs 8-15): `cls2dn_scale = 0.0` (no gradients to denoiser)
+  - Second half (epochs 16-23): `cls2dn_scale = 0.1` (weak coupling)
 - Denoiser/noise losses: continue with same lambda values
 - Goal: Warm start classifier while denoiser stabilizes
 
-**Stage C (epochs 20-119):**
+**Stage C (epochs 24-119):**
 - Classification loss: full gradients (normal training)
 - Denoiser/noise losses: continue with same lambda values
 - Goal: Joint fine-tuning for maximum performance
 
-**Note:** Lambda values are fixed from command line. The plan suggests stage-wise adjustments, but current implementation uses fixed values. The values used (`lambda_dn=0.3`, `lambda_id=0.05`, `lambda_noise=0.1`) are a balanced choice that works across all stages.
+**Note:** Lambda values are fixed from command line. The plan suggests stage-wise adjustments, but current implementation uses fixed values. The values used (`lambda_dn=0.3`, `lambda_id=0.05`, `lambda_noise=0.1`, `lambda_snr=0.0`) are copied from the proven A4 cls-only runs.
 
 ---
 

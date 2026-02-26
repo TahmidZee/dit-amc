@@ -801,3 +801,451 @@ cd /home/tahit/Modulation/AMR-Benchmark/RML201610a/DiT_AMC && \
   --seed 2016 \
   --num-workers 4
 ```
+
+---
+
+## Wave 5D.3 (2026-02-26): Ceiling-First Diagnostics Commands (2 Goose + 4 Athena)
+
+### Pre-run: Eval-only backfill (no training slot)
+
+#### E0 — backfill `w5d2_tcn_l6_c160_k3`
+
+```bash
+cd /home/tahit/Modulation/AMR-Benchmark/RML201610a/DiT_AMC && /home/tahit/Modulation/AMR-Benchmark/venv2/bin/python train.py \
+  --eval-only \
+  --ckpt runs/rml2016_athena/w5d2_tcn_l6_c160_k3/best.pt \
+  --out-dir runs/rml2016_athena/w5d2_tcn_l6_c160_k3 \
+  --data-path /home/tahit/Modulation/RML2016.10a_dict.pkl \
+  --dataset rml2016a \
+  --arch cldnn \
+  --seed 2016 \
+  --train-per 600 \
+  --val-per 200 \
+  --batch-size 512 \
+  --num-workers 4 \
+  --amp \
+  --snr-cap-max-db 18 \
+  --normalize rms \
+  --snr-mode predict \
+  --t-eval 0 \
+  --cldnn-bidir \
+  --cldnn-lstm-layers 2 \
+  --cldnn-lstm-hidden 128 \
+  --cldnn-cls-hidden 512 \
+  --cldnn-denoiser \
+  --cldnn-denoiser-dual-path \
+  --cldnn-denoiser-base-ch 48 \
+  --noise-head-hidden 32 \
+  --noise-eta-min -8.0 \
+  --noise-eta-max 5.5 \
+  --lambda-noise 0.1 \
+  --lambda-dn 0.3 \
+  --lambda-id 0.03 \
+  --fit-noise-proxy-calibration \
+  --stage-a-epochs 12 \
+  --stage-b-epochs 16 \
+  --stage-a-no-cls \
+  --stage-b1-cls2dn-scale 0.0 \
+  --stage-b2-cls2dn-scale 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --moe-n-experts 1 \
+  --cldnn-backbone tcn \
+  --cldnn-tcn-levels 6 \
+  --cldnn-tcn-channels 160 \
+  --cldnn-tcn-kernel 3
+```
+
+#### E1 — backfill `w5d2_tcn_l8_c128_k3`
+
+```bash
+cd /home/tahit/Modulation/AMR-Benchmark/RML201610a/DiT_AMC && /home/tahit/Modulation/AMR-Benchmark/venv2/bin/python train.py \
+  --eval-only \
+  --ckpt runs/rml2016_athena/w5d2_tcn_l8_c128_k3/best.pt \
+  --out-dir runs/rml2016_athena/w5d2_tcn_l8_c128_k3 \
+  --data-path /home/tahit/Modulation/RML2016.10a_dict.pkl \
+  --dataset rml2016a \
+  --arch cldnn \
+  --seed 2016 \
+  --train-per 600 \
+  --val-per 200 \
+  --batch-size 512 \
+  --num-workers 4 \
+  --amp \
+  --snr-cap-max-db 18 \
+  --normalize rms \
+  --snr-mode predict \
+  --t-eval 0 \
+  --cldnn-bidir \
+  --cldnn-lstm-layers 2 \
+  --cldnn-lstm-hidden 128 \
+  --cldnn-cls-hidden 512 \
+  --cldnn-denoiser \
+  --cldnn-denoiser-dual-path \
+  --cldnn-denoiser-base-ch 48 \
+  --noise-head-hidden 32 \
+  --noise-eta-min -8.0 \
+  --noise-eta-max 5.5 \
+  --lambda-noise 0.1 \
+  --lambda-dn 0.3 \
+  --lambda-id 0.03 \
+  --fit-noise-proxy-calibration \
+  --stage-a-epochs 12 \
+  --stage-b-epochs 16 \
+  --stage-a-no-cls \
+  --stage-b1-cls2dn-scale 0.0 \
+  --stage-b2-cls2dn-scale 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --moe-n-experts 1 \
+  --cldnn-backbone tcn \
+  --cldnn-tcn-levels 8 \
+  --cldnn-tcn-channels 128 \
+  --cldnn-tcn-kernel 3
+```
+
+### Goose (2 runs)
+
+#### C0 — `w5d3_oracle_res_b8_c128_k5_s2016`
+
+```bash
+cd /home/tahit/Modulation/AMR-Benchmark/RML201610a/DiT_AMC && /home/tahit/Modulation/AMR-Benchmark/venv2/bin/python train.py \
+  --data-path /home/tahit/Modulation/RML2016.10a_dict.pkl \
+  --dataset rml2016a \
+  --arch cldnn \
+  --out-dir runs/rml2016_goose/w5d3_oracle_res_b8_c128_k5_s2016 \
+  --seed 2016 \
+  --train-per 600 \
+  --val-per 200 \
+  --epochs 120 \
+  --batch-size 512 \
+  --num-workers 4 \
+  --amp \
+  --lr 5e-4 \
+  --min-lr 1e-5 \
+  --warmup-steps 500 \
+  --lr-decay-start-epoch 15 \
+  --weight-decay 1e-4 \
+  --dropout 0.15 \
+  --label-smoothing 0.02 \
+  --grad-clip 1.0 \
+  --early-stop-patience 15 \
+  --early-stop-min-delta 0.0005 \
+  --snr-cap-max-db 18 \
+  --normalize rms \
+  --snr-mode known \
+  --t-eval 0 \
+  --cldnn-bidir \
+  --cldnn-lstm-layers 2 \
+  --cldnn-lstm-hidden 128 \
+  --cldnn-cls-hidden 512 \
+  --cldnn-denoiser \
+  --cldnn-denoiser-dual-path \
+  --cldnn-denoiser-base-ch 48 \
+  --noise-head-hidden 32 \
+  --noise-eta-min -8.0 \
+  --noise-eta-max 5.5 \
+  --lambda-noise 0.1 \
+  --lambda-dn 0.3 \
+  --lambda-id 0.03 \
+  --fit-noise-proxy-calibration \
+  --stage-a-epochs 12 \
+  --stage-b-epochs 16 \
+  --stage-a-no-cls \
+  --stage-b1-cls2dn-scale 0.0 \
+  --stage-b2-cls2dn-scale 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --moe-n-experts 1 \
+  --cldnn-backbone resnet1d \
+  --cldnn-resnet-blocks 8 \
+  --cldnn-resnet-channels 128 \
+  --cldnn-resnet-kernel 5
+```
+
+#### C1 — `w5d3_oracle_tcn_l6_c160_k3_s2016`
+
+```bash
+cd /home/tahit/Modulation/AMR-Benchmark/RML201610a/DiT_AMC && /home/tahit/Modulation/AMR-Benchmark/venv2/bin/python train.py \
+  --data-path /home/tahit/Modulation/RML2016.10a_dict.pkl \
+  --dataset rml2016a \
+  --arch cldnn \
+  --out-dir runs/rml2016_goose/w5d3_oracle_tcn_l6_c160_k3_s2016 \
+  --seed 2016 \
+  --train-per 600 \
+  --val-per 200 \
+  --epochs 120 \
+  --batch-size 512 \
+  --num-workers 4 \
+  --amp \
+  --lr 5e-4 \
+  --min-lr 1e-5 \
+  --warmup-steps 500 \
+  --lr-decay-start-epoch 15 \
+  --weight-decay 1e-4 \
+  --dropout 0.15 \
+  --label-smoothing 0.02 \
+  --grad-clip 1.0 \
+  --early-stop-patience 15 \
+  --early-stop-min-delta 0.0005 \
+  --snr-cap-max-db 18 \
+  --normalize rms \
+  --snr-mode known \
+  --t-eval 0 \
+  --cldnn-bidir \
+  --cldnn-lstm-layers 2 \
+  --cldnn-lstm-hidden 128 \
+  --cldnn-cls-hidden 512 \
+  --cldnn-denoiser \
+  --cldnn-denoiser-dual-path \
+  --cldnn-denoiser-base-ch 48 \
+  --noise-head-hidden 32 \
+  --noise-eta-min -8.0 \
+  --noise-eta-max 5.5 \
+  --lambda-noise 0.1 \
+  --lambda-dn 0.3 \
+  --lambda-id 0.03 \
+  --fit-noise-proxy-calibration \
+  --stage-a-epochs 12 \
+  --stage-b-epochs 16 \
+  --stage-a-no-cls \
+  --stage-b1-cls2dn-scale 0.0 \
+  --stage-b2-cls2dn-scale 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --moe-n-experts 1 \
+  --cldnn-backbone tcn \
+  --cldnn-tcn-levels 6 \
+  --cldnn-tcn-channels 160 \
+  --cldnn-tcn-kernel 3
+```
+
+### Athena (4 runs)
+
+#### C2 — `w5d3_blind_res_b8_c128_k5_s3407`
+
+```bash
+cd /lustre/home/tahit/Modulation/dit-amc && python train.py \
+  --data-path /lustre/home/tahit/Modulation/dit-amc/RML2016.10a_dict.pkl \
+  --dataset rml2016a \
+  --arch cldnn \
+  --out-dir runs/rml2016_athena/w5d3_blind_res_b8_c128_k5_s3407 \
+  --seed 3407 \
+  --train-per 600 \
+  --val-per 200 \
+  --epochs 120 \
+  --batch-size 512 \
+  --num-workers 4 \
+  --amp \
+  --lr 5e-4 \
+  --min-lr 1e-5 \
+  --warmup-steps 500 \
+  --lr-decay-start-epoch 15 \
+  --weight-decay 1e-4 \
+  --dropout 0.15 \
+  --label-smoothing 0.02 \
+  --grad-clip 1.0 \
+  --early-stop-patience 15 \
+  --early-stop-min-delta 0.0005 \
+  --snr-cap-max-db 18 \
+  --normalize rms \
+  --snr-mode predict \
+  --t-eval 0 \
+  --cldnn-bidir \
+  --cldnn-lstm-layers 2 \
+  --cldnn-lstm-hidden 128 \
+  --cldnn-cls-hidden 512 \
+  --cldnn-denoiser \
+  --cldnn-denoiser-dual-path \
+  --cldnn-denoiser-base-ch 48 \
+  --noise-head-hidden 32 \
+  --noise-eta-min -8.0 \
+  --noise-eta-max 5.5 \
+  --lambda-noise 0.1 \
+  --lambda-dn 0.3 \
+  --lambda-id 0.03 \
+  --fit-noise-proxy-calibration \
+  --stage-a-epochs 12 \
+  --stage-b-epochs 16 \
+  --stage-a-no-cls \
+  --stage-b1-cls2dn-scale 0.0 \
+  --stage-b2-cls2dn-scale 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --moe-n-experts 1 \
+  --cldnn-backbone resnet1d \
+  --cldnn-resnet-blocks 8 \
+  --cldnn-resnet-channels 128 \
+  --cldnn-resnet-kernel 5
+```
+
+#### C3 — `w5d3_blind_tcn_l6_c160_k3_s3407`
+
+```bash
+cd /lustre/home/tahit/Modulation/dit-amc && python train.py \
+  --data-path /lustre/home/tahit/Modulation/dit-amc/RML2016.10a_dict.pkl \
+  --dataset rml2016a \
+  --arch cldnn \
+  --out-dir runs/rml2016_athena/w5d3_blind_tcn_l6_c160_k3_s3407 \
+  --seed 3407 \
+  --train-per 600 \
+  --val-per 200 \
+  --epochs 120 \
+  --batch-size 512 \
+  --num-workers 4 \
+  --amp \
+  --lr 5e-4 \
+  --min-lr 1e-5 \
+  --warmup-steps 500 \
+  --lr-decay-start-epoch 15 \
+  --weight-decay 1e-4 \
+  --dropout 0.15 \
+  --label-smoothing 0.02 \
+  --grad-clip 1.0 \
+  --early-stop-patience 15 \
+  --early-stop-min-delta 0.0005 \
+  --snr-cap-max-db 18 \
+  --normalize rms \
+  --snr-mode predict \
+  --t-eval 0 \
+  --cldnn-bidir \
+  --cldnn-lstm-layers 2 \
+  --cldnn-lstm-hidden 128 \
+  --cldnn-cls-hidden 512 \
+  --cldnn-denoiser \
+  --cldnn-denoiser-dual-path \
+  --cldnn-denoiser-base-ch 48 \
+  --noise-head-hidden 32 \
+  --noise-eta-min -8.0 \
+  --noise-eta-max 5.5 \
+  --lambda-noise 0.1 \
+  --lambda-dn 0.3 \
+  --lambda-id 0.03 \
+  --fit-noise-proxy-calibration \
+  --stage-a-epochs 12 \
+  --stage-b-epochs 16 \
+  --stage-a-no-cls \
+  --stage-b1-cls2dn-scale 0.0 \
+  --stage-b2-cls2dn-scale 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --moe-n-experts 1 \
+  --cldnn-backbone tcn \
+  --cldnn-tcn-levels 6 \
+  --cldnn-tcn-channels 160 \
+  --cldnn-tcn-kernel 3
+```
+
+#### C4 — `w5d3_blind_res_b8_c128_k5_lr4e4_s2016`
+
+```bash
+cd /lustre/home/tahit/Modulation/dit-amc && python train.py \
+  --data-path /lustre/home/tahit/Modulation/dit-amc/RML2016.10a_dict.pkl \
+  --dataset rml2016a \
+  --arch cldnn \
+  --out-dir runs/rml2016_athena/w5d3_blind_res_b8_c128_k5_lr4e4_s2016 \
+  --seed 2016 \
+  --train-per 600 \
+  --val-per 200 \
+  --epochs 120 \
+  --batch-size 512 \
+  --num-workers 4 \
+  --amp \
+  --lr 4e-4 \
+  --min-lr 1e-5 \
+  --warmup-steps 500 \
+  --lr-decay-start-epoch 15 \
+  --weight-decay 1e-4 \
+  --dropout 0.15 \
+  --label-smoothing 0.02 \
+  --grad-clip 1.0 \
+  --early-stop-patience 15 \
+  --early-stop-min-delta 0.0005 \
+  --snr-cap-max-db 18 \
+  --normalize rms \
+  --snr-mode predict \
+  --t-eval 0 \
+  --cldnn-bidir \
+  --cldnn-lstm-layers 2 \
+  --cldnn-lstm-hidden 128 \
+  --cldnn-cls-hidden 512 \
+  --cldnn-denoiser \
+  --cldnn-denoiser-dual-path \
+  --cldnn-denoiser-base-ch 48 \
+  --noise-head-hidden 32 \
+  --noise-eta-min -8.0 \
+  --noise-eta-max 5.5 \
+  --lambda-noise 0.1 \
+  --lambda-dn 0.3 \
+  --lambda-id 0.03 \
+  --fit-noise-proxy-calibration \
+  --stage-a-epochs 12 \
+  --stage-b-epochs 16 \
+  --stage-a-no-cls \
+  --stage-b1-cls2dn-scale 0.0 \
+  --stage-b2-cls2dn-scale 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --moe-n-experts 1 \
+  --cldnn-backbone resnet1d \
+  --cldnn-resnet-blocks 8 \
+  --cldnn-resnet-channels 128 \
+  --cldnn-resnet-kernel 5
+```
+
+#### C5 — `w5d3_blind_tcn_l6_c160_k3_lr4e4_s2016`
+
+```bash
+cd /lustre/home/tahit/Modulation/dit-amc && python train.py \
+  --data-path /lustre/home/tahit/Modulation/dit-amc/RML2016.10a_dict.pkl \
+  --dataset rml2016a \
+  --arch cldnn \
+  --out-dir runs/rml2016_athena/w5d3_blind_tcn_l6_c160_k3_lr4e4_s2016 \
+  --seed 2016 \
+  --train-per 600 \
+  --val-per 200 \
+  --epochs 120 \
+  --batch-size 512 \
+  --num-workers 4 \
+  --amp \
+  --lr 4e-4 \
+  --min-lr 1e-5 \
+  --warmup-steps 500 \
+  --lr-decay-start-epoch 15 \
+  --weight-decay 1e-4 \
+  --dropout 0.15 \
+  --label-smoothing 0.02 \
+  --grad-clip 1.0 \
+  --early-stop-patience 15 \
+  --early-stop-min-delta 0.0005 \
+  --snr-cap-max-db 18 \
+  --normalize rms \
+  --snr-mode predict \
+  --t-eval 0 \
+  --cldnn-bidir \
+  --cldnn-lstm-layers 2 \
+  --cldnn-lstm-hidden 128 \
+  --cldnn-cls-hidden 512 \
+  --cldnn-denoiser \
+  --cldnn-denoiser-dual-path \
+  --cldnn-denoiser-base-ch 48 \
+  --noise-head-hidden 32 \
+  --noise-eta-min -8.0 \
+  --noise-eta-max 5.5 \
+  --lambda-noise 0.1 \
+  --lambda-dn 0.3 \
+  --lambda-id 0.03 \
+  --fit-noise-proxy-calibration \
+  --stage-a-epochs 12 \
+  --stage-b-epochs 16 \
+  --stage-a-no-cls \
+  --stage-b1-cls2dn-scale 0.0 \
+  --stage-b2-cls2dn-scale 0.1 \
+  --aug-phase \
+  --aug-shift \
+  --moe-n-experts 1 \
+  --cldnn-backbone tcn \
+  --cldnn-tcn-levels 6 \
+  --cldnn-tcn-channels 160 \
+  --cldnn-tcn-kernel 3
+```

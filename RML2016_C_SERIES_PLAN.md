@@ -847,6 +847,8 @@ Training/eval flags now available in `train.py`:
   - `--dn-diff-enable`
   - `--dn-diff-target {v,eps}`
   - `--dn-diff-train-timesteps`
+  - `--dn-diff-beta-start`
+  - `--dn-diff-beta-end`
 - split t-source:
   - `--dn-diff-train-t-start-source {snr_pred,fixed}`
   - `--dn-diff-eval-t-start-source {snr_pred,snr_true,fixed}`
@@ -867,6 +869,8 @@ Training/eval flags now available in `train.py`:
   - `--dn-diff-loss-snr-hi`
 - loss/control:
   - `--dn-diff-freeze-classifier`
+  - `--init-ckpt`
+  - `--init-ckpt-source {auto,model,ema}`
   - `--lambda-dn-diff`
   - `--lambda-dn-recon`
   - `--lambda-dn-feat-align`
@@ -880,9 +884,36 @@ Training/eval flags now available in `train.py`:
 
 `metrics.jsonl` now includes additive diffusion fields:
 - config: `dn_diff_enabled`, `dn_diff_target`, `dn_diff_train_t_source`, `dn_diff_eval_t_source`, `dn_diff_eval_mode`, `dn_diff_eval_steps`, `dn_diff_ddim_eta`, `dn_diff_multisample`, etc.
+- warm-start trace: `init_ckpt`, `init_ckpt_source_used`
 - train losses: `train_loss_dn_diff`, `train_loss_dn_recon`, `train_loss_dn_feat_align`, `train_loss_dn_logit_align`
 - diagnostics: `dn_diff_t_start_mean`, `dn_diff_t_start_std`, `dn_diff_active_frac_low/mid/high`
 - validation mirrors: `val_dn_diff_*`
+- per-epoch SNR trajectory file: `val_acc_by_snr_history.jsonl`
+
+### E.1 execution corrections (2026-02-26)
+
+- Full incident log: `W5E1_INCIDENT_REPORT_2026_02_26.md`.
+- Root causes observed in first E.1 attempt:
+  - frozen-classifier runs launched without reliable warm-start;
+  - eval path using EMA shadow before stable EMA state in warm-started runs.
+- Code corrections now in place:
+  - warm-start source selector: `--init-ckpt-source {auto,model,ema}`;
+  - in `auto`, frozen-classifier runs prefer checkpoint EMA state when available;
+  - EMA eval is only used after `global_step >= ema_start`.
+- Operational protocol for current E.1 reruns:
+  - always pass `--init-ckpt` for frozen-classifier runs;
+  - set `--ema-decay 0` for deconfounded feasibility runs;
+  - use schedule coverage settings that avoid low-band timestep saturation
+    (`--dn-diff-train-timesteps 500` or `--dn-diff-beta-end 0.10`);
+  - run 1-2 epoch smoke before launching full E.1 matrix.
+
+### E.1 schedule-coverage precheck (required before full matrix)
+
+Run two short smokes and keep all non-schedule flags fixed:
+- Variant A: `--dn-diff-train-timesteps 500 --dn-diff-beta-end 0.02`
+- Variant B: `--dn-diff-train-timesteps 100 --dn-diff-beta-end 0.10`
+
+Select the variant with better low-band (`-14..-6`) without high-band damage, then use that single schedule setting for full E.1.
 
 ### Wave 5E.1 run matrix (2 Goose + 4 Athena)
 

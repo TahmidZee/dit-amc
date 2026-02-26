@@ -1736,6 +1736,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dn-diff-enable", action="store_true", help="Enable waveform diffusion denoiser front-end for CLDNN.")
     parser.add_argument("--dn-diff-target", type=str, choices=["v", "eps"], default="v", help="Prediction target for diffusion denoiser (v or eps).")
     parser.add_argument("--dn-diff-train-timesteps", type=int, default=100, help="Diffusion timestep count for waveform denoiser schedule.")
+    parser.add_argument("--dn-diff-beta-start", type=float, default=1e-4, help="Beta schedule start value for diffusion denoiser.")
+    parser.add_argument("--dn-diff-beta-end", type=float, default=2e-2, help="Beta schedule end value for diffusion denoiser. Increase to cover lower SNR (e.g. 0.10 for -22 dB).")
     parser.add_argument(
         "--dn-diff-train-t-start-source",
         type=str,
@@ -1810,6 +1812,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Initialize model weights from checkpoint without resuming optimizer/scheduler state.",
+    )
+    parser.add_argument(
+        "--init-ckpt-source",
+        type=str,
+        default="auto",
+        choices=["auto", "model", "ema"],
+        help=(
+            "Warm-start source for --init-ckpt. "
+            "auto uses EMA for frozen-classifier runs when available; otherwise model weights."
+        ),
     )
     parser.add_argument("--lambda-dn-diff", type=float, default=1.0, help="Weight for diffusion denoiser target loss.")
     parser.add_argument("--lambda-dn-recon", type=float, default=0.0, help="Weight for one-step reconstruction loss from diffusion x0 prediction.")
@@ -2010,6 +2022,8 @@ def build_model_from_cfg(
             dn_diff_enable=bool(_cfg_get(cfg, fallback, "dn_diff_enable", False)),
             dn_diff_target=str(_cfg_get(cfg, fallback, "dn_diff_target", "v")),
             dn_diff_train_timesteps=int(_cfg_get(cfg, fallback, "dn_diff_train_timesteps", 100)),
+            dn_diff_beta_start=float(_cfg_get(cfg, fallback, "dn_diff_beta_start", 1e-4)),
+            dn_diff_beta_end=float(_cfg_get(cfg, fallback, "dn_diff_beta_end", 2e-2)),
             dn_diff_eval_mode=str(_cfg_get(cfg, fallback, "dn_diff_eval_mode", "ddim")),
             dn_diff_eval_steps=int(_cfg_get(cfg, fallback, "dn_diff_eval_steps", 8)),
             dn_diff_ddim_eta=float(_cfg_get(cfg, fallback, "dn_diff_ddim_eta", 0.0)),
@@ -3232,6 +3246,8 @@ def train(args: argparse.Namespace) -> None:
             dn_diff_enable=bool(getattr(args, "dn_diff_enable", False)),
             dn_diff_target=str(getattr(args, "dn_diff_target", "v")),
             dn_diff_train_timesteps=int(getattr(args, "dn_diff_train_timesteps", 100)),
+            dn_diff_beta_start=float(getattr(args, "dn_diff_beta_start", 1e-4)),
+            dn_diff_beta_end=float(getattr(args, "dn_diff_beta_end", 2e-2)),
             dn_diff_eval_mode=str(getattr(args, "dn_diff_eval_mode", "ddim")),
             dn_diff_eval_steps=int(getattr(args, "dn_diff_eval_steps", 8)),
             dn_diff_ddim_eta=float(getattr(args, "dn_diff_ddim_eta", 0.0)),
@@ -3372,11 +3388,13 @@ def train(args: argparse.Namespace) -> None:
     ema = EMA.create(model, decay=args.ema_decay) if args.ema_decay > 0 else None
     start_epoch = 0
     global_step = 0
+    init_ckpt_source_used = "none"
 
     if args.ckpt is not None and args.resume:
         ckpt = load_checkpoint(args.ckpt, model, optimizer=optimizer, scheduler=scheduler, ema=ema)
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("step", 0)
+        init_ckpt_source_used = "resume"
     elif getattr(args, "init_ckpt", None):
         init_ckpt = str(getattr(args, "init_ckpt"))
         if not os.path.exists(init_ckpt):
@@ -3385,15 +3403,66 @@ def train(args: argparse.Namespace) -> None:
             init_blob = torch.load(init_ckpt, map_location="cpu", weights_only=False)
         except TypeError:
             init_blob = torch.load(init_ckpt, map_location="cpu")
+        init_pref = str(getattr(args, "init_ckpt_source", "auto")).strip().lower()
+        init_state: Dict[str, torch.Tensor] | torch.Tensor
         if isinstance(init_blob, dict):
-            init_state = init_blob.get("model", init_blob)
+            ema_state = init_blob.get("ema")
+            use_ema_init = False
+            if init_pref == "ema":
+                if not (isinstance(ema_state, dict) and len(ema_state) > 0):
+                    raise ValueError("--init-ckpt-source ema requested, but checkpoint has no EMA state.")
+                use_ema_init = True
+            elif init_pref == "auto":
+                use_ema_init = bool(dn_diff_freeze_classifier_eff) and isinstance(ema_state, dict) and len(ema_state) > 0
+            if use_ema_init:
+                init_state = ema_state
+                init_ckpt_source_used = "ema"
+            else:
+                init_state = init_blob.get("model", init_blob)
+                init_ckpt_source_used = "model"
         else:
             init_state = init_blob
+            init_ckpt_source_used = "model"
         init_stats = load_state_dict_flexible(model, init_state, prefix="init-ckpt")
         print(
             f"[init-ckpt] loaded from {init_ckpt} "
+            f"source={init_ckpt_source_used} "
             f"(loaded={init_stats.get('loaded', 0)}, skipped_shape={init_stats.get('skipped_shape', 0)})."
         )
+        # Keep EMA consistent with warm-started weights.
+        # Without this, eval can read stale/random EMA shadows for many steps.
+        if ema is not None:
+            ema = EMA.create(model, decay=args.ema_decay)
+            print("[init-ckpt] EMA shadow reinitialized from loaded model state.")
+
+    # --- Diffusion schedule coverage diagnostic ---
+    if args.arch == "cldnn" and bool(getattr(args, "dn_diff_enable", False)):
+        _dn_sched = getattr(model, "dn_diff_schedule", None)
+        if _dn_sched is not None:
+            import math as _math
+            _ab_min = float(_dn_sched.alpha_bars[-1])
+            _ab_max = float(_dn_sched.alpha_bars[0])
+            # SNR (dB) at which snr_to_t() saturates: alpha_bar_min = SNR_lin / (SNR_lin + 1)
+            # => SNR_lin = alpha_bar_min / (1 - alpha_bar_min)
+            _snr_lin_min = _ab_min / max(1.0 - _ab_min, 1e-12)
+            _snr_db_min = 10.0 * _math.log10(max(_snr_lin_min, 1e-12))
+            _loss_lo = float(getattr(args, "dn_diff_loss_snr_lo", -14.0))
+            _loss_hi = float(getattr(args, "dn_diff_loss_snr_hi", -6.0))
+            _covered = _snr_db_min <= _loss_lo
+            print(
+                f"[dn_diff] schedule coverage: T={_dn_sched.timesteps}, "
+                f"beta=[{model.dn_diff_beta_start:.1e}, {model.dn_diff_beta_end:.1e}], "
+                f"alpha_bar=[{_ab_min:.4f}, {_ab_max:.4f}], "
+                f"SNR_min_covered={_snr_db_min:.1f} dB"
+            )
+            if not _covered:
+                print(
+                    f"[dn_diff] WARNING: schedule alpha_bar_min={_ab_min:.4f} "
+                    f"only covers SNR >= {_snr_db_min:.1f} dB, "
+                    f"but loss range is [{_loss_lo}, {_loss_hi}] dB. "
+                    f"All samples below {_snr_db_min:.1f} dB will clamp to t={_dn_sched.timesteps - 1}. "
+                    f"Consider --dn-diff-beta-end 0.10 or --dn-diff-train-timesteps 500+."
+                )
 
     # Optional fixed early-feature encoder for L_feat, or lazy snapshot at Stage-B start.
     if (
@@ -5395,7 +5464,8 @@ def train(args: argparse.Namespace) -> None:
             prev_eval_bypass = bool(getattr(model, "force_denoiser_bypass", False))
             model.force_denoiser_bypass = eval_bypass  # type: ignore[attr-defined]
 
-        if ema is not None:
+        use_ema_eval = ema is not None and global_step >= int(args.ema_start)
+        if use_ema_eval:
             ema.store(model)
             ema.copy_to(model)
             val_acc, _, val_acc_by_snr, val_summary = evaluate(
@@ -5432,7 +5502,7 @@ def train(args: argparse.Namespace) -> None:
             bool(getattr(args, "cldnn_noise_cond", False))
             or bool(getattr(args, "cldnn_denoiser", False))
         ):
-            if ema is not None:
+            if use_ema_eval:
                 ema.store(model)
                 ema.copy_to(model)
                 noise_calib = evaluate_eta_calibration(
@@ -5573,6 +5643,7 @@ def train(args: argparse.Namespace) -> None:
             "early_stop_min_delta": float(getattr(args, "early_stop_min_delta", 0.0)),
             "early_stop_start_epoch": int(early_stop_start_epoch),
             "init_ckpt": str(getattr(args, "init_ckpt", "") or ""),
+            "init_ckpt_source_used": str(init_ckpt_source_used),
             "allow_random_frozen_classifier": bool(getattr(args, "allow_random_frozen_classifier", False)),
             "cldnn_backbone": str(getattr(args, "cldnn_backbone", "lstm")),
             "cldnn_tcn_levels": int(getattr(args, "cldnn_tcn_levels", 6)),
@@ -5586,6 +5657,9 @@ def train(args: argparse.Namespace) -> None:
             "dn_diff_enabled": bool(getattr(args, "dn_diff_enable", False)),
             "dn_diff_target": str(getattr(args, "dn_diff_target", "v")),
             "dn_diff_train_timesteps": int(getattr(args, "dn_diff_train_timesteps", 100)),
+            "dn_diff_beta_start": float(getattr(args, "dn_diff_beta_start", 1e-4)),
+            "dn_diff_beta_end": float(getattr(args, "dn_diff_beta_end", 2e-2)),
+            "dn_diff_alpha_bar_min": float(getattr(model, "dn_diff_schedule", None).alpha_bars[-1]) if getattr(model, "dn_diff_schedule", None) is not None else 0.0,
             "dn_diff_train_t_source": str(getattr(args, "dn_diff_train_t_start_source", "snr_pred")),
             "dn_diff_eval_t_source": str(getattr(args, "dn_diff_eval_t_start_source", "snr_pred")),
             "dn_diff_eval_mode": str(getattr(args, "dn_diff_eval_mode", "ddim")),
@@ -5650,6 +5724,20 @@ def train(args: argparse.Namespace) -> None:
         if val_acc_by_snr:
             with open(os.path.join(args.out_dir, "val_acc_by_snr.json"), "w", encoding="utf-8") as f:
                 json.dump(val_acc_by_snr, f, indent=2)
+            # Persist epoch-by-epoch SNR diagnostics (append-only) for run-vs-run comparisons.
+            val_acc_by_snr_hist = {str(k): float(v) for k, v in val_acc_by_snr.items()}
+            write_jsonl(
+                os.path.join(args.out_dir, "val_acc_by_snr_history.jsonl"),
+                {
+                    "epoch": int(epoch),
+                    "val_acc": float(val_acc),
+                    "val_macro_acc": float(val_summary.get("macro_acc", 0.0)),
+                    "val_macro_f1": float(val_summary.get("macro_f1", 0.0)),
+                    "val_low_macro_acc": float(val_summary.get("low_macro_acc", 0.0)),
+                    "val_low_macro_f1": float(val_summary.get("low_macro_f1", 0.0)),
+                    "val_acc_by_snr": val_acc_by_snr_hist,
+                },
+            )
         if noise_calib and noise_calib.get("eta_by_snr"):
             with open(os.path.join(args.out_dir, "eta_calibration_by_snr.json"), "w", encoding="utf-8") as f:
                 json.dump(noise_calib["eta_by_snr"], f, indent=2)
@@ -5849,6 +5937,8 @@ def run_eval(args: argparse.Namespace) -> None:
             dn_diff_enable=bool(getattr(args, "dn_diff_enable", False)),
             dn_diff_target=str(getattr(args, "dn_diff_target", "v")),
             dn_diff_train_timesteps=int(getattr(args, "dn_diff_train_timesteps", 100)),
+            dn_diff_beta_start=float(getattr(args, "dn_diff_beta_start", 1e-4)),
+            dn_diff_beta_end=float(getattr(args, "dn_diff_beta_end", 2e-2)),
             dn_diff_eval_mode=str(getattr(args, "dn_diff_eval_mode", "ddim")),
             dn_diff_eval_steps=int(getattr(args, "dn_diff_eval_steps", 8)),
             dn_diff_ddim_eta=float(getattr(args, "dn_diff_ddim_eta", 0.0)),
