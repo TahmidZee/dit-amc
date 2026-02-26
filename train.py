@@ -1800,6 +1800,17 @@ def parse_args() -> argparse.Namespace:
         help="Disable classifier freezing during diffusion training.",
     )
     parser.set_defaults(dn_diff_freeze_classifier=None)
+    parser.add_argument(
+        "--allow-random-frozen-classifier",
+        action="store_true",
+        help="Allow freezing classifier without loading pretrained weights (debug only).",
+    )
+    parser.add_argument(
+        "--init-ckpt",
+        type=str,
+        default=None,
+        help="Initialize model weights from checkpoint without resuming optimizer/scheduler state.",
+    )
     parser.add_argument("--lambda-dn-diff", type=float, default=1.0, help="Weight for diffusion denoiser target loss.")
     parser.add_argument("--lambda-dn-recon", type=float, default=0.0, help="Weight for one-step reconstruction loss from diffusion x0 prediction.")
     parser.add_argument("--lambda-dn-feat-align", type=float, default=0.0, help="Weight for diffusion feature-alignment loss.")
@@ -2877,6 +2888,11 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--cldnn-expert-eta-gate requires --cldnn-expert-features.")
     if int(getattr(args, "stage_a_epochs", 0)) < 0 or int(getattr(args, "stage_b_epochs", 0)) < 0:
         raise ValueError("stage_a_epochs and stage_b_epochs must be >= 0.")
+    init_ckpt_path = str(getattr(args, "init_ckpt", "") or "").strip()
+    if init_ckpt_path and (args.ckpt is not None and args.resume):
+        raise ValueError("Use either --init-ckpt or --ckpt with --resume, not both.")
+    if init_ckpt_path and not os.path.exists(init_ckpt_path):
+        raise FileNotFoundError(f"init_ckpt not found: {init_ckpt_path}")
     if int(getattr(args, "early_stop_patience", 0)) < 0:
         raise ValueError("early_stop_patience must be >= 0.")
     if int(getattr(args, "early_stop_start_epoch", 0)) < 0:
@@ -3302,11 +3318,24 @@ def train(args: argparse.Namespace) -> None:
         dn_diff_freeze_classifier_eff = bool(getattr(args, "dn_diff_enable", False))
     else:
         dn_diff_freeze_classifier_eff = bool(freeze_cfg)
+
+    init_ckpt_path = str(getattr(args, "init_ckpt", "") or "").strip()
+    has_init_weights = bool((args.ckpt is not None and args.resume) or init_ckpt_path)
     if dn_diff_freeze_classifier_eff and not (
         bool(getattr(args, "dn_diff_enable", False))
         or bool(getattr(args, "cldnn_denoiser", False))
     ):
         raise ValueError("--dn-diff-freeze-classifier requires dn_diff_enable or cldnn_denoiser path.")
+    if (
+        dn_diff_freeze_classifier_eff
+        and not has_init_weights
+        and not bool(getattr(args, "allow_random_frozen_classifier", False))
+    ):
+        raise ValueError(
+            "Frozen classifier mode requires pretrained initialization "
+            "(use --init-ckpt PATH or --ckpt PATH --resume). "
+            "Use --allow-random-frozen-classifier only for debug."
+        )
 
     freeze_cls_for_dn = dn_diff_freeze_classifier_eff
     if args.arch == "cldnn" and freeze_cls_for_dn:
@@ -3348,6 +3377,23 @@ def train(args: argparse.Namespace) -> None:
         ckpt = load_checkpoint(args.ckpt, model, optimizer=optimizer, scheduler=scheduler, ema=ema)
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("step", 0)
+    elif getattr(args, "init_ckpt", None):
+        init_ckpt = str(getattr(args, "init_ckpt"))
+        if not os.path.exists(init_ckpt):
+            raise FileNotFoundError(f"init_ckpt not found: {init_ckpt}")
+        try:
+            init_blob = torch.load(init_ckpt, map_location="cpu", weights_only=False)
+        except TypeError:
+            init_blob = torch.load(init_ckpt, map_location="cpu")
+        if isinstance(init_blob, dict):
+            init_state = init_blob.get("model", init_blob)
+        else:
+            init_state = init_blob
+        init_stats = load_state_dict_flexible(model, init_state, prefix="init-ckpt")
+        print(
+            f"[init-ckpt] loaded from {init_ckpt} "
+            f"(loaded={init_stats.get('loaded', 0)}, skipped_shape={init_stats.get('skipped_shape', 0)})."
+        )
 
     # Optional fixed early-feature encoder for L_feat, or lazy snapshot at Stage-B start.
     if (
@@ -5526,6 +5572,8 @@ def train(args: argparse.Namespace) -> None:
             "early_stop_patience": int(getattr(args, "early_stop_patience", 0)),
             "early_stop_min_delta": float(getattr(args, "early_stop_min_delta", 0.0)),
             "early_stop_start_epoch": int(early_stop_start_epoch),
+            "init_ckpt": str(getattr(args, "init_ckpt", "") or ""),
+            "allow_random_frozen_classifier": bool(getattr(args, "allow_random_frozen_classifier", False)),
             "cldnn_backbone": str(getattr(args, "cldnn_backbone", "lstm")),
             "cldnn_tcn_levels": int(getattr(args, "cldnn_tcn_levels", 6)),
             "cldnn_tcn_channels": int(getattr(args, "cldnn_tcn_channels", 128)),
