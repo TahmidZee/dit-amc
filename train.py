@@ -5366,6 +5366,31 @@ def train(args: argparse.Namespace) -> None:
                     x_dn_ref = x_aux
                     snr_dn_ref = snr_aux
 
+                dn_loss_cond_source = str(getattr(args, "dn_diff_loss_cond_source", "raw")).strip().lower()
+                if dn_loss_cond_source == "degraded":
+                    dn_pair_delta_min = float(getattr(args, "dn_pair_delta_min", 2.0))
+                    dn_pair_delta_max = float(getattr(args, "dn_pair_delta_max", 8.0))
+                    dn_pair_snr_floor = (
+                        float(getattr(args, "dn_pair_snr_floor_db"))
+                        if getattr(args, "dn_pair_snr_floor_db", None) is not None
+                        else float(snr_min_db)
+                    )
+                    dn_pair_snr_new_lo_raw = float(getattr(args, "dn_pair_snr_new_lo", -999.0))
+                    dn_pair_snr_new_hi_raw = float(getattr(args, "dn_pair_snr_new_hi", 999.0))
+                    dn_pair_snr_new_lo = dn_pair_snr_new_lo_raw if dn_pair_snr_new_lo_raw > -900.0 else None
+                    dn_pair_snr_new_hi = dn_pair_snr_new_hi_raw if dn_pair_snr_new_hi_raw < 900.0 else None
+                    x_cond_dn, _delta_dn = snr_path_degrade(
+                        x_dn_ref,
+                        snr_dn_ref,
+                        delta_min=dn_pair_delta_min,
+                        delta_max=dn_pair_delta_max,
+                        snr_floor=dn_pair_snr_floor,
+                        snr_target_min=dn_pair_snr_new_lo,
+                        snr_target_max=dn_pair_snr_new_hi,
+                    )
+                else:
+                    x_cond_dn = x_dn_ref
+
                 pred_dn: Optional[torch.Tensor] = None
                 target_dn: Optional[torch.Tensor] = None
                 x0_dn: Optional[torch.Tensor] = None
@@ -5383,6 +5408,7 @@ def train(args: argparse.Namespace) -> None:
                         and isinstance(x0_c, torch.Tensor)
                         and isinstance(t_c, torch.Tensor)
                         and int(pred_c.shape[0]) == int(x_dn_ref.shape[0])
+                        and dn_loss_cond_source == "raw"
                     ):
                         pred_dn = pred_c
                         target_dn = target_c
@@ -5390,31 +5416,6 @@ def train(args: argparse.Namespace) -> None:
                         t_dn = t_c
 
                 if pred_dn is None or target_dn is None or x0_dn is None or t_dn is None:
-                    dn_loss_cond_source = str(getattr(args, "dn_diff_loss_cond_source", "raw")).strip().lower()
-                    if dn_loss_cond_source == "degraded":
-                        dn_pair_delta_min = float(getattr(args, "dn_pair_delta_min", 2.0))
-                        dn_pair_delta_max = float(getattr(args, "dn_pair_delta_max", 8.0))
-                        dn_pair_snr_floor = (
-                            float(getattr(args, "dn_pair_snr_floor_db"))
-                            if getattr(args, "dn_pair_snr_floor_db", None) is not None
-                            else float(snr_min_db)
-                        )
-                        dn_pair_snr_new_lo_raw = float(getattr(args, "dn_pair_snr_new_lo", -999.0))
-                        dn_pair_snr_new_hi_raw = float(getattr(args, "dn_pair_snr_new_hi", 999.0))
-                        dn_pair_snr_new_lo = dn_pair_snr_new_lo_raw if dn_pair_snr_new_lo_raw > -900.0 else None
-                        dn_pair_snr_new_hi = dn_pair_snr_new_hi_raw if dn_pair_snr_new_hi_raw < 900.0 else None
-                        x_cond_dn, _delta_dn = snr_path_degrade(
-                            x_dn_ref,
-                            snr_dn_ref,
-                            delta_min=dn_pair_delta_min,
-                            delta_max=dn_pair_delta_max,
-                            snr_floor=dn_pair_snr_floor,
-                            snr_target_min=dn_pair_snr_new_lo,
-                            snr_target_max=dn_pair_snr_new_hi,
-                        )
-                    else:
-                        x_cond_dn = x_dn_ref
-
                     if hasattr(model, "_dn_diff_train_t_start"):
                         t_dn = model._dn_diff_train_t_start(x_raw=x_dn_ref, snr_flat=snr_dn_ref)  # type: ignore[attr-defined]
                     else:
