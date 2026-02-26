@@ -5,6 +5,7 @@ import math
 import os
 import random
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -5483,15 +5484,24 @@ def train(args: argparse.Namespace) -> None:
                     else:
                         x0_dn_cls = x0_dn
                     t_dn_cls = torch.zeros((x_aux.shape[0],), device=device, dtype=torch.long)
-                    logits_dn_cls, _, _ = model(
-                        x0_dn_cls,
-                        t_dn_cls,
-                        snr=snr_in_aux,
-                        snr_mode=args.snr_mode,
-                        group_mask=mask,
-                        denoiser_bypass=True,
-                        **moe_kwargs_aux,
-                    )
+                    dn_cls_ctx = nullcontext()
+                    if bool(dn_diff_freeze_classifier_eff):
+                        model_dn_cls = model.module if hasattr(model, "module") else model
+                        backbone_name = str(getattr(model_dn_cls, "cldnn_backbone", "")).strip().lower()
+                        if backbone_name == "lstm":
+                            # Frozen-classifier mode keeps the stack in eval(); disable cuDNN
+                            # for this auxiliary pass so RNN input-gradient backprop is valid.
+                            dn_cls_ctx = torch.backends.cudnn.flags(enabled=False)
+                    with dn_cls_ctx:
+                        logits_dn_cls, _, _ = model(
+                            x0_dn_cls,
+                            t_dn_cls,
+                            snr=snr_in_aux,
+                            snr_mode=args.snr_mode,
+                            group_mask=mask,
+                            denoiser_bypass=True,
+                            **moe_kwargs_aux,
+                        )
                     if use_mixup and (not mixup_cls_only):
                         ce_dn_a = focal_cross_entropy(
                             logits_dn_cls,
